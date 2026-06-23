@@ -1,0 +1,314 @@
+"""rollout オーケストレーション（`optimizer` 内部の private ヘルパ集）。
+
+`optimize` の各 rollout で実行される (1) 候補適用 + vars 再注入 (`_apply_candidate`)、(2) target /
+registry 組み直し → SDK 経由実行 + 承認自動解決 (`_make_rollout` / `_run_one`)、(3) 承認 decision
+構築 + 安全不変条件チェック (`_build_decisions`) を集約する。SDK / `agentlightning` を import せず、
+`_adapters` 経由で実行する（NFR-1）。
+
+公開窓口は `optimizer.optimize` 経由のみ。テストからは `from .._rollout import _build_decisions`
+等で private として参照する（`optimizer` モジュールからの再エクスポートも維持）。
+"""
+
+from __future__ import annotations
+
+import inspect
+from typing import TYPE_CHECKING, Any
+
+from ._slots_norm import _extract_case_input, _reinject_vars
+from .types import FailureKind, OptimizeError, RolloutResult, Slot
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from ...registry import AgentRegistry
+
+
+def _merge_observation(base: Any, nxt: Any) -> Any:
+    """承認 resume の前後 segment の `ObservedRun` を 1 つへマージする（route / tool 連結）。
+
+    承認自動解決ループでは 1 ケースが複数 segment（中断 → resume → ...）に分かれて実行される。
+    各 segment の `route.steps` と `tool_calls` を順に連結し、`route.last_agent` は後段（`nxt`）の
+    値で更新する。各 segment の route 末尾は last_agent を含むため、segment 境界では前段末尾と後段
+    先頭が同一 agent になりうる（例: 単体 agent の resume で `['bot']` + `['bot']`）。境界の連続
+    重複だけを 1 件畳み（後段先頭ステップの agent が累積末尾の agent と一致ならその先頭を捨て）、
+    別 agent への正当な handoff-back は畳まない（連続が同一 agent のときのみ）。
+
+    llmops `evaluator._merge_observation` と同じ規則（横断検証済み）。Codex P2 回帰防止: 承認後の
+    handoff / 最終応答が segment 側で起きるケースで `route_match` / `last_agent_match` reward が
+    pre-resume の古い route で誤採点されないようにする。
+
+    Args:
+        base: これまでに蓄積した `ObservedRun`（`route` / `tool_calls` を持つ不透明型）。
+        nxt: 直近 segment の `ObservedRun`。
+
+    Returns:
+        route ステップとツール呼び出しを連結した新しい `ObservedRun`。
+    """
+    import dataclasses
+
+    base_steps = list(base.route.steps)
+    nxt_steps = list(nxt.route.steps)
+    if base_steps and nxt_steps and base_steps[-1].agent == nxt_steps[0].agent:
+        nxt_steps = nxt_steps[1:]
+    merged_route = dataclasses.replace(
+        base.route,
+        steps=base_steps + nxt_steps,
+        last_agent=nxt.route.last_agent or base.route.last_agent,
+    )
+    return dataclasses.replace(
+        base,
+        route=merged_route,
+        tool_calls=list(base.tool_calls) + list(nxt.tool_calls),
+    )
+
+
+def _make_rollout(
+    *,
+    target: Any,
+    registry: AgentRegistry | None,
+    slots: dict[str, Slot] | None,
+    rebind: Callable[[Any], Any] | None,
+    reward: Callable[[RolloutResult], float | Awaitable[float]],
+    tool_mocks: dict[str, dict[str, Any]] | None,
+    approvals: Callable[[dict], bool] | None,
+) -> Callable[[dict[str, str], Any], Awaitable[float]]:
+    """候補スロット mapping + 1 ケースから報酬を返す rollout callable を組む。
+
+    各 rollout で (1) 候補に vars を再注入し（必要 `${var}` 喪失は 0.0 で fail-closed）、(2)
+    `Slot.build` から自動導出した rebind（または利用者供給 rebind）で target を組み直し、(3)
+    `_target.normalize` → `_adapters` `run_with_observation` で実行し、(4) plain な `RolloutResult`
+    を利用者 reward へ渡す。
+
+    Args:
+        target: 最適化対象。
+        registry: specs 供給経路 / 既定 build の spec 解決元。
+        slots: 自動 rebind 経路の `{名前: Slot}`（None で生 seed + rebind 経路）。
+        rebind: 生 seed 経路の rebind（候補 → 宣言物 or registry）。
+        reward: rollout の `RolloutResult` から報酬を返す callable（同期 / async）。
+        tool_mocks: rollout 安全化のモック dict（llmops 経路を再利用）。
+        approvals: 承認自動解決ポリシー（llmops 経路を再利用）。
+
+    Returns:
+        `(候補スロット mapping, ケース) -> 報酬`（non-blocking）。
+    """
+
+    async def rollout(candidate: dict[str, str], case: Any) -> float:
+        applied = _apply_candidate(
+            target=target, registry=registry, slots=slots, rebind=rebind, candidate=candidate
+        )
+        if applied is None:
+            # 必要 ${var} を喪失した候補は無効化（fail-closed・低評価）。
+            return 0.0
+        opt_target, opt_registry = applied
+
+        from ..._adapters import DefaultRunnerAdapter
+        from . import _target as target_mod
+
+        agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
+        outcome, observation, fired_approvals = await _run_one(
+            agent=agent,
+            case=case,
+            replaced=replaced,
+            approvals=approvals,
+            runner=DefaultRunnerAdapter(),
+        )
+        result = RolloutResult(
+            case=case,
+            output=outcome.final_output or "",
+            tool_calls=[tc.tool for tc in observation.tool_calls],
+            fired_approvals=fired_approvals,
+            route_steps=[step.agent for step in observation.route.steps],
+            # ObservedRoute.last_agent は str（空文字なら応答なし）→ 空は None に正規化する。
+            last_agent=observation.route.last_agent or None,
+        )
+        scored = reward(result)
+        if inspect.isawaitable(scored):
+            scored = await scored
+        return float(scored)
+
+    return rollout
+
+
+def _apply_candidate(
+    *,
+    target: Any,
+    registry: AgentRegistry | None,
+    slots: dict[str, Slot] | None,
+    rebind: Callable[[Any], Any] | None,
+    candidate: dict[str, str],
+) -> tuple[Any, AgentRegistry | None] | None:
+    """候補を vars 再注入の上で適用し `(target', registry')` を返す（fail-closed は None）。
+
+    自動 rebind 経路（`slots` あり）では各スロットの `build` から target / registry を組み直す。
+    生 seed 経路（`slots` なし）では利用者 `rebind`（単一候補 / 候補 mapping）へ委譲する。必要
+    `${var}` を喪失した候補は None（無効化・低評価）。
+
+    Args:
+        target: 最適化対象。
+        registry: specs 供給経路 / 既定 build の spec 解決元。
+        slots: 自動 rebind 経路の `{名前: Slot}`（None で生 seed + rebind 経路）。
+        rebind: 生 seed 経路の rebind。
+        candidate: Trainer が生成した候補スロット mapping（`{名前: 候補テキスト}`）。
+
+    Returns:
+        `(組み直した target, 組み直した registry)`。必要 `${var}` 喪失で無効化なら None。
+    """
+    from ...spec import AgentSpec
+
+    if slots is None:
+        # 生 seed 経路: rebind へ委譲（単一候補なら値、複数なら mapping を渡す）。
+        payload: Any = next(iter(candidate.values())) if len(candidate) == 1 else dict(candidate)
+        return rebind(payload), registry  # type: ignore[misc]
+
+    # 自動 rebind 経路: 各スロットの build で組み直す。
+    reinjected: dict[str, str] = {}
+    for name, slot in slots.items():
+        text = candidate.get(name, slot.seed)
+        applied = _reinject_vars(slot, text)
+        if applied is None:
+            return None
+        reinjected[name] = applied
+
+    if isinstance(target, AgentSpec):
+        # 単一スロット = target 自身の build で AgentSpec を組み直す。
+        slot = next(iter(slots.values()))
+        return slot.build(reinjected[slot.name]), registry
+
+    # 横断（グラフ）: registry をクローンし各スロットの名前の spec を build 済み spec へ差し替える。
+    if registry is None:
+        raise OptimizeError(
+            FailureKind.CONFIG_MISSING,
+            "グラフ最適化には registry が必須です（optimize(registry=...) で渡してください）",
+        )
+
+    def _transform(spec: AgentSpec) -> AgentSpec:
+        slot = slots.get(spec.name)
+        if slot is None:
+            return spec
+        return slot.build(reinjected[spec.name])
+
+    return target, registry.clone(transform_spec=_transform)
+
+
+async def _run_one(
+    *,
+    agent: Any,
+    case: Any,
+    replaced: frozenset[tuple[str, str]],
+    approvals: Callable[[dict], bool] | None,
+    runner: Any,
+) -> tuple[Any, Any, list[str]]:
+    """1 rollout を実行し `(RunOutcome, ObservedRun, fired_approvals)` を返す（承認自動解決対応）。
+
+    `run_with_observation` で 1 回実行し、`approvals` 指定かつ中断した場合は承認自動解決ループ
+    （llmops 経路の `apply_approvals` / `resume_with_observation`・安全不変条件は `replaced` で
+    担保）で完了まで再開する。承認後の segment で観測されたツール呼び出しは初回 observation の
+    `tool_calls` に追記してマージし、reward callable が `tool_match` 等の recall 評価で正しく
+    score できるようにする。中断時の `pending`（承認ゲート発火）は各ラウンドで `fired_approvals`
+    にツール名で連結し、`approval_match` 等の recall reward が承認ゲート挙動を判定できるように
+    する（approve / reject を問わず収集・llmops `ObservedApproval` と同型）。`approvals` 未指定で
+    中断した場合も初回 pending の tool_name は `fired_approvals` に含める（reward 側で参照可）。
+
+    Args:
+        agent: 正規化済み実行 Agent（不透明型）。
+        case: rollout への入力ケース。
+        replaced: 実差し替えした `(agent, tool)` ペア集合（approve 認可の安全不変条件）。
+        approvals: 承認自動解決ポリシー（None で自動解決しない）。
+        runner: `DefaultRunnerAdapter` インスタンス。
+
+    Returns:
+        `(RunOutcome, マージ済み ObservedRun, fired_approvals ツール名列)` の plain タプル。
+    """
+    from ..._adapters import apply_approvals, resume_with_observation
+
+    case_input = _extract_case_input(case)
+    outcome, observation = await runner.run_with_observation(agent, case_input)
+
+    # 初回中断時の pending を fired に積む（approvals 有無に関わらず承認ゲート発火を観測する）。
+    fired_approvals: list[str] = []
+    if outcome.interrupted:
+        fired_approvals.extend(p.get("tool_name", "") for p in outcome.pending)
+
+    if approvals is None or not outcome.interrupted:
+        return outcome, observation, fired_approvals
+
+    _MAX_ROUNDS = 5
+    merged_observation = observation
+    current = outcome
+    for _round in range(_MAX_ROUNDS):
+        if not current.interrupted:
+            break
+        decisions = _build_decisions(
+            list(current.pending), resolver=approvals, replaced_tools=replaced
+        )
+        applied = apply_approvals(current.state, decisions)
+        if not applied.applied:
+            break
+        current, segment = await resume_with_observation(agent, current.state)
+        # resume 後の segment は tool_calls だけでなく **route_steps / last_agent も**
+        # 反映する必要がある（Codex P2 回帰防止）。承認後にハンドオフ / 最終応答が segment 側で
+        # 起きるケースで、`route_match` / `last_agent_match` reward が pre-resume の古い経路で
+        # 採点されないよう、全観測をマージする（境界重複 = 累積末尾 agent と segment 先頭 agent
+        # が同一なら 1 件だけ畳む・llmops `_merge_observation` と同等規則）。
+        merged_observation = _merge_observation(merged_observation, segment)
+        if current.interrupted:
+            # resume 後に新たに発火した承認ゲートを fired へ追記する（後段ラウンドの recall 用）。
+            fired_approvals.extend(p.get("tool_name", "") for p in current.pending)
+    return current, merged_observation, fired_approvals
+
+
+def _build_decisions(
+    pending: list[dict[str, str]],
+    *,
+    resolver: Callable[[dict], bool],
+    replaced_tools: frozenset[tuple[str, str]],
+) -> list[dict[str, Any]]:
+    """承認待ち列に resolver を適用し `apply_approvals` 用 decisions を構築する（安全不変条件）。
+
+    approve を返した `(agent_name, tool_name)` が `replaced_tools`（実際にモックへ差し替えた集合）に
+    含まれない場合は `OptimizeError(FailureKind.CONFIG_MISSING)`（本物の危険ツールを構造的に
+    実行させない・fail-closed）。reject は安全（ツール非実行）。llmops `evaluator._build_decisions`
+    と同じ安全不変条件を踏襲しつつ、APO の LitAgent 経路で握り潰されず構造化失敗種別へ昇格する
+    よう `OptimizeError` を使う（FR-8 / NFR-8 整合）。
+
+    Args:
+        pending: 中断時点の承認待ち一覧（plain dict 列・`agent_name` を含む）。
+        resolver: `(pending_dict) -> bool`。approve(True) / reject(False) を返す。
+        replaced_tools: 実際にモックへ差し替えた `(agent, tool)` ペアの集合。
+
+    Returns:
+        `apply_approvals` 用 decisions（`{"call_id", "decision", "rejection_message"}` 列）。
+
+    Raises:
+        OptimizeError: approve を返した `(agent, tool)` が `replaced_tools` に無い場合
+            （`FailureKind.CONFIG_MISSING`）。
+    """
+    decisions: list[dict[str, Any]] = []
+    for item in pending:
+        tool_name = item.get("tool_name", "")
+        call_id = item.get("call_id", "")
+        agent_name = item.get("agent_name", "")
+        approved = bool(resolver(dict(item)))
+        if approved and (agent_name, tool_name) not in replaced_tools:
+            # NFR-8 安全不変条件: 本物の危険ツールを構造的に実行させない。FR-8 整合のため
+            # `OptimizeError(CONFIG_MISSING)` に倒し、APO LitAgent 経路でも握り潰されず利用者へ
+            # 明確な失敗種別として伝える。
+            raise OptimizeError(
+                FailureKind.CONFIG_MISSING,
+                f"approval resolver が approve を返したツール {tool_name!r}（agent "
+                f"{agent_name!r}）がモックへ差し替えられていません。本物の危険ツールの実行を防ぐ"
+                "ため、approve するツールは optimize(tool_mocks={agent: {tool: 値}}) で当該 agent "
+                "のモック実装を指定し、かつ実際に差し替え可能（spec ベース登録の FunctionTool）"
+                "である必要があります",
+            )
+        if approved:
+            decisions.append({"call_id": call_id, "decision": "approve"})
+        else:
+            decisions.append(
+                {
+                    "call_id": call_id,
+                    "decision": "reject",
+                    "rejection_message": "rejected by optimization resolver",
+                }
+            )
+    return decisions

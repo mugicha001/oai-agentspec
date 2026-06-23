@@ -1,0 +1,17 @@
+# pre-commit フック設定。
+# 導入: uv run pre-commit install
+# 手動全体: uv run ruff check src/ tests/ / uv run ruff format src/ tests/ / make secrets
+repos:
+  # Ruff: lint（--fix）+ format。設定は pyproject [tool.ruff]（line-length=100 / select）に従う。
+  # rev はローカル ruff（uv 管理）のバージョンに合わせる。
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  # gitleaks によるシークレット流出防止（コミット時にステージ差分をスキャン）。
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

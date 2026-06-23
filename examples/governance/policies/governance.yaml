@@ -1,0 +1,18 @@
+# bundle YAML: 既定 + per-agent の制限の全量を 1 ファイルに宣言する
+# （04_policy_bundle.py が GovernedAgentBuilder.from_yaml で読む）。
+#
+# - default: 必須。overrides 未掲載の全エージェントに適用される既定ポリシー。
+# - agents: 任意。エージェント名 -> ポリシー（spec.name との完全一致で引き当て）。
+#
+# 各セクションは単一ポリシー YAML と同一の fail-fast 検証を受ける
+# （未知キーは ValueError・非強制フィールドは RuntimeWarning）。
+default:
+  name: readonly
+  allowed_tools:
+    - lookup_order
+agents:
+  support:
+    name: support
+    allowed_tools:
+      - lookup_order
+      - refund

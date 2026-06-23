@@ -1,0 +1,106 @@
+[project]
+name = "oai-agentspec"
+version = "0.3.0"
+description = "Declarative agent / prompt / handoff management library on top of openai-agents"
+readme = "README.md"
+authors = [
+    { name = "mugicha001" }
+]
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["openai-agents", "agents", "llm", "prompt", "handoff", "orchestration"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "openai-agents>=0.17.4",
+    "pyyaml>=6.0.3",
+]
+
+[project.urls]
+Repository = "https://github.com/mugicha001/oai-agentspec"
+
+[project.scripts]
+oai-agentspec = "oai_agentspec.runtime.cli.main:main"
+
+[project.optional-dependencies]
+conversation = []
+guardrails = []
+serve = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+]
+cli = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "rich>=13",
+]
+llmops = [
+    "deepeval>=4.0",
+]
+llmops-langfuse = [
+    "oai-agentspec[llmops]",
+    "langfuse>=4.0",
+]
+lightning = [
+    # agentlightning の private 属性 (`_history_best_score` 等) と APO instance method
+    # (`compute_textual_gradient` / `textual_gradient_and_apply_edit`) に依存しているため、
+    # patch リリース (0.3.x) を含めて固定する。次の 0.3.x が出たら回帰確認の上で pin を上げる。
+    "agentlightning[apo]>=0.3,<0.3.1",
+]
+governance = [
+    # ツール単位ポリシー強制 (`govern`) + 監査ログ + openai-agents 連携アダプタを使う。
+    # `[openai-agents]` extra で core / integrations / structlog を取り込む（軽量・grpc/azure/
+    # opa/torch 等の重い推移依存なし）。次の major (5.x) が出たら回帰確認の上で pin を上げる。
+    "agent-governance-toolkit[openai-agents]>=4.0,<5",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5",
+    "pre-commit>=3.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.12,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+
+[tool.ruff.lint.isort]
+# examples/ は src レイアウト外のローカルモジュール（_azure, basic 等）を持つ。
+known-local-folder = ["_azure", "_helpers", "_run_path"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=oai_agentspec --cov-report=term-missing --cov-report=xml --cov-report=html"
+markers = [
+    "unit: ユニットテスト（外部依存なし）",
+    "integration: 統合テスト（FakeModel 使用）",
+    "slow: 実行時間が長いテスト",
+]
+
+[tool.coverage.run]
+source = ["oai_agentspec"]
+
+[tool.coverage.report]
+fail_under = 80
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.",
+]

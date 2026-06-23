@@ -1,0 +1,38 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# development environment files
+.claude/
+CLAUDE.md
+
+# environment variables
+.env
+
+# 会話履歴 db の既定保存先（CLI serve / ConversationService の既定 ./memory/）
+memory/
+
+# SAST/SCA generated artifacts
+requirements.txt
+coverage.xml
+.coverage
+htmlcov/
+.security/reports/*
+!.security/reports/.gitkeep
+
+
+# sample code
+# TODO: 削除予定
+sample_code/
+# SonarScanner 作業ディレクトリ
+.scannerwork/
+
+# agent-lightning AgentOps tracer がカレントに吐く実行時ログ（session replay URL を含む）
+agentops.log

@@ -1,0 +1,14 @@
+# 注文サポートエージェントのツールポリシー（AGT GovernancePolicy のフィールドをそのまま記述する）。
+#
+# - allowed_tools: ツール名 allowlist。未掲載ツールの呼び出しは実行前に拒否される。
+# - blocked_patterns: ツール引数 JSON への正規表現照合。生のワイヤ文字列と JSON 正規化文字列の
+#   両方に適用される（\uXXXX 等のエスケープ別表現によるすり抜けを防ぐ）。
+#
+# 未知キー（typo 等）は読み込み時に ValueError で拒否される（allowlist が黙って無効化され
+# 全ツール許可に化ける事故の防止）。max_tool_calls 等の本統合で強制されないフィールドを
+# 指定した場合は RuntimeWarning で警告される。
+name: support
+allowed_tools:
+  - lookup_order
+blocked_patterns:
+  - "(?i)drop\\s+table"
