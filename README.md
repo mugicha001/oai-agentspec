@@ -5,6 +5,10 @@
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#プロジェクトステータス)
 [![Ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://docs.astral.sh/ruff/)
 
+> **Disclaimer**: `oai-agentspec` is an **unofficial, community-maintained** library built on top of [openai-agents](https://github.com/openai/openai-agents-python). **Not affiliated with, endorsed by, or sponsored by OpenAI.** OpenAI, the OpenAI logo, GPT, and ChatGPT are trademarks of OpenAI, Inc.
+>
+> 本ライブラリは [openai-agents](https://github.com/openai/openai-agents-python) を基盤としたコミュニティの非公式ライブラリで、**OpenAI 社による公式・推奨・スポンサー関係はありません**。OpenAI / GPT / ChatGPT 等は OpenAI, Inc. の商標です。
+
 **OpenAI Agents SDK を、より宣言的に・ミスを防ぎながら扱うための薄いラッパーライブラリ。**
 
 `oai-agentspec` は [openai-agents](https://github.com/openai/openai-agents-python) の `Agent` を置き換えません。
@@ -40,17 +44,22 @@
 
 ## インストール
 
+現在 Alpha 段階のため PyPI には未公開です。GitHub から直接インストールしてください。
+
 ```bash
-uv add oai-agentspec
-# ローカルサーバ / CLI クライアントも使う場合は extra を指定
-uv add "oai-agentspec[serve,cli]"
-# LLMOps 評価（DeepEval 採点・任意で Langfuse 観測）
-uv add "oai-agentspec[llmops]"
-uv add "oai-agentspec[llmops,llmops-langfuse]"
-# Agent Lightning APO（プロンプト自動改善）
-uv add "oai-agentspec[lightning]"
-# または開発リポジトリで:
-uv sync
+# 本体
+uv add "oai-agentspec @ git+https://github.com/mugicha001/oai-agentspec.git"
+
+# extras 付き
+uv add "oai-agentspec[serve,cli] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[llmops] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[llmops,llmops-langfuse] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[lightning] @ git+https://github.com/mugicha001/oai-agentspec.git"
+
+# ローカルクローンで開発する場合
+git clone https://github.com/mugicha001/oai-agentspec.git
+cd oai-agentspec
+uv sync --all-extras
 ```
 
 要件: Python 3.12+ / `openai-agents>=0.17.4`
