@@ -2,7 +2,8 @@
 
 Realtime 専用宣言ルート（`oai_agentspec.realtime`）の使用例。
 
-- `basic_declaration.py`: 宣言 -> 登録 -> validate -> get で RealtimeAgent を構築するまで（実 API 不要）。
+- `basic_declaration.py`: 宣言 -> グラフ DSL（`RealtimeHandoffGraph`）でトポロジ宣言・`mermaid()` 可視化 ->
+  登録 -> validate -> get で RealtimeAgent を構築するまで（実 API 不要）。
   実行: `uv run python examples/realtime/basic_declaration.py`
 - `handoff_session.py`: triage <-> support の相互 handoff（循環）を宣言し RealtimeRunner で実行する最小例。
   実行時 Config は利用者が渡す（model_name / voice 等は `RealtimeRunner` 構築時、
