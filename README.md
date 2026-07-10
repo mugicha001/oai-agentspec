@@ -23,7 +23,7 @@
 - [特徴](#特徴)
 - [インストール](#インストール)
 - [クイックスタート](#クイックスタート)
-- [コアコンセプト](#コアコンセプト)（AgentSpec / Registry / プロンプト合成 / ハンドオフ / ワークフロー / 会話 Helper / HITL / compaction）
+- [コアコンセプト](#コアコンセプト)（AgentSpec / Registry / プロンプト合成 / ハンドオフ / Realtime / ワークフロー / 会話 Helper / HITL / compaction）
 - [プロンプトレイアウト](#プロンプトレイアウト)
 - [サンプル](#サンプル)
 - [開発](#開発)
@@ -36,6 +36,7 @@
 |---|---|
 | **Agent 宣言・編集** | `AgentSpec`（`Agent` の薄いラッパー）/ `AgentRegistry` で生成・`update`・`unregister`・差し替え / プロンプト合成（`base + parts + agent`・利用側 root）/ `RunContextWrapper` 経由の動的 instructions / サブエージェント（`sub_agents` で agent as tool） |
 | **ハンドオフ** | 名前ベース宣言 + `validate()` で実行前タイポ検出 / 型付き設定（`on_handoff` / `input_type` / `input_filter` / `is_enabled`）/ 動的転送（`dynamic_edge`）/ 循環解決（`A⇄B`）/ `mermaid()` 可視化 |
+| **Realtime（音声）** | `RealtimeAgentSpec` / 専用 `RealtimeAgentRegistry` による専用宣言ルート / 非対応フィールドの型レベル排除 / 名前ベース handoff の遅延構築・循環解決 / `oai_agentspec.realtime` 窓口 |
 | **ワークフロー（実験的）** | `WorkflowGraph` でノード（AGENT/FUNCTION）+ エッジ（通常 / 条件 / fan-in）を宣言、順次 / 並列 / 条件分岐 / 合流 / ループを表現 / build-time `validate()` / SDK tracing 自動配線（`workflow.*` span + AGENT 内側 `Runner.run` の親子接続・`set_tracing_disabled(True)` 時オーバーヘッド 0） |
 | **会話 Helper** | `ConversationService`（in-process または `[serve]` + `[cli]` のクライアント・サーバ型）/ SDK `Session` で永続化・途中再開 / HITL 承認（`function_tool(needs_approval=True)` を call_id 単位で approve / reject）/ compaction（`CompactionConfig.enabled=True` で履歴圧縮を明示有効化） |
 | **LLMOps（extras）** | `[llmops]` で観点別採点 + 統合 verdict（DeepEval ベース・任意で `[llmops-langfuse]` で Langfuse 観測）/ `[lightning]` で `AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning へ委譲して自動改善（textual gradient + beam search） |
@@ -250,6 +251,36 @@ graph.dynamic_edge(
     "triage", ["billing", "support"], route, tool_name="route", description="動的に担当を決定",
 )
 ```
+
+### Realtime エージェント（専用宣言ルート）
+
+音声（Realtime）エージェントは `agents.realtime.RealtimeAgent` を対象とする専用宣言ルートで扱う。
+`RealtimeAgentSpec` は RealtimeAgent が対応するフィールドのみを持ち、非対応フィールド（`model` /
+`model_settings` / `input_guardrails` 等の実行時 Config）を型レベルで排除する。専用の
+`RealtimeAgentRegistry` が名前ベース handoff を遅延構築（循環も解決）する。シンボルはコア
+`__all__` に載せず `oai_agentspec.realtime` 窓口から取得する。
+
+```python
+from agents.realtime import RealtimeRunner
+from oai_agentspec.realtime import RealtimeAgentRegistry, RealtimeAgentSpec
+
+registry = RealtimeAgentRegistry()
+registry.register(RealtimeAgentSpec(
+    name="triage",
+    instructions="受付担当。技術的な問い合わせはサポート担当へ引き継ぐ。",
+    handoff_description="最初の受付・振り分け担当。",
+    handoffs=["support"],  # 名前ベース handoff（registry が遅延構築で結線）
+))
+registry.register(RealtimeAgentSpec(name="support", instructions="技術サポート担当。"))
+registry.validate()  # 未解決の handoff 参照を run 前に検出
+
+entry = registry.get("triage")
+# model_settings（model_name / voice / modalities 等）は宣言側が持たない実行時 Config。
+# セッション開始時に利用者が RealtimeRunner へ渡す。
+runner = RealtimeRunner(entry, config={"model_settings": {"model_name": "gpt-4o-realtime-preview"}})
+```
+
+音声 I/O 込みの実行例は `examples/realtime/`（`handoff_session.py` / `voice_chat.py`）を参照。
 
 ### ワークフロー（WorkflowGraph）
 
