@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from .handoffs import RealtimeHandoffEdge, RealtimeHandoffGraph, from_specs
 from .registry import RealtimeAgentRegistry
 from .spec import RealtimeAgentSpec, RealtimeHandoffConfig
 
@@ -18,4 +19,7 @@ __all__ = [
     "RealtimeAgentRegistry",
     "RealtimeAgentSpec",
     "RealtimeHandoffConfig",
+    "RealtimeHandoffEdge",
+    "RealtimeHandoffGraph",
+    "from_specs",
 ]
