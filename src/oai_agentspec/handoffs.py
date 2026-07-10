@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from dataclasses import fields as _dataclass_fields
 from typing import TYPE_CHECKING, Any
 
+from ._mermaid import render_flowchart
 from .spec import DynamicHandoff, HandoffConfig
 
 if TYPE_CHECKING:
@@ -259,17 +260,16 @@ class HandoffGraph:
         return registry.get(self.entry)
 
     def mermaid(self) -> str:
-        """グラフを Mermaid flowchart 文字列として返す。"""
-        lines = ["flowchart TD"]
-        if self.entry:
-            lines.append(f"    start([start]) --> {self.entry}")
-        for e in self.edges:
-            label = f"|{e.config.description}|" if e.config.description else ""
-            lines.append(f"    {e.src} -->{label} {e.dst}")
-        for d in self.dynamic:
-            for cand in d.candidates:
-                lines.append(f"    {d.src} -.->|{d.tool_name}| {cand}")
-        return "\n".join(lines)
+        """グラフを Mermaid flowchart 文字列として返す。
+
+        書式は共有フォーマッタ `_mermaid` が単一ソースで保つ（動的エッジの破線は
+        本ルート固有のため追加行として渡す）。
+        """
+        static_edges = [(e.src, e.dst, e.config.description) for e in self.edges]
+        dynamic_lines = [
+            f"    {d.src} -.->|{d.tool_name}| {cand}" for d in self.dynamic for cand in d.candidates
+        ]
+        return render_flowchart(self.entry, static_edges, dynamic_lines)
 
 
 def from_specs(specs: Iterable[Any], entry: str | None = None) -> HandoffGraph:
