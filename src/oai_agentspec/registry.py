@@ -12,6 +12,7 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ._validation import validate_instructions_callable
 from .spec import AgentSpec
 
 if TYPE_CHECKING:
@@ -472,14 +473,8 @@ class AgentRegistry:
 
     @staticmethod
     def _validate_spec(spec: AgentSpec) -> None:
-        """callable instructions の引数数（(context, agent) の 2 引数）を検証する。"""
-        if callable(spec.instructions):
-            params = list(inspect.signature(spec.instructions).parameters.values())
-            if len(params) != 2:
-                raise ValueError(
-                    f"agent {spec.name!r}: instructions callable は (context, agent) の "
-                    f"2 引数が必須ですが {len(params)} 引数です"
-                )
+        """callable instructions が (context, agent) の 2 引数で呼び出せることを検証する。"""
+        validate_instructions_callable(spec.name, spec.instructions)
 
 
 def _copy_spec(spec: AgentSpec) -> AgentSpec:
