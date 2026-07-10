@@ -36,7 +36,7 @@
 |---|---|
 | **Agent 宣言・編集** | `AgentSpec`（`Agent` の薄いラッパー）/ `AgentRegistry` で生成・`update`・`unregister`・差し替え / プロンプト合成（`base + parts + agent`・利用側 root）/ `RunContextWrapper` 経由の動的 instructions / サブエージェント（`sub_agents` で agent as tool） |
 | **ハンドオフ** | 名前ベース宣言 + `validate()` で実行前タイポ検出 / 型付き設定（`on_handoff` / `input_type` / `input_filter` / `is_enabled`）/ 動的転送（`dynamic_edge`）/ 循環解決（`A⇄B`）/ `mermaid()` 可視化 |
-| **Realtime（音声）** | `RealtimeAgentSpec` / 専用 `RealtimeAgentRegistry` による専用宣言ルート / 非対応フィールドの型レベル排除 / 名前ベース handoff の遅延構築・循環解決 / `oai_agentspec.realtime` 窓口 |
+| **Realtime（音声）** | `RealtimeAgentSpec` / 専用 `RealtimeAgentRegistry` による専用宣言ルート / 非対応フィールドの型レベル排除 / 名前ベース handoff の遅延構築・循環解決 / グラフ DSL（`RealtimeHandoffGraph`・`mermaid()` 可視化）/ `oai_agentspec.realtime` 窓口 |
 | **ワークフロー（実験的）** | `WorkflowGraph` でノード（AGENT/FUNCTION）+ エッジ（通常 / 条件 / fan-in）を宣言、順次 / 並列 / 条件分岐 / 合流 / ループを表現 / build-time `validate()` / SDK tracing 自動配線（`workflow.*` span + AGENT 内側 `Runner.run` の親子接続・`set_tracing_disabled(True)` 時オーバーヘッド 0） |
 | **会話 Helper** | `ConversationService`（in-process または `[serve]` + `[cli]` のクライアント・サーバ型）/ SDK `Session` で永続化・途中再開 / HITL 承認（`function_tool(needs_approval=True)` を call_id 単位で approve / reject）/ compaction（`CompactionConfig.enabled=True` で履歴圧縮を明示有効化） |
 | **LLMOps（extras）** | `[llmops]` で観点別採点 + 統合 verdict（DeepEval ベース・任意で `[llmops-langfuse]` で Langfuse 観測）/ `[lightning]` で `AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning へ委譲して自動改善（textual gradient + beam search） |
@@ -278,6 +278,19 @@ entry = registry.get("triage")
 # model_settings（model_name / voice / modalities 等）は宣言側が持たない実行時 Config。
 # セッション開始時に利用者が RealtimeRunner へ渡す。
 runner = RealtimeRunner(entry, config={"model_settings": {"model_name": "gpt-4o-realtime-preview"}})
+```
+
+ハンドオフのトポロジは `RealtimeHandoffGraph` によるノード・エッジ宣言でも構築できる
+（`spec.handoffs` 直接宣言と同一の結線・`mermaid()` で可視化可能）:
+
+```python
+from oai_agentspec.realtime import RealtimeHandoffGraph
+
+graph = RealtimeHandoffGraph(entry="triage")
+graph.edge("triage", "support", tool_description="技術的な問い合わせを引き継ぐ")
+graph.edge("support", "triage")  # 相互参照（循環）も可
+graph.apply(specs)               # 検証付きで spec 群へ一括反映（build 前に行う）
+print(graph.mermaid())           # flowchart TD ...
 ```
 
 音声 I/O 込みの実行例は `examples/realtime/`（`handoff_session.py` / `voice_chat.py`）を参照。
