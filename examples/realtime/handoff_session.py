@@ -31,7 +31,11 @@ from pathlib import Path
 
 from agents.realtime import RealtimeRunner
 
-from oai_agentspec.realtime import RealtimeAgentRegistry, RealtimeAgentSpec
+from oai_agentspec.realtime import (
+    RealtimeAgentRegistry,
+    RealtimeAgentSpec,
+    RealtimeHandoffGraph,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
 from _connection import build_model_config, require_credentials, scrub  # noqa: E402
@@ -54,16 +58,13 @@ def build_registry() -> RealtimeAgentRegistry:
     Returns:
         validate 済みの RealtimeAgentRegistry（entry は triage）。
     """
-    registry = RealtimeAgentRegistry()
-    registry.register(
+    # spec はエージェントの中身のみ宣言する（トポロジはグラフ側の責務）。
+    specs = [
         RealtimeAgentSpec(
             name="triage",
             instructions="受付担当。技術的な問い合わせはサポート担当へ引き継ぐ。",
             handoff_description="最初の受付・振り分け担当。",
-            handoffs=["support"],
-        )
-    )
-    registry.register(
+        ),
         RealtimeAgentSpec(
             name="support",
             instructions=(
@@ -71,10 +72,19 @@ def build_registry() -> RealtimeAgentRegistry:
                 "解決したら、または技術以外の話題になったら受付担当へ戻す。"
             ),
             handoff_description="技術サポート担当。",
-            # 相互参照（triage <-> support の循環）。registry の 2 パス遅延バインドが解決する
-            handoffs=["triage"],
-        )
-    )
+        ),
+    ]
+
+    # 相互 handoff（循環）をグラフ DSL で宣言し spec 群へ一括反映する
+    # （spec.handoffs 直接宣言と同一の結線になる）。
+    graph = RealtimeHandoffGraph(entry="triage")
+    graph.edge("triage", "support", tool_description="技術的な問い合わせを引き継ぐ")
+    graph.edge("support", "triage", tool_description="解決したら受付へ戻す")
+    graph.apply(specs)
+
+    registry = RealtimeAgentRegistry()
+    for spec in specs:
+        registry.register(spec)
     registry.validate()
     return registry
 

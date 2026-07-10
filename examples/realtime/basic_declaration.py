@@ -2,8 +2,12 @@
 
 Realtime 専用宣言ルート（`oai_agentspec.realtime`）の基本フローを示す:
 
-    RealtimeAgentSpec 宣言 -> RealtimeAgentRegistry.register -> validate
+    RealtimeAgentSpec 宣言 -> RealtimeHandoffGraph でトポロジ宣言 -> apply(specs)
+    -> RealtimeAgentRegistry.register -> validate
     -> get で RealtimeAgent を遅延構築（handoffs は 2 パスで後付け結線）
+
+ハンドオフは spec の `handoffs` に直接書いても、グラフ DSL（本例）で宣言しても
+構造的に同一の結線になる。グラフは `mermaid()` でトポロジを可視化できる。
 
 実 API（OpenAI Realtime）へは接続しない。宣言と build-time 検証・構築までで完結し、
 構築された RealtimeAgent のフィールドを print で確認するだけの例。
@@ -21,33 +25,41 @@ from __future__ import annotations
 from oai_agentspec.realtime import (
     RealtimeAgentRegistry,
     RealtimeAgentSpec,
-    RealtimeHandoffConfig,
+    RealtimeHandoffGraph,
 )
 
 
+def build_graph() -> RealtimeHandoffGraph:
+    """triage <-> support の相互 handoff（循環）をノードとエッジで宣言する。
+
+    Returns:
+        エッジ宣言済みの RealtimeHandoffGraph（entry は triage）。
+    """
+    graph = RealtimeHandoffGraph(entry="triage")
+    graph.edge(
+        "triage",
+        "support",
+        tool_name="transfer_to_support",
+        tool_description="技術的な問い合わせをサポート担当へ引き継ぐ。",
+    )
+    # 相互参照（triage <-> support の循環）。registry の 2 パス遅延バインドが解決する
+    graph.edge("support", "triage")
+    return graph
+
+
 def build_registry() -> RealtimeAgentRegistry:
-    """triage <-> support の相互 handoff（循環）で 2 エージェントを宣言・登録して registry を返す。
+    """spec 宣言 + グラフ適用で 2 エージェントを登録し registry を返す。
 
     Returns:
         validate 済みの RealtimeAgentRegistry（entry は最初に登録した triage）。
     """
-    registry = RealtimeAgentRegistry()
-
-    registry.register(
+    # spec はエージェントの中身のみ宣言する（トポロジはグラフ側の責務）。
+    specs = [
         RealtimeAgentSpec(
             name="triage",
             instructions="ユーザーの要望を聞き取り、必要ならサポート担当へ引き継ぐ受付担当。",
             handoff_description="最初の受付・振り分け担当。",
-            handoffs=["support"],
-            handoff_options={
-                "support": RealtimeHandoffConfig(
-                    tool_name_override="transfer_to_support",
-                    tool_description_override="技術的な問い合わせをサポート担当へ引き継ぐ。",
-                )
-            },
-        )
-    )
-    registry.register(
+        ),
         RealtimeAgentSpec(
             name="support",
             instructions=(
@@ -55,10 +67,18 @@ def build_registry() -> RealtimeAgentRegistry:
                 "解決したら、または技術以外の話題になったら受付担当へ戻す。"
             ),
             handoff_description="技術サポート担当。",
-            # 相互参照（triage <-> support の循環）。registry の 2 パス遅延バインドが解決する
-            handoffs=["triage"],
-        )
-    )
+        ),
+    ]
+
+    # グラフを spec 群へ一括反映する（spec.handoffs 直接宣言と同一の結線になる）。
+    graph = build_graph()
+    graph.apply(specs)
+    print("--- mermaid ---")
+    print(graph.mermaid())
+
+    registry = RealtimeAgentRegistry()
+    for spec in specs:
+        registry.register(spec)
 
     # handoffs 参照のタイポ等を build 前に一括検出する。
     registry.validate()

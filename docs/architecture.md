@@ -84,7 +84,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に `_validation`（共有バリデーションヘルパ・`agents` 非依存）があり、`registry` / `realtime/registry` / `_adapters` が下向きに参照する。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -96,13 +96,14 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `spec.py` | `AgentSpec` の定義。`agents.Agent` の薄い Wrapper。`agents` 非依存の宣言的データ。最下層 |
 | `protocols.py` | `AgentBuilder` の Protocol 定義。`agents` 非依存 |
 | `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証）。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
+| `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
 | `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
-| `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters` と共有バリデーションヘルパ `_validation` への上向き単方向のみ。コアから `realtime/` への依存辺はない |
+| `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
 | `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
@@ -734,7 +735,42 @@ _adapters/realtime  →  agents.realtime（SDK 結合はここに閉じる）
   - `handoff_options` のキーが `handoffs` に存在しない場合は `ValueError`（per-edge 設定の silent drop 防止）。
   - `input_type` 指定時は `on_handoff` が必須。
   - `on_handoff` の引数個数は `input_type` ありで 2・なしで 1。
+- 上記のうち handoff 系検証（`handoff_options` のキー整合・`input_type`→`on_handoff` 必須・`on_handoff` の
+  arity）は `_validation` の共有バリデータへ一元化され、`register`（`_validate_spec` 経由）と後述の
+  `RealtimeHandoffGraph.apply` の双方から呼ばれる（反映順序に依らず最終 spec が検証される）。
 - デフォルトビルダーは関数内遅延 import で取得し、registry import 時点で `agents.realtime` を読み込まない。
+
+### 宣言的ハンドオフグラフ（RealtimeHandoffGraph）
+
+`RealtimeHandoffGraph` はハンドオフのトポロジを宣言し、`RealtimeAgentSpec` 群へ `apply(specs)` して各 src の
+`handoffs`（名前リスト）と `handoff_options`（dst -> `RealtimeHandoffConfig`）を書き込む宣言アーティファクトで
+ある。registry は変更せず（built 無効化・freeze を要さない）、`spec.handoffs` に名前を直接宣言する場合と構造的
+に同一の結線になる。
+
+- `apply(specs)` は 2 パスで反映する: パス 1 で全 src の反映値を組み立てて handoff 系検証を `_validation` の
+  共有バリデータで実行し、パス 2 で一括代入する。途中の失敗ではどの spec も変異しない（原子性）。`register`（`_validate_spec` 経由）も同じバリデータを共有するため、`apply → register`
+  でも `register → apply` でも最終 spec が必ず検証される（反映順序に依らず検証は迂回されない）。src がグラフに
+  現れるが `specs` に無い場合は `KeyError`。
+- build 前ワンショット反映の制約: apply は spec のみを書き換え、registry のキャッシュには関与しない。
+  `registry.get()` で構築済みのエージェントはキャッシュから返るため、構築後に apply しても既存エージェントの
+  結線は変わらない。apply は必ず最初の `get()` より前に行う。再 `apply` 時に前回反映して今回消えた src の
+  `handoffs` を自動クリアしない（一回性）。エッジを持つ src の `handoffs` のみを replace 上書きし、エッジを
+  持たない src の spec には触れない。
+- `edge()` の引数は `RealtimeHandoffConfig` のフィールドへ次のとおりマップする。`input_filter` は露出させない。
+
+  | `edge()` 引数 | `RealtimeHandoffConfig` フィールド |
+  |---|---|
+  | `on_handoff` | `on_handoff` |
+  | `input_type` | `input_type` |
+  | `tool_name` | `tool_name_override` |
+  | `tool_description` | `tool_description_override` |
+  | `is_enabled` | `is_enabled` |
+
+- `mermaid()` は静的エッジのみを `flowchart TD` として返す（`start([start]) --> {entry}` / `{src} -->|{label}| {dst}`）。
+  ラベル源は `tool_description_override`（未設定時は無ラベル）で、動的エッジ破線・`input_filter` を持たない。
+- `from_specs(specs, entry=None)` は各 spec の `handoffs` から静的エッジを張ってグラフを構築する。
+- コアの `HandoffGraph` とは統合しない独立アーティファクトであり（`input_filter`・動的エッジを型として持たず、
+  registry 内部プリミティブへ委譲しない）、相互の対称性契約の対象外である。
 
 ### build 時の reject（型で排除しきれない経路）
 
@@ -757,7 +793,8 @@ on_handoff=..., input_type=..., is_enabled=...)` へ委譲する（`input_filter
 
 Realtime シンボルはコア `__all__` に載せず、`oai_agentspec.runtime.conversation` と同様に
 `oai_agentspec.realtime` の公開窓口で参照する。`realtime/__init__.py` は再エクスポート専用で、`__all__` に
-`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `RealtimeAgentRegistry` を掲載する。利用側は
+`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `RealtimeAgentRegistry` / `RealtimeHandoffGraph` /
+`RealtimeHandoffEdge` / `from_specs` を掲載する。利用側は
 `from oai_agentspec.realtime import RealtimeAgentSpec, RealtimeAgentRegistry` で取得する。
 `RealtimeAgentBuilder`（DI 拡張点の Protocol）はコア `AgentBuilder` と同様どの `__all__` にも載せず、
 `from oai_agentspec.realtime.protocols import RealtimeAgentBuilder` の直接 import でのみ参照する。
@@ -1471,7 +1508,9 @@ governance（「何をできるか」）は内容ガードレール（`guardrail
 | L2（統合） | 実 `Agent` + `FakeModel` + `Runner` | 動的 instructions・循環ハンドオフ・サブエージェント委譲の実挙動を検証。workflow は経路C（`as_agent_spec` → `Runner.run` で決定論起動・handoff 流入）、経路A（`as_facade_spec` → context 透過・既定 input_filter）、`tool_choice` を extra に積むと `ValueError` / `model_settings` なら成功する回帰を検証。HITL は `FakeModel` が `needs_approval` ツールへ ToolCall を返して interruptions を生成し、複数 `call_id` を可変に与えるヘルパで段階解決を検証。承認前は実行記録が残らず approve 後に初めて残ること（NFR-7）を実行記録で検証する |
 
 Realtime ルート（`realtime/`）も同じ 2 層で検証する。L1 は `FakeRealtimeAgentBuilder` を注入して spec の
-フィールド排除・registry の遅延構築 / 循環解決 / 重複登録 / validate を `agents` 非依存で検証し、L2 は
+フィールド排除・registry の遅延構築 / 循環解決 / 重複登録 / validate を `agents` 非依存で検証し、加えて
+`RealtimeHandoffGraph` のグラフ宣言 / `apply` の spec 反映 / 反映順序非依存の検証 / `mermaid` / 「グラフ apply ==
+spec 直接宣言」の等価性を `FakeRealtimeAgentBuilder` 注入で検証する。L2 は
 `RealtimeRunner` + `FakeRealtimeModel`（`RealtimeModel` 抽象実装）で handoff の実委譲を検証する。個別
 assert・テスト名は docstring を一次情報とする既存方針を踏襲する。加えて Realtime の隔離不変条件
 （コア `__all__` に Realtime シンボルを含まない・`import oai_agentspec` が `realtime` を連鎖 import しない・

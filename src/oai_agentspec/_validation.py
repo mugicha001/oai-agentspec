@@ -9,7 +9,13 @@
 from __future__ import annotations
 
 import inspect
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    # 型ヒント専用の一方向参照であり実行時依存はない（_validation は最下層のまま）。
+    from .realtime.spec import RealtimeHandoffConfig
 
 
 def validate_instructions_callable(agent_name: str, instructions: Any) -> None:
@@ -61,3 +67,59 @@ def ensure_static_prompt(agent_name: str, prompt: Any) -> None:
             f"agent {agent_name!r}: prompt に callable（DynamicPromptFunction）は"
             f"指定できません（RealtimeAgent は静的 Prompt のみ対応）"
         )
+
+
+def validate_realtime_handoff_options(
+    agent_name: str,
+    handoffs: Sequence[str],
+    handoff_options: Mapping[str, RealtimeHandoffConfig],
+) -> None:
+    """Realtime ルートの per-edge ハンドオフ設定（`handoff_options`）を検証する。
+
+    `RealtimeAgentRegistry.register`（`_validate_spec` 経由）と `RealtimeHandoffGraph.apply`
+    が共有する検証ロジックを一元化する。両者が同じバリデータを呼ぶことで、`apply -> register`
+    でも `register -> apply` でも最終 spec が必ず同一規則・同一エラーメッセージで検証される
+    （順序非依存）。
+
+    検証項目:
+        - `handoff_options` のキーが `handoffs` に存在すること（タイポによる per-edge 設定の
+          silent drop を防ぐ）。
+        - `input_type` 指定時に `on_handoff` が伴うこと。
+        - `on_handoff` の引数個数（`input_type` ありで 2・なしで 1。SDK `realtime_handoff()`
+          の必須制約）。get() 時の文脈なし UserError をエージェント名・エッジ名入り ValueError
+          に前倒しする。シグネチャ取得不能な callable（builtin 等）は arity 検査をスキップする。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名（ハンドオフ元）。
+        handoffs: ハンドオフ先エージェント名リスト。
+        handoff_options: dst 名 -> RealtimeHandoffConfig の per-edge 設定。
+
+    Raises:
+        ValueError: キー不整合・input_type と on_handoff の不整合・arity 不一致のいずれか。
+    """
+    unknown_options = set(handoff_options) - set(handoffs)
+    if unknown_options:
+        raise ValueError(
+            f"agent {agent_name!r}: handoff_options のキー {sorted(unknown_options)!r} が "
+            f"handoffs に存在しません"
+        )
+    for dst, config in handoff_options.items():
+        if config.input_type is not None and config.on_handoff is None:
+            raise ValueError(
+                f"agent {agent_name!r} -> {dst!r}: input_type を指定する場合は "
+                f"on_handoff が必須です"
+            )
+        if config.on_handoff is not None:
+            # SDK realtime_handoff() は引数個数を厳格に検査する（bind ではなく len）ため
+            # 同じ規則で前倒し検証する
+            expected = 2 if config.input_type is not None else 1
+            try:
+                n_params = len(inspect.signature(config.on_handoff).parameters)
+            except (ValueError, TypeError):
+                continue
+            if n_params != expected:
+                form = "(context, input) の 2" if expected == 2 else "(context) の 1"
+                raise ValueError(
+                    f"agent {agent_name!r} -> {dst!r}: on_handoff は {form} 引数である"
+                    f"必要がありますが {n_params} 引数です"
+                )

@@ -12,10 +12,13 @@ dynamic_handoffs は Realtime ルートに存在しない）。
 
 from __future__ import annotations
 
-import inspect
 from typing import TYPE_CHECKING, Any
 
-from .._validation import ensure_static_prompt, validate_instructions_callable
+from .._validation import (
+    ensure_static_prompt,
+    validate_instructions_callable,
+    validate_realtime_handoff_options,
+)
 from .spec import RealtimeAgentSpec
 
 if TYPE_CHECKING:
@@ -200,32 +203,8 @@ class RealtimeAgentRegistry:
         """
         # SDK 側に instructions の引数検査はないため bind で呼び出し可能性のみ確認する
         # （on_handoff の厳格 len 検査とは前提が異なる）。検証本体は両宣言ルート共有の
-        # _validation ヘルパに一元化している。
+        # _validation ヘルパに一元化している（handoff_options は RealtimeHandoffGraph.apply
+        # とも共有し、apply -> register / register -> apply の順序に依らず同一規則で検証する）。
         validate_instructions_callable(spec.name, spec.instructions)
         ensure_static_prompt(spec.name, spec.prompt)
-        unknown_options = set(spec.handoff_options) - set(spec.handoffs)
-        if unknown_options:
-            raise ValueError(
-                f"agent {spec.name!r}: handoff_options のキー {sorted(unknown_options)!r} が "
-                f"handoffs に存在しません"
-            )
-        for dst, config in spec.handoff_options.items():
-            if config.input_type is not None and config.on_handoff is None:
-                raise ValueError(
-                    f"agent {spec.name!r} -> {dst!r}: input_type を指定する場合は "
-                    f"on_handoff が必須です"
-                )
-            if config.on_handoff is not None:
-                # SDK realtime_handoff() は引数個数を厳格に検査する（bind ではなく len）ため
-                # 同じ規則で前倒し検証する
-                expected = 2 if config.input_type is not None else 1
-                try:
-                    n_params = len(inspect.signature(config.on_handoff).parameters)
-                except (ValueError, TypeError):
-                    continue
-                if n_params != expected:
-                    form = "(context, input) の 2" if expected == 2 else "(context) の 1"
-                    raise ValueError(
-                        f"agent {spec.name!r} -> {dst!r}: on_handoff は {form} 引数である"
-                        f"必要がありますが {n_params} 引数です"
-                    )
+        validate_realtime_handoff_options(spec.name, spec.handoffs, spec.handoff_options)
