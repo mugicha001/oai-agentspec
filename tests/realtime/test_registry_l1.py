@@ -301,7 +301,9 @@ def test_promptstore_の動的合成callableはinstructionsとして通る(tmp_p
     (tmp_path / "base").mkdir()
     (tmp_path / "parts").mkdir()
     (tmp_path / "agents").mkdir()
-    (tmp_path / "agents" / "triage.md").write_text("あなたは ${user} 担当の受付。", encoding="utf-8")
+    (tmp_path / "agents" / "triage.md").write_text(
+        "あなたは ${user} 担当の受付。", encoding="utf-8"
+    )
     store = PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
 
     instructions = store.compose(agent="triage", vars=lambda ctx: {"user": ctx.context.user})
