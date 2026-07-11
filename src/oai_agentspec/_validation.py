@@ -48,6 +48,47 @@ def validate_instructions_callable(agent_name: str, instructions: Any) -> None:
         ) from None
 
 
+def validate_extra_kwargs(
+    agent_name: str,
+    extra: Mapping[str, Any],
+    *,
+    dedicated: frozenset[str],
+    field_names: frozenset[str],
+    agent_label: str,
+) -> None:
+    """spec.extra の専用フィールド衝突・未知キーを検証する（両ルートのアダプタが共有）。
+
+    通常ルート（`build_agent`）と Realtime 専用ルート（`build_realtime_agent`）の
+    extra 検証を一元化する。SDK 型の有効 kwarg 集合（`field_names`）と専用フィールド集合
+    （`dedicated`）は各アダプタで算出済みの `frozenset` を渡すため、本ヘルパは agents 非依存を
+    保つ。衝突検査を未知検査より先に行う順序・両メッセージ文字列を単一ソースで維持する。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名。
+        extra: spec の extra（キー集合のみ参照する）。
+        dedicated: spec 側で別扱いする専用フィールド名の集合（extra から除外する対象）。
+        field_names: 対象 SDK Agent が受け付ける有効 kwarg 名の集合。
+        agent_label: 未知キーメッセージに埋め込む SDK クラス表示名
+            （`agents.Agent` / `agents.realtime.RealtimeAgent`）。
+
+    Raises:
+        ValueError: extra に専用フィールド名と同名のキー、または対象 Agent が受け付けない
+            未知のキーが含まれる場合。
+    """
+    collisions = dedicated & extra.keys()
+    if collisions:
+        raise ValueError(
+            f"agent {agent_name!r}: extra に専用フィールドと同名のキーが含まれます: "
+            f"{sorted(collisions)}"
+        )
+    unknown = extra.keys() - field_names
+    if unknown:
+        raise ValueError(
+            f"agent {agent_name!r}: extra に {agent_label} が受け付けないキーが含まれます: "
+            f"{sorted(unknown)}"
+        )
+
+
 def ensure_static_prompt(agent_name: str, prompt: Any) -> None:
     """prompt が callable（DynamicPromptFunction）でないことを検証する（Realtime ルート用）。
 

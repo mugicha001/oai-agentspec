@@ -21,6 +21,8 @@ from agents import (
     handoff,
 )
 
+from .._validation import validate_extra_kwargs
+
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
@@ -100,18 +102,13 @@ def build_agent(spec: AgentSpec) -> Agent:
             未知のキーが含まれる場合。
     """
     extra = dict(spec.extra)
-    collisions = _DEDICATED_AGENT_KWARGS & extra.keys()
-    if collisions:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に専用フィールドと同名のキーが含まれます: "
-            f"{sorted(collisions)}"
-        )
-    unknown = extra.keys() - _AGENT_FIELD_NAMES
-    if unknown:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に agents.Agent が受け付けないキーが含まれます: "
-            f"{sorted(unknown)}"
-        )
+    validate_extra_kwargs(
+        spec.name,
+        extra,
+        dedicated=_DEDICATED_AGENT_KWARGS,
+        field_names=_AGENT_FIELD_NAMES,
+        agent_label="agents.Agent",
+    )
 
     kwargs: dict[str, Any] = {
         "name": spec.name,
