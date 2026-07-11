@@ -282,3 +282,36 @@ def test_validate_passes_when_all_resolved() -> None:
     reg.register(RealtimeAgentSpec(name="a", instructions="a", handoffs=["b"]))
     reg.register(RealtimeAgentSpec(name="b", instructions="b"))
     reg.validate()
+
+
+# ------------------------------------------------------------------
+# PromptStore の動的合成との互換性
+# ------------------------------------------------------------------
+def test_promptstore_の動的合成callableはinstructionsとして通る(tmp_path) -> None:
+    """PromptStore.compose(vars=callable) の戻り値（(context, agent) -> str）が
+    RealtimeAgentSpec.instructions として register 検証を通過し、構築物へそのまま渡る。
+
+    Realtime session は callable instructions を get_system_prompt(context) で解決する
+    ため、PromptStore のテンプレート合成（動的変数注入）は Realtime でも機能する。
+    """
+    from types import SimpleNamespace
+
+    from oai_agentspec import PromptLayout, PromptStore
+
+    (tmp_path / "base").mkdir()
+    (tmp_path / "parts").mkdir()
+    (tmp_path / "agents").mkdir()
+    (tmp_path / "agents" / "triage.md").write_text("あなたは ${user} 担当の受付。", encoding="utf-8")
+    store = PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
+
+    instructions = store.compose(agent="triage", vars=lambda ctx: {"user": ctx.context.user})
+    assert callable(instructions)
+
+    reg, builder = make_registry()
+    reg.register(RealtimeAgentSpec(name="triage", instructions=instructions))
+    agent = reg.get("triage")
+    assert agent.instructions is instructions
+
+    # SDK と同じ呼び出し形（(context, agent) の 2 位置引数）で解決できることを確認する。
+    ctx = SimpleNamespace(context=SimpleNamespace(user="mugicha"))
+    assert agent.instructions(ctx, agent) == "あなたは mugicha 担当の受付。"
