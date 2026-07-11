@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from agents.realtime import RealtimeAgent, realtime_handoff
 
-from .._validation import ensure_static_prompt
+from .._validation import ensure_static_prompt, validate_extra_kwargs
 
 if TYPE_CHECKING:
     from ..realtime.spec import RealtimeAgentSpec, RealtimeHandoffConfig
@@ -64,18 +64,13 @@ def build_realtime_agent(
             未知のキーが含まれる場合（agent 名 + 該当キー名を含む）。
     """
     extra = dict(spec.extra)
-    collisions = _DEDICATED_REALTIME_AGENT_KWARGS & extra.keys()
-    if collisions:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に専用フィールドと同名のキーが含まれます: "
-            f"{sorted(collisions)}"
-        )
-    unknown = extra.keys() - _REALTIME_AGENT_FIELD_NAMES
-    if unknown:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に agents.realtime.RealtimeAgent が受け付けない"
-            f"キーが含まれます: {sorted(unknown)}"
-        )
+    validate_extra_kwargs(
+        spec.name,
+        extra,
+        dedicated=_DEDICATED_REALTIME_AGENT_KWARGS,
+        field_names=_REALTIME_AGENT_FIELD_NAMES,
+        agent_label="agents.realtime.RealtimeAgent",
+    )
     # RealtimeAgent.prompt は Prompt | None のみで DynamicPromptFunction（callable）非対応
     # （session が agent.prompt を解決 callback 抜きで直接使うため）。register 時の前倒し検証と
     # 同一の共有ヘルパで第二防御として reject する（判定・メッセージの単一ソース化）。
