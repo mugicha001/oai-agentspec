@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .._registry_core import build_two_pass, collect_reachable
 from .._validation import (
     ensure_static_prompt,
     validate_instructions_callable,
@@ -101,43 +102,17 @@ class RealtimeAgentRegistry:
         if name not in self._specs:
             raise KeyError(f"unknown agent: {name}")
 
-        reachable = self._collect_reachable(name)
-        # パス 1/2 はトランザクショナルに実行する。途中で例外が出たら本呼び出しで
-        # 新規キャッシュした bare agent を巻き戻し、不完全なインスタンスを残さない。
-        newly_built: list[str] = []
-        try:
-            # パス 1: handoffs 空でビルドして登録
-            for target in reachable:
-                if target not in self._built:
-                    self._built[target] = self._builder().build(self._specs[target])
-                    newly_built.append(target)
-            # パス 2: handoffs を後付け結線
-            for target in reachable:
-                self._wire(self._specs[target], self._built[target])
-        except Exception:
-            for target in newly_built:
-                self._built.pop(target, None)
-            raise
+        # 到達可能収集とトランザクショナルな 2 パス build/wire + 巻き戻しは共有 leaf
+        # `_registry_core` に委譲する（依存辺は handoffs のみ・bare ビルドは builder 経由）。
+        reachable = collect_reachable(name, self._specs, self._built, lambda spec: spec.handoffs)
+        build_two_pass(
+            reachable,
+            self._specs,
+            self._built,
+            lambda spec: self._builder().build(spec),
+            self._wire,
+        )
         return self._built[name]
-
-    def _collect_reachable(self, name: str) -> list[str]:
-        """name から handoffs を辿り未ビルドの spec 名を集める（visited で循環を打ち切る）。"""
-        collected: list[str] = []
-        visited: set[str] = set()
-        stack = [name]
-        while stack:
-            current = stack.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            if current not in self._specs:
-                continue
-            if current not in self._built:
-                collected.append(current)
-            for dep in self._specs[current].handoffs:
-                if dep not in visited:
-                    stack.append(dep)
-        return collected
 
     def _wire(self, spec: RealtimeAgentSpec, agent: Any) -> None:
         """ビルド済み RealtimeAgent に handoffs を後付け結線する。"""

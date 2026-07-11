@@ -12,6 +12,7 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ._registry_core import build_two_pass, collect_reachable
 from ._validation import validate_instructions_callable
 from .spec import AgentSpec
 
@@ -166,48 +167,11 @@ class AgentRegistry:
         if name not in self._specs:
             raise KeyError(f"unknown agent: {name}")
 
-        reachable = self._collect_reachable(name)
-        # パス 1/2 はトランザクショナルに実行する。途中で例外が出たら本呼び出しで
-        # 新規キャッシュした bare agent を巻き戻し、不完全なインスタンスを残さない。
-        newly_built: list[str] = []
-        try:
-            # パス 1: handoffs 空・サブツール未注入でビルドして登録
-            for target in reachable:
-                if target not in self._built:
-                    self._built[target] = self._build_bare(self._specs[target])
-                    newly_built.append(target)
-            # パス 2: handoffs / sub_agents を後付け結線
-            for target in reachable:
-                self._wire(self._specs[target], self._built[target])
-        except Exception:
-            for target in newly_built:
-                self._built.pop(target, None)
-            raise
+        # 到達可能収集とトランザクショナルな 2 パス build/wire + 巻き戻しは共有 leaf
+        # `_registry_core` に委譲する（差分点＝依存辺・bare ビルド・結線はコールバックで注入）。
+        reachable = collect_reachable(name, self._specs, self._built, self._dependencies)
+        build_two_pass(reachable, self._specs, self._built, self._build_bare, self._wire)
         return self._built[name]
-
-    def _collect_reachable(self, name: str) -> list[str]:
-        """name から依存辺（handoffs ∪ sub_agents）を辿り未ビルドの spec 名を集める。
-
-        visited 集合で循環を打ち切る。到達不能 spec は含めない。spec でない依存名
-        （factory / 未登録）は収集対象外（factory は get() 時に自前構築、未登録は
-        結線フェーズでエラーになる）。
-        """
-        collected: list[str] = []
-        visited: set[str] = set()
-        stack = [name]
-        while stack:
-            current = stack.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            if current not in self._specs:
-                continue
-            if current not in self._built:
-                collected.append(current)
-            for dep in self._dependencies(self._specs[current]):
-                if dep not in visited:
-                    stack.append(dep)
-        return collected
 
     def _build_bare(self, spec: AgentSpec) -> Agent:
         return self._builder().build(spec)
