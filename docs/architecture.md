@@ -84,7 +84,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -95,8 +95,9 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 |---|---|
 | `spec.py` | `AgentSpec` の定義。`agents.Agent` の薄い Wrapper。`agents` 非依存の宣言的データ。最下層 |
 | `protocols.py` | `AgentBuilder` の Protocol 定義。`agents` 非依存 |
-| `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証）。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
+| `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
 | `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
+| `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
 | `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
@@ -363,6 +364,8 @@ mutation が成立する。
 
 `register` 時点ではビルドしない（遅延性を維持）。構築後、object identity が保証される
 （`a.handoffs[0] is registry.get("b")` かつ `b.handoffs[0] is registry.get("a")`）。
+
+到達可能収集と 2 パス + 巻き戻しの骨格は共有 leaf `_registry_core` に一元化し、通常 / Realtime 両 registry が委譲する（差分点の注入方式はコンポーネントの責務表を参照）。
 
 詳細な検討経緯は `docs/rationale/handoff-cycle-resolution.md` を参照。
 
@@ -779,7 +782,8 @@ _adapters/realtime  →  agents.realtime（SDK 結合はここに閉じる）
 - `extra` に専用フィールドと同名のキー、または RealtimeAgent / AgentBase が受け付けない未知キー
   （`model` / `model_settings` / `output_type` / `tool_use_behavior` / `input_guardrails` 等）が含まれる
   場合は `ValueError`（agent 名と該当キー名を含む）。有効 kwarg は `RealtimeAgent` の dataclass フィールドから
-  導出する。
+  導出する。判定・メッセージは通常ルートと共有の `_validation` leaf（`validate_extra_kwargs`）に一元化する
+  （既存の `ensure_static_prompt` 共有委譲と同流儀。各アダプタは算出済みフィールド名 frozenset とラベル文字列を渡す）。
 - `RealtimeHandoffConfig` は `input_filter` / `options` / `extra` を型として持たないため、非対応の
   `input_filter` を渡す経路自体が存在しない（型レベル排除で完結し、実行時 reject は不要）。
 - 未指定（None / 空）のフィールドは kwargs に積まず RealtimeAgent の既定に委ねる（明示的に None を渡さない）。
