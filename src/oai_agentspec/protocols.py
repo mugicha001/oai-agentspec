@@ -20,6 +20,11 @@ class AgentBuilder(Protocol):
     handoffs は空で構築し、サブエージェントのツールも注入しない。これらの結線は
     registry の局所 2 パス遅延バインドが担う。テストでは本物の `agents.Agent` を
     構築しないフェイクを注入できる。
+
+    spec は `AgentSpec` のサブクラス（`SandboxAgentSpec` 等）でありうる。デフォルト
+    実装（`_adapters.build_agent`）は `SandboxAgentSpec` に対して
+    `agents.sandbox.SandboxAgent` を構築する。カスタム実装が構築先クラスをどう扱うかは
+    実装側の責務となる。
     """
 
     def build(self, spec: AgentSpec) -> Agent:
