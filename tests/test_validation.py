@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import pytest
 
-from oai_agentspec._validation import validate_realtime_handoff_options
+from oai_agentspec._validation import (
+    validate_instructions_callable,
+    validate_realtime_handoff_options,
+)
 from oai_agentspec.realtime.spec import RealtimeHandoffConfig
 
 
@@ -100,3 +103,29 @@ def test_異常系_2引数期待に1引数の_on_handoff_は_ValueError() -> Non
 def test_境界_シグネチャ取得不能な_on_handoff_はスキップ() -> None:
     """inspect.signature が取れない callable（builtin 等）は arity 検査をスキップし通過する。"""
     validate_realtime_handoff_options("a", ["b"], {"b": RealtimeHandoffConfig(on_handoff=zip)})
+
+
+# ------------------------------------------------------------------
+# validate_instructions_callable: フィールドラベル引数（Issue #21 T2・RED 先行）
+# ------------------------------------------------------------------
+def test_既定ラベルのメッセージは_instructions_のまま不変() -> None:
+    """フィールドラベル未指定時のエラーメッセージ原文は従来どおり instructions を含む。"""
+    with pytest.raises(ValueError) as excinfo:
+        validate_instructions_callable("a", lambda x: x)
+    assert str(excinfo.value) == (
+        "agent 'a': instructions callable は (context, agent) の 2 引数で呼び出せる必要があります"
+    )
+
+
+def test_フィールドラベル指定でメッセージが_base_instructions_になる() -> None:
+    """field_label='base_instructions' 指定時はメッセージに base_instructions が入る。"""
+    with pytest.raises(ValueError) as excinfo:
+        validate_instructions_callable("a", lambda x: x, field_label="base_instructions")
+    message = str(excinfo.value)
+    assert "'a'" in message
+    assert "base_instructions" in message
+
+
+def test_フィールドラベル指定でも2引数_callable_は通過() -> None:
+    """field_label を指定しても (context, agent) の 2 引数 callable は検証を通過する。"""
+    validate_instructions_callable("a", lambda c, a: "x", field_label="base_instructions")
