@@ -18,8 +18,10 @@ if TYPE_CHECKING:
     from .realtime.spec import RealtimeHandoffConfig
 
 
-def validate_instructions_callable(agent_name: str, instructions: Any) -> None:
-    """callable instructions が (context, agent) の 2 引数で呼び出せることを検証する。
+def validate_instructions_callable(
+    agent_name: str, instructions: Any, *, field_label: str = "instructions"
+) -> None:
+    """callable な instructions 系の値が (context, agent) の 2 引数で呼び出せることを検証する。
 
     SDK は instructions を `(context, agent)` の 2 位置引数で呼び出すため、bind による
     呼び出し可能性のみを検証する（デフォルト引数・可変長は許容）。シグネチャ取得不能な
@@ -28,6 +30,8 @@ def validate_instructions_callable(agent_name: str, instructions: Any) -> None:
     Args:
         agent_name: エラーメッセージに含めるエージェント名。
         instructions: spec の instructions 値（callable でなければ何もしない）。
+        field_label: エラーメッセージに埋め込むフィールド表示名（既定 `"instructions"`。
+            `SandboxAgentSpec.base_instructions` の検証時に `"base_instructions"` を渡す）。
 
     Raises:
         ValueError: callable が 2 引数で呼び出せない場合。
@@ -43,7 +47,7 @@ def validate_instructions_callable(agent_name: str, instructions: Any) -> None:
         sig.bind(object(), object())
     except TypeError:
         raise ValueError(
-            f"agent {agent_name!r}: instructions callable は (context, agent) の "
+            f"agent {agent_name!r}: {field_label} callable は (context, agent) の "
             f"2 引数で呼び出せる必要があります"
         ) from None
 
