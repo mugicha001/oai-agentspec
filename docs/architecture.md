@@ -230,6 +230,39 @@ Realtime シンボル（`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `Realtim
 model_settings / hooks）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
 場合は構築時に `ValueError` を送出する。
 
+### SandboxAgentSpec
+
+`SandboxAgentSpec` は `AgentSpec` を継承し、`agents.sandbox.SandboxAgent`（`agents.Agent` の
+正式なサブクラス）向けの専用フィールドを追加する dataclass。`AgentSpec` の全フィールド
+（`tools` / `handoffs` / `model` / `model_settings` / `hooks` / `input_guardrails` /
+`output_guardrails` / `sub_agents` 等）をそのまま継承して保持する。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `default_manifest` | `Any \| None` | サンドボックスのファイルシステム / env / マウント定義（SDK `Manifest` 相当。不透明型） |
+| `capabilities` | `Any \| None` | サンドボックスが提供する機能のトグル列（SDK `Sequence[Capability]` 相当。不透明型） |
+| `run_as` | `Any \| None` | サンドボックス実行時のユーザーコンテキスト（不透明型） |
+| `base_instructions` | `str \| Callable \| None` | サンドボックス実行エージェント向けの基底システムプロンプト。文字列、または `(context, agent)` の 2 引数 callable |
+
+`default_manifest` / `capabilities` / `run_as` / `base_instructions` は `agents.sandbox` の
+実型を持たない不透明型として宣言され、`spec.py` は `agents.sandbox` を import しない
+（`AgentSpec.model_settings` / `hooks` と同じ不透明型パターン）。4 フィールドとも未指定
+（`None`）の場合は構築時の kwargs に積まず、`SandboxAgent` 自身の既定値に委ねる（ライブラリ
+側で SDK の既定値を再現・ハードコードしない）。`capabilities` 未指定時の SDK 既定はシェル実行を
+含む機能群を有効化しうるため、最小権限にしたい場合は `capabilities` を明示指定すること。
+指定された list 値（`capabilities` 等）は build 時に新しい list へコピーされ、構築済み Agent へ
+spec 側リストの事後 mutation が伝播しない（`tools` と同じ遮断挙動）。
+
+`base_instructions` に callable を渡す場合、SDK が `(context, agent)` の 2 引数 callable を
+要求する点は `instructions` と同様だが、検証タイミングが異なる。`instructions` は
+`AgentRegistry` の register 時に検証されるのに対し、`base_instructions` の callable arity
+検証は `_adapters/builders.py` の build 時（`build_agent` 内）で行われる。これは `registry.py`
+が `SandboxAgentSpec` 固有の分岐を持たない（属性アクセスのみで動作する）方針を維持するための
+非対称である。`registry.py` は sandbox 固有の分岐を持たず、`AgentSpec` と `SandboxAgentSpec` を
+混在登録・混在ハンドオフできる。spec 複製（`freeze` / `clone`）の外部 mutation 遮断は、spec の
+全 dataclass フィールドを走査して list / dict 値を新コンテナに複製する方式であり、サブクラス
+固有の可変フィールド（`capabilities` 等）にも列挙の手動同期なしで適用される。
+
 ## SDK 隔離と依存性注入（DI）
 
 openai-agents への結合の隔離は `_adapters/__init__.py`（`from agents import ...` の単一窓口）が
@@ -239,7 +272,9 @@ openai-agents への結合の隔離は `_adapters/__init__.py`（`from agents im
 `protocols.py` の `AgentBuilder` Protocol は、これとは別の「生成処理そのものの差し替え」拡張点。
 
 - `AgentBuilder`: `build(spec) -> Agent`。handoffs を空にした Agent を 1 つ構築する責務。
-  デフォルト実装（`build_agent`）は `_adapters` に置く。
+  デフォルト実装（`build_agent`）は `_adapters` に置く。`build_agent` は spec を
+  `isinstance(spec, SandboxAgentSpec)` で分岐し、構築先クラス（`agents.Agent` /
+  `agents.sandbox.SandboxAgent`）を切り替える。
 - 注入点は `AgentRegistry.__init__(agent_builder=None)`。省略時は `_adapters` のデフォルト実装。
 
 `AgentBuilder` はテスト（`agents.Agent` を構築しないフェイク `FakeAgentBuilder` の注入）と、
