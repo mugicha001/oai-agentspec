@@ -157,6 +157,10 @@ class SandboxAgentSpec(AgentSpec):
     ため、最小権限にしたい場合は明示指定すること。`base_instructions` の callable arity
     検証は build 時（`_adapters`）に行う。
 
+    デフォルト builder（`_adapters.build_agent`）が `SandboxAgent` へ渡すのは本クラスで
+    宣言済みのフィールドのみ。本クラスをさらに継承して独自フィールドを追加しても
+    デフォルト builder は関知しない（カスタム `AgentBuilder` の注入が必要）。
+
     Attributes:
         default_manifest: `SandboxAgent.default_manifest`（SDK `Manifest` 相当の不透明型）。
         capabilities: `SandboxAgent.capabilities`（SDK `Sequence[Capability]` 相当の不透明型）。
