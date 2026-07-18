@@ -143,3 +143,33 @@ class AgentSpec:
     sub_agent_tools: dict[str, tuple[str | None, str | None]] = field(default_factory=dict)
     dynamic_handoffs: list[DynamicHandoff] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SandboxAgentSpec(AgentSpec):
+    """サンドボックスエージェントの宣言的定義（`SandboxAgent` の薄い Wrapper）。
+
+    `agents.sandbox.SandboxAgent`（`agents.Agent` のサブクラス）向けの宣言 dataclass。
+    `AgentSpec` の全フィールドを継承し、サンドボックス固有の 4 フィールドを追加する。
+    4 フィールドはいずれも未指定（None）の場合、build 時に kwargs へ積まれず SDK の
+    既定値に委ねられる（SDK の `Capabilities.default()` 等をここで再現・ハードコード
+    しない）。`capabilities` 未指定時の SDK 既定はシェル実行を含む機能群を有効化しうる
+    ため、最小権限にしたい場合は明示指定すること。`base_instructions` の callable arity
+    検証は build 時（`_adapters`）に行う。
+
+    デフォルト builder（`_adapters.build_agent`）が `SandboxAgent` へ渡すのは本クラスで
+    宣言済みのフィールドのみ。本クラスをさらに継承して独自フィールドを追加しても
+    デフォルト builder は関知しない（カスタム `AgentBuilder` の注入が必要）。
+
+    Attributes:
+        default_manifest: `SandboxAgent.default_manifest`（SDK `Manifest` 相当の不透明型）。
+        capabilities: `SandboxAgent.capabilities`（SDK `Sequence[Capability]` 相当の不透明型）。
+        run_as: `SandboxAgent.run_as`（SDK `User | str` 相当の不透明型）。
+        base_instructions: サンドボックス用ベースプロンプト。文字列、または
+            (context, agent) の 2 引数 callable。
+    """
+
+    default_manifest: Any = field(default=None, kw_only=True)
+    capabilities: Any = field(default=None, kw_only=True)
+    run_as: Any = field(default=None, kw_only=True)
+    base_instructions: str | Callable[..., Any] | None = field(default=None, kw_only=True)

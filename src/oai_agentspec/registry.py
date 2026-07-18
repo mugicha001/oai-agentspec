@@ -348,8 +348,8 @@ class AgentRegistry:
         if self._frozen:
             return
         # 外部からの spec mutation を遮断するため独立コピーに置き換える（_copy_spec は
-        # tools / handoffs / handoff_options / sub_agents / sub_agent_tools / dynamic_handoffs
-        # / input_guardrails / output_guardrails / extra を新 list/dict にコピーする）。
+        # spec の全 dataclass フィールドを走査し list/dict 値を新コンテナにコピーする。
+        # サブクラスの可変フィールド（SandboxAgentSpec.capabilities 等）も対象）。
         self._specs = {name: _copy_spec(spec) for name, spec in self._specs.items()}
         # コピー前の spec から組まれた Agent は無効化（次回 get() で snapshot から再構築）。
         self._built.clear()
@@ -444,29 +444,28 @@ class AgentRegistry:
 def _copy_spec(spec: AgentSpec) -> AgentSpec:
     """`AgentSpec` を独立コピーする（新オブジェクト + 可変コンテナを新 list/dict に複製）。
 
-    `clone` が登録する spec を元 registry と identity / 可変コンテナ共有しないようにするための
-    ヘルパ。`AgentSpec` のミュータブル list/dict フィールド（`tools` / `input_guardrails` /
-    `output_guardrails` / `handoffs` / `handoff_options` / `sub_agents` / `sub_agent_tools` /
-    `dynamic_handoffs` / `extra`）を全て新インスタンスに浅くコピーする（中身の要素 = FunctionTool /
-    guardrail / handoff 名 / DynamicHandoff 等は共有でよい。`apply` 等が触るのはコンテナと spec
+    `clone` / `freeze` が保持する spec を元 registry と identity / 可変コンテナ共有しない
+    ようにするためのヘルパ。spec の全 dataclass フィールドを走査し、値が list / dict の
+    フィールドを全て新インスタンスに浅くコピーする（中身の要素 = FunctionTool / guardrail /
+    handoff 名 / DynamicHandoff 等は共有でよい。`apply` 等が触るのはコンテナと spec
     オブジェクト自体のため）。スカラー / 不変フィールド（`name` / `instructions` / `model` 等）は
-    そのまま引き継ぐ。
+    そのまま引き継ぐ。フィールド列挙を宣言（`dataclasses.fields`）から導出するため、
+    `AgentSpec` のサブクラス（`SandboxAgentSpec` の `capabilities` 等）の可変コンテナも
+    列挙の手動同期なしで複製対象になる。
 
     Args:
-        spec: コピー元の `AgentSpec`。
+        spec: コピー元の `AgentSpec`（サブクラス可。戻り値は同一クラス）。
 
     Returns:
         可変コンテナを共有しない独立した `AgentSpec`。
     """
-    return dataclasses.replace(
-        spec,
-        tools=list(spec.tools),
-        input_guardrails=list(spec.input_guardrails),
-        output_guardrails=list(spec.output_guardrails),
-        handoffs=list(spec.handoffs),
-        handoff_options=dict(spec.handoff_options),
-        sub_agents=list(spec.sub_agents),
-        sub_agent_tools=dict(spec.sub_agent_tools),
-        dynamic_handoffs=list(spec.dynamic_handoffs),
-        extra=dict(spec.extra),
-    )
+    copies: dict[str, Any] = {}
+    for f in dataclasses.fields(spec):
+        if not f.init:
+            continue
+        value = getattr(spec, f.name)
+        if isinstance(value, list):
+            copies[f.name] = list(value)
+        elif isinstance(value, dict):
+            copies[f.name] = dict(value)
+    return dataclasses.replace(spec, **copies)
