@@ -104,12 +104,13 @@ def build_resolver(classifier: Any) -> Any:
         payload = json.loads(input_json) if input_json else {}
         rewritten = payload.get("utterance", "")
         print(f"[REWRITE]    {rewritten}")
-        try:
-            prediction = await classifier.classify(IntentQuery(utterance=rewritten))
-        except ValueError:
-            # triage が空 utterance を返した場合（分類対象なし）は crash させず受付へ。
+        if not rewritten:
+            # triage が空 utterance を返した場合（分類対象なし）は分類せず受付へ。
+            # except ValueError で受けると pydantic.ValidationError（そのサブクラス）
+            # まで飲み込みパース失敗を隠すため、事前チェックで分岐する。
             print("[RESOLVE]    utterance が空 -> reception")
             return FALLBACK
+        prediction = await classifier.classify(IntentQuery(utterance=rewritten))
 
         # RunContextWrapper を開いて run スコープの state に分類結果を書き込む。
         state = context.context

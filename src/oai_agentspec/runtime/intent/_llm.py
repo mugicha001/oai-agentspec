@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Callable
 from typing import Any
 
@@ -37,11 +36,6 @@ logger = logging.getLogger(__name__)
 _LEVEL_ORDER: dict[ConfidenceLevel, int] = {level: idx for idx, level in enumerate(ConfidenceLevel)}
 
 
-# Markdown コードフェンス（```json ... ``` / ``` ... ```）で全体が包まれた応答にマッチする。
-# 改行の有無・言語タグ直後に本文が続く形（```json{...}```）も 1 パターンで剥がす。
-_FENCE_RE = re.compile(r"^```[\w-]*\s*(.*?)\s*```$", re.DOTALL)
-
-
 def _strip_code_fence(raw: str) -> str:
     """LLM 応答が Markdown コードフェンスで包まれていた場合に中身だけを取り出す。
 
@@ -50,6 +44,9 @@ def _strip_code_fence(raw: str) -> str:
     （```json {...}```）や言語タグ直後に本文が続く形も対象。フェンスでない応答は
     そのまま返す（strip 以外の加工はしない）。
 
+    LLM 由来の非信頼入力を受けるため正規表現は使わず、入力長に対し線形時間で
+    処理する（ReDoS 回避・CWE-1333）。
+
     Args:
         raw: LLM の生応答テキスト。
 
@@ -57,8 +54,14 @@ def _strip_code_fence(raw: str) -> str:
         フェンスを剥がした（または元のままの）テキスト。
     """
     text = raw.strip()
-    match = _FENCE_RE.match(text)
-    return match.group(1).strip() if match else text
+    if text.startswith("```") and text.endswith("```") and len(text) >= 6:
+        body = text[3:-3]
+        # 言語タグ（先頭の英数字・_- の連続）を除去
+        i = 0
+        while i < len(body) and (body[i].isalnum() or body[i] in "_-"):
+            i += 1
+        return body[i:].strip()
+    return text
 
 
 class LLMCandidateGenerator:
@@ -114,7 +117,10 @@ class LLMCandidateGenerator:
                 例外メッセージには LLM の生出力の一部が含まれるため、外部露出
                 （ログ・API レスポンス）前に握り替えを検討すること。
             ValueError: prompt callable の返す user_content と history_items の
-                両方が空の場合（adapter の fail-fast から伝播）。
+                両方が空の場合（adapter の fail-fast から伝播）。なお
+                `ValidationError` は `ValueError` のサブクラスのため、
+                `except ValueError` は両方を捕捉する。選別して扱う場合は
+                `isinstance` 等の型分岐で判別すること。
         """
         system = self._policy.render_prompt() if self._include_policy_in_system else ""
         user_content = self._prompt(context)

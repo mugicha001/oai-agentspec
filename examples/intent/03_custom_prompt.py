@@ -63,7 +63,8 @@ def build_prompt(context: IntentContext) -> str:
     cats = "\n".join(f"- {c.name}: {c.description}" for c in POLICY.categories)
     # utterance に ``` が含まれるとフェンスが閉じられ脱出可能なため、utterance 内の ``` は事前に
     # 除去またはランダム区切り文字への差し替えを検討する（このサンプルは緩和策の例示に留める）。
-    fenced_utterance = context.utterance.replace("```", "``​`")
+    # U+200B (zero width space) を挟んでフェンス 3 連を分断する（不可視文字は明示指定）。
+    fenced_utterance = context.utterance.replace("```", "``\u200b`")
     return (
         "あなたは意図分類器です。次のいずれかのカテゴリに分類し、JSON のみを出力してください。\n\n"
         f"Categories:\n{cats}\n\n"
