@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING, Any
 
 from agents import (
     RawResponsesStreamEvent,
-    RunContextWrapper,
     Runner,
     RunState,
 )
@@ -25,6 +24,7 @@ from openai.types.responses import (
     ResponseTextDeltaEvent,
 )
 
+from .run_context import unwrap_run_context
 from .runner import _outcome_from_result
 
 if TYPE_CHECKING:
@@ -117,7 +117,7 @@ async def run_streamed_outcome(
     Yields:
         テキスト断片（`str`）を 0 件以上、最後に終端の `RunOutcome` を 1 件。
     """
-    raw_context = context.context if isinstance(context, RunContextWrapper) else context
+    raw_context = unwrap_run_context(context)
     streamed = Runner.run_streamed(
         agent, input, context=raw_context, session=session, **runner_kwargs
     )
@@ -155,7 +155,7 @@ async def run_streamed_text(
     Yields:
         `StreamTextDelta`（テキスト断片）に続き、最後に `StreamTextDone`（最終出力）。
     """
-    raw_context = context.context if isinstance(context, RunContextWrapper) else context
+    raw_context = unwrap_run_context(context)
     streamed = Runner.run_streamed(
         agent, input, context=raw_context, session=session, **runner_kwargs
     )
