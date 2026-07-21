@@ -16,12 +16,19 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents import FunctionTool, function_tool
 
 from .._validation import validate_extra_kwargs
-from ..tool_registry import _UNSET, ToolSpec
+from ..constants import TOOL_UNSET
+
+if TYPE_CHECKING:
+    # 型ヒント専用の一方向参照（実行時 import なし・W1 修正）。
+    # `_adapters -> tool_registry` の実行時上向き参照を持たないことで、
+    # 将来 tool_registry 側に `_adapters` のトップレベル import が入っても
+    # 循環にならない構造を維持する。
+    from ..tool_registry import ToolSpec
 
 __all__ = ["build_function_tool"]
 
@@ -107,10 +114,10 @@ def build_function_tool(
     if spec.strict_mode is not None:
         kwargs["strict_mode"] = spec.strict_mode
 
-    # failure_error_function の 3 値: `_UNSET` なら渡さない（SDK 既定 formatter に委ねる）、
+    # failure_error_function の 3 値: `TOOL_UNSET` なら渡さない（SDK 既定 formatter に委ねる）、
     # それ以外（None 明示 / callable）は渡す。SDK 側で None 明示は「例外を素通し」の意味に
     # なるため 3 値の区別が保持される（設計判断 4）。
-    if spec.failure_error_function is not _UNSET:
+    if spec.failure_error_function is not TOOL_UNSET:
         kwargs["failure_error_function"] = spec.failure_error_function
 
     # is_enabled: enabled_supplier を SDK シグネチャ (ctx, agent) -> bool にラップ。

@@ -14,12 +14,17 @@ import keyword
 from dataclasses import dataclass, field
 from typing import Any
 
+from .constants import TOOL_UNSET
+
 # ---------------------------------------------------------------------------
 # センチネル / 内部ヘルパ
 # ---------------------------------------------------------------------------
 #: `failure_error_function` の「未指定」を表す module-level センチネル。
-#: SDK private センチネルを import せずに 3 値（未指定 / callable / None）を表現する。
-_UNSET: Any = object()
+#: 実体は `constants.TOOL_UNSET`（コア最下層・agents 非依存）。`_adapters/tools.py`
+#: が本モジュールを実行時 import しなくても 3 値判定できるようコア層に一本化する。
+#: 後方互換のため本モジュールからは旧名 `_UNSET` として参照可能にする（既存テスト・
+#: docstring・利用者コードの `is _UNSET` 判定は不変）。
+_UNSET: Any = TOOL_UNSET
 
 #: `ToolRegistry` の公開メソッド名。属性アクセスと衝突する Tool 名の登録を拒否するために使う。
 _RESERVED_METHOD_NAMES: frozenset[str] = frozenset({"register", "names", "metadata"})

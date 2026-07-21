@@ -105,6 +105,40 @@ def test_正常系_timeout_None_omissionで未指定() -> None:
     assert tool_explicit.timeout_seconds == 10.0
 
 
+def test_正常系_timeout_behavior_None_omissionで未指定() -> None:
+    """`timeout_behavior=None` は kwarg を渡さず SDK 既定（"error_as_result"）に委ねる。
+
+    明示指定（`"raise_exception"`）が FunctionTool.timeout_behavior に反映される。
+    """
+    tool_default = build_function_tool(
+        ToolSpec(func=_sample_fn, timeout_behavior=None), lambda: True
+    )
+    assert tool_default.timeout_behavior == "error_as_result"
+    tool_explicit = build_function_tool(
+        ToolSpec(func=_sample_fn, timeout_behavior="raise_exception"), lambda: True
+    )
+    assert tool_explicit.timeout_behavior == "raise_exception"
+
+
+def test_正常系_timeout_error_function_None_omissionで未指定() -> None:
+    """`timeout_error_function=None` は kwarg を渡さず SDK 既定（None）に委ねる。
+
+    明示指定した callable が FunctionTool.timeout_error_function に格納される。
+    """
+
+    def my_timeout_fmt(ctx: object, err: Exception) -> str:
+        return f"custom timeout: {err}"
+
+    tool_default = build_function_tool(
+        ToolSpec(func=_sample_fn, timeout_error_function=None), lambda: True
+    )
+    assert tool_default.timeout_error_function is None
+    tool_explicit = build_function_tool(
+        ToolSpec(func=_sample_fn, timeout_error_function=my_timeout_fmt), lambda: True
+    )
+    assert tool_explicit.timeout_error_function is my_timeout_fmt
+
+
 # ---------------------------------------------------------------------------
 # 正常系: failure_error_function 3 値（_UNSET / callable / None 明示）
 # ---------------------------------------------------------------------------

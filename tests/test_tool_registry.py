@@ -244,6 +244,24 @@ def test_異常系_getattr_アンダースコア始まりは通常AttributeError
     assert "get_weather" not in msg
 
 
+def test_異常系_getattr_specs未初期化時は素のAttributeErrorで無限再帰しない() -> None:
+    """`__new__` バイパスで `_specs` 未初期化のインスタンスへの属性アクセスが
+
+    `_unknown_tool_message` → `self.names()` → `self._specs` → `__getattr__` の無限再帰
+    （RecursionError）にならず、素の `AttributeError`（`unknown tool` 文言を含まない）で
+    早期終了する二段防御パスを検証する（unpickle 等の想定シナリオ）。
+    """
+    # `__init__` をバイパスして `_specs` / `_built` 未初期化状態を作る。
+    reg = ToolRegistry.__new__(ToolRegistry)
+    with pytest.raises(AttributeError) as exc:
+        _ = reg.anything
+    msg = str(exc.value)
+    # 登録済み名一覧付きの分かりやすいメッセージには到達しない（防御パスは素の
+    # AttributeError で早期終了する）。
+    assert "unknown tool" not in msg
+    # `RecursionError` にはならない（`pytest.raises` を通過している時点で確認）。
+
+
 def test_正常系_getattr_登録済み名アクセス時にbuild_function_toolが1回だけ呼ばれキャッシュされる(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
