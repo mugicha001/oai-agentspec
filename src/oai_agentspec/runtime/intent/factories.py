@@ -23,6 +23,7 @@ def intent_classifier_from_model(
     policy: IntentPolicy,
     history_limit: int = 20,
     include_policy_in_system: bool = True,
+    model_settings: Any | None = None,
 ) -> DefaultIntentClassifier:
     """LLM モデルから既定構成の `DefaultIntentClassifier` を組み立てる。
 
@@ -32,6 +33,8 @@ def intent_classifier_from_model(
         policy: 分類器が守る契約。
         history_limit: `DefaultContextBuilder` が history から取得する上限件数。
         include_policy_in_system: True なら `policy.render_prompt()` を system に注入する。
+        model_settings: agents.ModelSettings 相当（不透明型）。None なら SDK 既定に委ねる。
+            `LLMCandidateGenerator` へそのまま pass-through する。
 
     Returns:
         `DefaultContextBuilder` + `LLMCandidateGenerator` を束ねた
@@ -44,5 +47,6 @@ def intent_classifier_from_model(
             prompt,
             policy=policy,
             include_policy_in_system=include_policy_in_system,
+            model_settings=model_settings,
         ),
     )

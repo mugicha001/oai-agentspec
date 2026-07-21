@@ -95,6 +95,7 @@ class _Capturer:
         user_content: str,
         *,
         context: Any = None,
+        model_settings: Any = None,
     ) -> str:
         self.calls.append(
             {
@@ -103,6 +104,7 @@ class _Capturer:
                 "history_items": history_items,
                 "user_content": user_content,
                 "context": context,
+                "model_settings": model_settings,
             }
         )
         return self.response
@@ -471,6 +473,45 @@ async def test_history_only_classification_flow(monkeypatch: pytest.MonkeyPatch)
     assert len(cap.calls) == 1
     assert cap.calls[0]["user_content"] == ""
     assert cap.calls[0]["history_items"] == items
+
+
+# ---- model_settings DI pass-through (Issue #24 追加改修) ----
+
+
+async def test_model_settings_forwarded_from_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """コンストラクタの `model_settings` が adapter の `model_settings=` に forward される。"""
+    from oai_agentspec.runtime.intent._llm import LLMCandidateGenerator
+
+    response = (
+        '{"candidates":[{"text":"ask","level":"high","rationale":"r"}],'
+        '"report":null,"metadata":null}'
+    )
+    cap = _Capturer(response)
+    _patch_run_intent_prompt(monkeypatch, cap)
+    sentinel = object()
+    gen = LLMCandidateGenerator(
+        IntentFakeModel(text=response),
+        lambda _ctx: "USER_PROMPT",
+        policy=_policy(),
+        model_settings=sentinel,
+    )
+    await gen.generate(_ctx())
+    assert len(cap.calls) == 1
+    assert cap.calls[0]["model_settings"] is sentinel
+
+
+async def test_model_settings_default_none_in_generator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`model_settings` 未指定時、adapter は `model_settings=None` を受ける（既定値 pin）。"""
+    response = (
+        '{"candidates":[{"text":"ask","level":"high","rationale":"r"}],'
+        '"report":null,"metadata":null}'
+    )
+    cap = _Capturer(response)
+    _patch_run_intent_prompt(monkeypatch, cap)
+    gen = _make_generator(response)
+    await gen.generate(_ctx())
+    assert len(cap.calls) == 1
+    assert cap.calls[0]["model_settings"] is None
 
 
 # ---- pydantic 型検査失敗 ----

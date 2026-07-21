@@ -67,6 +67,7 @@ class RecordingFakeModel(Model):
         self,
         system_instructions: str | None = None,
         input: Any = None,  # noqa: A002 - SDK シグネチャに追従
+        model_settings: Any = None,
         *args: Any,
         **kwargs: Any,
     ) -> ModelResponse:
@@ -75,6 +76,7 @@ class RecordingFakeModel(Model):
             {
                 "system_instructions": system_instructions,
                 "input": input,
+                "model_settings": model_settings,
                 "args": args,
                 "kwargs": kwargs,
             }

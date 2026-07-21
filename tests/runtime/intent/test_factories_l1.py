@@ -100,6 +100,21 @@ def test_factory_model_is_stored_in_generator() -> None:
     assert clf.generator._model is sentinel
 
 
+def test_factory_passes_model_settings_to_generator() -> None:
+    """model_settings がそのまま LLMCandidateGenerator._model_settings に格納される（不透明値）。"""
+    sentinel = object()
+    clf = intent_classifier_from_model(object(), _prompt, policy=_policy(), model_settings=sentinel)
+    assert isinstance(clf.generator, LLMCandidateGenerator)
+    assert clf.generator._model_settings is sentinel
+
+
+def test_factory_model_settings_default_none() -> None:
+    """model_settings 未指定時、generator の _model_settings は None（既定値 pin）。"""
+    clf = intent_classifier_from_model(object(), _prompt, policy=_policy())
+    assert isinstance(clf.generator, LLMCandidateGenerator)
+    assert clf.generator._model_settings is None
+
+
 def test_factory_policy_is_keyword_only() -> None:
     """policy は keyword-only（位置引数で渡すと TypeError）。"""
     with pytest.raises(TypeError):

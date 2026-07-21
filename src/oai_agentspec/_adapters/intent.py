@@ -18,6 +18,7 @@ async def run_intent_prompt(
     user_content: str,
     *,
     context: Any = None,
+    model_settings: Any = None,
 ) -> str:
     """agents.Agent + Runner.run を薄くラップして意図予測 LLM 応答を str で返す。
 
@@ -29,6 +30,9 @@ async def run_intent_prompt(
             履歴のみを送る。
         context: RunContext。`RunContextWrapper` の場合は `.context` を展開して forward、
             None も可（keyword-only）。
+        model_settings: agents.ModelSettings 相当（不透明型・keyword-only）。None なら
+            SDK 既定に委ねる。reasoning effort / verbosity / max_tokens 等のチューニングを
+            利用側 DI で渡すための pass-through。
 
     Returns:
         LLM の final_output を str 化したもの。None は空文字。
@@ -42,11 +46,14 @@ async def run_intent_prompt(
 
     from .run_context import unwrap_run_context
 
-    agent = Agent(
-        name="intent-classifier",
-        instructions=system or None,
-        model=model,
-    )
+    agent_kwargs: dict[str, Any] = {
+        "name": "intent-classifier",
+        "instructions": system or None,
+        "model": model,
+    }
+    if model_settings is not None:
+        agent_kwargs["model_settings"] = model_settings
+    agent = Agent(**agent_kwargs)
     input_items: list[Mapping[str, Any]] = list(history_items)
     if user_content:
         input_items.append({"role": "user", "content": user_content})

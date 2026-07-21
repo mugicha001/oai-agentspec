@@ -77,6 +77,7 @@ class LLMCandidateGenerator:
         *,
         policy: IntentPolicy,
         include_policy_in_system: bool = True,
+        model_settings: Any | None = None,
     ) -> None:
         """LLM 分類器を初期化する。
 
@@ -87,11 +88,15 @@ class LLMCandidateGenerator:
             include_policy_in_system: True なら `policy.render_prompt()` を system に注入する。
                 False の場合、categories と出力 JSON schema を LLM に伝達する責務は
                 `prompt` callable 側に移る（利用側が全制御するための escape hatch）。
+            model_settings: agents.ModelSettings 相当（不透明型・keyword-only）。None なら
+                SDK 既定に委ねる。利用側 DI で LLM 呼び出しのチューニングを渡すための
+                pass-through。
         """
         self._model = model
         self._prompt = prompt
         self._policy = policy
         self._include_policy_in_system = include_policy_in_system
+        self._model_settings = model_settings
 
     async def generate(self, context: IntentContext[Any]) -> IntentPrediction:
         """LLM を呼び出し、post-hoc 3 段適用済みの `IntentPrediction` を返す。
@@ -119,6 +124,7 @@ class LLMCandidateGenerator:
             context.history_items,
             user_content,
             context=context.run_context,
+            model_settings=self._model_settings,
         )
         parsed = IntentPrediction.model_validate_json(_strip_code_fence(raw))
 

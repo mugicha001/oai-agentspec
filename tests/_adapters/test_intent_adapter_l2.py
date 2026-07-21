@@ -199,6 +199,48 @@ async def test_whitespace_user_content_is_sent() -> None:
     assert model.calls[0]["input"] == [{"role": "user", "content": " "}]
 
 
+# ---------------------------------------------------------------------------
+# model_settings DI pass-through (Issue #24 追加改修): 低速モデル対策
+# ---------------------------------------------------------------------------
+
+
+async def test_model_settings_forwarded_to_agent() -> None:
+    """`model_settings=<ModelSettings>` を渡すと Agent 経由で model に resolve されて届く。
+
+    SDK は `Agent.model_settings` を resolve して `Model.get_response(model_settings=...)`
+    に渡すため、`RecordingFakeModel` が受けた `model_settings` の属性値で観測する。
+    """
+    from agents import ModelSettings
+
+    model = RecordingFakeModel(text="OK")
+    await run_intent_prompt(
+        model,
+        system="sys",
+        history_items=(),
+        user_content="hi",
+        model_settings=ModelSettings(max_tokens=123),
+    )
+    assert len(model.calls) == 1
+    captured = model.calls[0]["model_settings"]
+    assert captured is not None
+    assert captured.max_tokens == 123
+
+
+async def test_model_settings_default_none_uses_sdk_default() -> None:
+    """`model_settings` 未指定時は SDK 既定（`max_tokens is None`）のまま。"""
+    model = RecordingFakeModel(text="OK")
+    await run_intent_prompt(
+        model,
+        system="sys",
+        history_items=(),
+        user_content="hi",
+    )
+    assert len(model.calls) == 1
+    captured = model.calls[0]["model_settings"]
+    assert captured is not None
+    assert captured.max_tokens is None
+
+
 def test_signature_に_history_items_と_user_content_と_context_が含まれる() -> None:
     """新 signature の pin: parameter 名で契約を確認する（呼び出し互換の保証）。"""
     sig = inspect.signature(run_intent_prompt)

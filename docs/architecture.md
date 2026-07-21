@@ -1655,13 +1655,18 @@ pydantic 採用により、LLM I/O 契約は次のように単一ソース化さ
 
 ### `agents.Model` の DI と SDK 隔離
 
-`LLMCandidateGenerator(model, prompt, *, policy, include_policy_in_system=True)` の `model` は
-`agents.Model` 相当を不透明型（`Any`）として受ける DI。環境変数は参照しない（env 参照は runtime レイヤの
-規約通り `runtime/cli` 境界に閉じる）。
+`LLMCandidateGenerator(model, prompt, *, policy, include_policy_in_system=True, model_settings=None)` の
+`model` は `agents.Model` 相当を不透明型（`Any`）として受ける DI。`model_settings` も同様に
+`agents.ModelSettings` 相当の不透明型 DI で、reasoning effort / verbosity / max_tokens 等の
+チューニングを利用側から渡す（None なら SDK 既定。`intent_classifier_from_model` も同名 kwarg で
+pass-through する）。環境変数は参照しない（env 参照は runtime レイヤの規約通り `runtime/cli` 境界に
+閉じる）。
 
 SDK 結合は `_adapters/intent.py`（薄いラッパ
-`async run_intent_prompt(model, system, history_items, user_content, *, context=None) -> str`）に閉じる。
-adapter は `Agent(name="intent-classifier", instructions=system or None, model=model)` を組み、
+`async run_intent_prompt(model, system, history_items, user_content, *, context=None,
+model_settings=None) -> str`）に閉じる。
+adapter は `Agent(name="intent-classifier", instructions=system or None, model=model)`（`model_settings`
+が非 None のときのみ `model_settings=` を付与）を組み、
 `Runner.run(agent, input=input_items, context=raw_ctx)` を呼んで `str(result.final_output)`（`None` の
 場合は `""`）を返す。`input_items` は `history_items` に、`user_content` が非空の場合のみ
 `{"role":"user","content":user_content}` を末尾 append した list（空文字の `user_content` は turn を
