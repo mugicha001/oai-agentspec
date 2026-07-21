@@ -1651,7 +1651,11 @@ pydantic 採用により、LLM I/O 契約は次のように単一ソース化さ
   post-hoc 3 段は `LLMCandidateGenerator` の責務であり、`DefaultIntentClassifier` は generator の
   出力を素通しする（policy を強制しない）。独自 `CandidateGenerator` を DI する場合、policy を
   守らせたいなら実装側で同等の適用を行う。`IntentPrediction.candidates` の降順ソートは既定実装のみが
-  保証し、Protocol / 型としては強制されない。
+  保証し、Protocol / 型としては強制されない。独自 generator の組み立ては
+  `intent_classifier_from_generator(generator, *, history_limit=20)`（`intent_classifier_from_model` の
+  対称形・`DefaultContextBuilder` を内部で束ねる 1 行ヘルパ）で行える。generator の型検証は行わず
+  素通しで格納する（既存 factory と同一の非検証契約）。ContextBuilder まで差し替える場合は
+  `DefaultIntentClassifier` を直接組み立てる。
 
 ### `agents.Model` の DI と SDK 隔離
 
@@ -1688,7 +1692,8 @@ adapter は `Agent(name="intent-classifier", instructions=system or None, model=
 公開窓口は `oai_agentspec.runtime.intent`（他 runtime extra と同型・コア `__all__` には載せない）。公開シンボル:
 `ConfidenceLevel` / `IntentQuery` / `IntentContext` / `IntentCategory` / `IntentPolicy` / `IntentPrediction` /
 `IntentCandidate` / `ConsistencyReport` / `IntentClassifier` / `ContextBuilder` / `CandidateGenerator` /
-`DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model`。
+`DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
+`intent_classifier_from_generator`。
 
 ## テスト層
 
@@ -1708,12 +1713,12 @@ L1 テストダブルが `agents` に依存しない）は clean subprocess で�
 テストで機械的に固定する。
 
 intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（frozen・`IntentPolicy` の categories
-検証等）と `render_prompt()` の出力・`intent_classifier_from_model` の組み立てを `agents` 非依存で
-pin する。L2 は `LLMCandidateGenerator` の post-hoc 3 段（allowlist / sort / truncate）・コードフェンス
+検証等）と `render_prompt()` の出力・`intent_classifier_from_model` /
+`intent_classifier_from_generator` の組み立てを `agents` 非依存で pin する。L2 は `LLMCandidateGenerator` の post-hoc 3 段（allowlist / sort / truncate）・コードフェンス
 耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
 検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
 空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
-PEP 562 遅延再エクスポートと `__all__` 14 件の pin、履歴のみモード（`utterance=""` + history）の
+PEP 562 遅延再エクスポートと `__all__` 15 件の pin、履歴のみモード（`utterance=""` + history）の
 end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
 
 L2 には SDK バージョン耐性トリップワイヤ（NFR-7）を置く。openai-agents SDK との結合点で手組みしている

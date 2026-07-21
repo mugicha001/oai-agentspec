@@ -24,6 +24,7 @@ uv run python examples/intent/01_basic_classification.py
 ```
 
 各例は分類実行時に LLM へ流れる合成プロンプトを `[SYSTEM]` / `[USER]` として stdout に表示する。
+例外は 07 で、LLM を使わないため環境変数なしでオフライン実行できる。
 
 ## 例の一覧
 
@@ -35,6 +36,7 @@ uv run python examples/intent/01_basic_classification.py
 | 04 | `04_custom_context_builder.py` | 独自 `ContextBuilder` を差し替え、`run_context`（`UserProfile`）を素通しし prompt callable が user_content に反映。`DefaultIntentClassifier` を直接組み立て。`include_rationale_in_prompt=True` で判断理由を生成させるオプションのデモも兼ねる |
 | 05 | `05_intent_based_routing.py` | 信頼度分岐の統合フロー。`ConfidenceLevel` が certain/high なら下流 `AgentSpec` へ dispatch、それ未満なら実行せず複数候補を提示して聞き返す（実行しない判断・信頼度・複数候補は分類結果をデータとして持つ intent 固有のユースケース） |
 | 06 | `06_dynamic_edge_routing.py` | `HandoffGraph.dynamic_edge` と intent 分類器の合成による入口ルーティング。triage が `tool_choice="required"` で強制された `route` tool の引数として発話を分類しやすくリライトし、async resolver がそのリライト文を `intent_classifier_from_model` に入れて転送先を実行時決定する。taxonomy（分類対象）と routing 候補（転送先）を分離し、候補なし・信頼度不足は `reception`（受付・分類対象外の fallback）へ。分類結果は run ごとの state（`Runner.run(context=...)`）経由で reception の dynamic instructions（callable）に渡り、分類器が実際に迷った候補だけを提示して聞き返す |
+| 07 | `07_custom_candidate_generator.py` | `CandidateGenerator` Protocol を自作（キーワードマッチ・LLM 不使用）し、`intent_classifier_from_generator` の 1 行で束ねる。policy 強制（sort / truncate）が generator 責務であることの実演。環境変数不要・オフライン実行 |
 
 ## ルーティングの使い分け
 
@@ -93,8 +95,8 @@ uv run python examples/intent/01_basic_classification.py
   ```
 
   他の即効策: `history_limit` を 3-5 に絞る / `max_candidates=1` / non-reasoning モデル
-  （gpt-4.1-nano 等）への切替。LLM 自体を使わない embedding 分類は `CandidateGenerator`
-  差し替えで実現できる。
+  （gpt-4.1-nano 等）への切替。LLM 自体を使わない分類（キーワード・embedding 等）は
+  `CandidateGenerator` 差し替え + `intent_classifier_from_generator` で実現できる（例 07）。
 - **非 reasoning デプロイでの実行**: `reasoning` / `verbosity` は reasoning 系モデル専用の
   パラメータで、未対応モデル（gpt-4.1-nano 等）に送ると API エラーになる。
   `AZURE_OPENAI_DEPLOYMENT` を非 reasoning モデルに向ける場合は `AZURE_OPENAI_REASONING=0`
