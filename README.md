@@ -40,7 +40,7 @@
 | **ワークフロー（実験的）** | `WorkflowGraph` でノード（AGENT/FUNCTION）+ エッジ（通常 / 条件 / fan-in）を宣言、順次 / 並列 / 条件分岐 / 合流 / ループを表現 / build-time `validate()` / SDK tracing 自動配線（`workflow.*` span + AGENT 内側 `Runner.run` の親子接続・`set_tracing_disabled(True)` 時オーバーヘッド 0） |
 | **会話 Helper** | `ConversationService`（in-process または `[serve]` + `[cli]` のクライアント・サーバ型）/ SDK `Session` で永続化・途中再開 / HITL 承認（`function_tool(needs_approval=True)` を call_id 単位で approve / reject）/ compaction（`CompactionConfig.enabled=True` で履歴圧縮を明示有効化） |
 | **LLMOps（extras）** | `[llmops]` で観点別採点 + 統合 verdict（DeepEval ベース・任意で `[llmops-langfuse]` で Langfuse 観測）/ `[lightning]` で `AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning へ委譲して自動改善（textual gradient + beam search） |
-| **意図予測（extras）** | `[intent]` で発話 / 会話履歴からの意図分類基盤（`runtime/intent`）/ 信頼度 5 段階の候補列（`IntentPrediction`）/ `IntentPolicy` で意図集合・返却制約を宣言 / Protocol DI で全体・内部段を差し替え / `intent_classifier_from_model` の 1 行ヘルパ |
+| **意図予測（extras）** | `[intent]` で発話 / 会話履歴からの意図分類基盤（`runtime/intent`）/ 信頼度 5 段階の候補列（`IntentPrediction`）/ `IntentPolicy` で意図集合・返却制約を宣言 / Protocol DI で全体・内部段を差し替え / `intent_classifier_from_model` / `intent_classifier_from_generator`（自作 generator 用）の 1 行ヘルパ |
 
 詳細・サンプルは [コアコンセプト](#コアコンセプト) / [サンプル](#サンプル) を参照。
 
@@ -427,7 +427,7 @@ PromptLayout(base="base", parts="parts", agents="agents")
 `examples/` に実行可能なサンプルを用意している（AGENT を含む例は Azure OpenAI の Responses API を
 利用。環境変数は `examples/_shared/_azure.py` 参照）。「offline」と記した例は API キー不要で動く。
 カテゴリ別に `basic/`（基本・ハンドオフ）・`workflow/`（ワークフロー）・`conversation/`（会話 Helper）・
-`llmops/`（LLMOps 評価）・`lightning/`（Agent Lightning APO）に整理し、共有ヘルパーは `_shared/`、
+`llmops/`（LLMOps 評価）・`lightning/`（Agent Lightning APO）・`intent/`（意図予測）に整理し、共有ヘルパーは `_shared/`、
 プロンプト素材は `prompts/` に置く。`examples/prompts/` はプロンプト記法のサンプル（`PromptStore`
 レイアウト base/parts/agents・フロントマター・`${var}`・合成）で、詳細は `examples/prompts/README.md`
 を参照。
@@ -472,6 +472,9 @@ PromptLayout(base="base", parts="parts", agents="agents")
 | `examples/lightning/06_approval_match_apo.py` | `approval_match` で承認ゲート発火を APO 学習 |
 | `examples/lightning/07_composite_reward_apo.py` | `OptimizeCase` 全観点 + 複合 reward + 系全体最適化 |
 | `examples/lightning/README.md` | Agent Lightning APO の使い方（reward ファクトリ・`OptimizeResult`・`HistoryEntry` schema） |
+| `examples/intent/01_basic_classification.py` | `intent_classifier_from_model` 1 行ヘルパの最小分類例 |
+| `examples/intent/07_custom_candidate_generator.py` | 自作 `CandidateGenerator`（キーワードマッチ・LLM 不使用）を `intent_classifier_from_generator` で束ねる（offline） |
+| `examples/intent/README.md` | 意図予測の使い方（例 01-07 一覧・信頼境界・レイテンシチューニング） |
 
 ```bash
 uv run python examples/basic/basic.py
@@ -480,6 +483,7 @@ uv run python examples/conversation/01_inprocess.py
 uv run python examples/llmops/01_agent_quality_eval.py
 uv run python examples/lightning/01_single_agent_apo.py
 uv run python examples/lightning/05_failure_handling.py     # offline（API キー不要）
+uv run python examples/intent/07_custom_candidate_generator.py  # offline（API キー不要）
 ```
 
 会話 Helper（`ConversationService` / serve / CLI）・HITL・compaction の使い方は
