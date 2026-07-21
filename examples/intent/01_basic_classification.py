@@ -13,8 +13,12 @@ Azure OpenAI の環境変数（examples/_shared/_azure.py 参照）を設定し�
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
+
+from agents import ModelSettings
+from openai.types.shared import Reasoning
 
 from oai_agentspec.runtime.intent import (
     IntentCategory,
@@ -27,8 +31,19 @@ from oai_agentspec.runtime.intent import (
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
 
 from _timing import stopwatch  # noqa: E402
+from _warmup import warmup  # noqa: E402
 
 from _azure import azure_model  # noqa: E402
+
+# reasoning 系モデルの思考トークンを止めて分類レイテンシを最小化する（利用側 DI）。
+# 非 reasoning デプロイ（gpt-4.1-nano 等）では AZURE_OPENAI_REASONING=0 を設定すると
+# reasoning / verbosity パラメータ自体を送らない（未対応モデルでの API エラーを回避）。
+if os.environ.get("AZURE_OPENAI_REASONING", "1") != "0":
+    MODEL_SETTINGS = ModelSettings(
+        reasoning=Reasoning(effort="none"), verbosity="low", max_tokens=100
+    )
+else:
+    MODEL_SETTINGS = ModelSettings(max_tokens=100)
 
 
 def build_prompt(context: IntentContext) -> str:
@@ -46,10 +61,16 @@ async def main() -> None:
         max_candidates=3,
     )
 
+    # warmup と classifier で同じ model インスタンスを共有する（接続プールが client 単位のため）。
+    model = azure_model()
+    with stopwatch("warmup"):
+        await warmup(model, MODEL_SETTINGS)
+
     classifier = intent_classifier_from_model(
-        model=azure_model(),
+        model=model,
         prompt=build_prompt,
         policy=policy,
+        model_settings=MODEL_SETTINGS,
     )
 
     query = IntentQuery(utterance="このプランは月いくらですか?")

@@ -12,9 +12,13 @@ Azure OpenAI の環境変数（examples/_shared/_azure.py 参照）を設定し�
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from agents import ModelSettings
+from openai.types.shared import Reasoning
 
 from oai_agentspec.runtime.intent import (
     DefaultIntentClassifier,
@@ -27,8 +31,20 @@ from oai_agentspec.runtime.intent import (
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
 from _timing import stopwatch  # noqa: E402
+from _warmup import warmup  # noqa: E402
 
 from _azure import azure_model  # noqa: E402
+
+# reasoning 系モデルの思考トークンを止めて分類レイテンシを最小化する（利用側 DI）。
+# 本例は include_rationale_in_prompt=True で rationale も生成させるため、JSON が
+# 途中で切れないよう max_tokens は他例 (100) より余裕を持たせる。
+# 非 reasoning デプロイでは AZURE_OPENAI_REASONING=0 で reasoning / verbosity を送らない。
+if os.environ.get("AZURE_OPENAI_REASONING", "1") != "0":
+    MODEL_SETTINGS = ModelSettings(
+        reasoning=Reasoning(effort="none"), verbosity="low", max_tokens=300
+    )
+else:
+    MODEL_SETTINGS = ModelSettings(max_tokens=300)
 
 
 @dataclass(frozen=True)
@@ -72,13 +88,20 @@ def build_prompt(context: IntentContext[UserProfile]) -> str:
 
 
 async def main() -> None:
+    # warmup と classifier で同じ model インスタンスを共有する
+    # （接続プールが client 単位のため）。
+    model = azure_model()
+    with stopwatch("warmup"):
+        await warmup(model, MODEL_SETTINGS)
+
     # DefaultIntentClassifier を直接組み立て（Protocol 差し替えの例）。
     classifier = DefaultIntentClassifier(
         context_builder=UserProfileContextBuilder(),
         generator=LLMCandidateGenerator(
-            model=azure_model(),
+            model=model,
             prompt=build_prompt,
             policy=POLICY,
+            model_settings=MODEL_SETTINGS,
         ),
     )
 
