@@ -623,3 +623,57 @@ def test_strip_code_fence_single_line_variants() -> None:
     assert _strip_code_fence('```json {"x":1}```') == '{"x":1}'
     assert _strip_code_fence('```json{"a":1}\n```') == '{"a":1}'
     assert _strip_code_fence('```{"a":1}```') == '{"a":1}'
+
+
+def test_strip_code_fence_unclosed_fence_passthrough() -> None:
+    """開きフェンスのみ（閉じなし・max_tokens 切断で自然発生）は素通しする。"""
+    from oai_agentspec.runtime.intent._llm import _strip_code_fence
+
+    assert _strip_code_fence('```json\n{"a":1}') == '```json\n{"a":1}'
+
+
+def test_strip_code_fence_linear_time_on_unclosed_whitespace() -> None:
+    """「開きフェンス + 空白連続・閉じなし」入力でも線形時間で終了する（ReDoS 回帰 pin）。
+
+    バックトラックする正規表現実装では空白 2,000 文字で秒単位に劣化する。
+    線形実装なら 10 万文字でも余裕で 0.5 秒未満に収まる。
+    """
+    import time
+
+    from oai_agentspec.runtime.intent._llm import _strip_code_fence
+
+    # 末尾に非空白 1 文字を置く（strip() で空白塊が消えず本体処理へ届く形）。
+    text = "```json" + " " * 2_000 + "x"
+    t0 = time.perf_counter()
+    result = _strip_code_fence(text)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.5, f"_strip_code_fence took {elapsed:.2f}s (ReDoS regression)"
+    assert result == text
+
+
+async def test_allowlist_warning_escapes_control_characters(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """allowlist 除外ログは制御文字を repr でエスケープする（ログフォージング対策の pin）。
+
+    LLM 由来テキストに改行が含まれても、WARNING メッセージには生の改行が現れず
+    エスケープ表現（\\n）として記録される。
+    """
+    import logging
+
+    text = (
+        '{"candidates":['
+        '{"text":"ask","level":"high"},'
+        '{"text":"bad\\nname","level":"high"}'
+        '],"report":null,"metadata":null}'
+    )
+    gen = _make_generator(text)
+    with caplog.at_level(logging.WARNING, logger="oai_agentspec.runtime.intent._llm"):
+        await gen.generate(_ctx())
+
+    warning_messages = [r.getMessage() for r in caplog.records]
+    assert warning_messages, "allowlist 除外の WARNING が出ていない"
+    joined = " ".join(warning_messages)
+    # repr 化により生の改行はメッセージに一切含まれない（ログフォージング不可）
+    assert "bad" in joined
+    assert "\n" not in joined

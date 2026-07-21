@@ -175,6 +175,15 @@ def test_intent_policy_render_prompt_empty_extra_instructions_no_change() -> Non
     assert default_prompt == empty_extra_prompt
 
 
+def test_intent_policy_render_prompt_whitespace_only_extra_instructions_no_change() -> None:
+    """空白のみの extra_instructions は空扱いで、既定と同一出力（先頭に空行を挿入しない）。"""
+    categories = (_make_category(),)
+    default_prompt = IntentPolicy(categories=categories).render_prompt()
+    for ws in ("   ", "\n", " \n\n "):
+        ws_prompt = IntentPolicy(categories=categories, extra_instructions=ws).render_prompt()
+        assert ws_prompt == default_prompt, f"extra_instructions={ws!r} で出力が変わった"
+
+
 def test_intent_policy_render_prompt_rationale_marked_optional_in_example() -> None:
     """include_rationale_in_prompt=True の出力例 JSON では rationale フィールドを含む。"""
     policy = IntentPolicy(categories=(_make_category(),), include_rationale_in_prompt=True)
