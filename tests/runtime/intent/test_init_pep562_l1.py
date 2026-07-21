@@ -26,15 +26,16 @@ _EXPECTED_ALL = {
     "DefaultIntentClassifier",
     "LLMCandidateGenerator",
     "intent_classifier_from_model",
+    "intent_classifier_from_generator",
 }
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 14 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 15 件で設計仕様通りのメンバ集合と一致する。"""
     import oai_agentspec.runtime.intent as intent_mod
 
     assert set(intent_mod.__all__) == _EXPECTED_ALL
-    assert len(intent_mod.__all__) == 14
+    assert len(intent_mod.__all__) == 15
 
 
 def test_all_does_not_include_confidence_level_description() -> None:

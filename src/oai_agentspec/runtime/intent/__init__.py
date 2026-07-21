@@ -4,7 +4,8 @@
 `IntentPrediction` / `IntentCandidate` / `ConsistencyReport` / `ConfidenceLevel`）、
 Protocol（`IntentClassifier` / `ContextBuilder` / `CandidateGenerator`）、
 デフォルト実装（`DefaultIntentClassifier` / `LLMCandidateGenerator`）、および 1 行
-ヘルパ（`intent_classifier_from_model`）を再エクスポートする。
+ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator`）を
+再エクスポートする。
 
 型は pydantic に依存するため、本窓口は PEP 562 (`__getattr__`) による遅延再エクスポートに
 統一する。窓口 import 自体は intent extra 未導入でも壊れず、属性アクセス時に初めて
@@ -33,6 +34,7 @@ __all__ = [
     "DefaultIntentClassifier",
     "LLMCandidateGenerator",
     "intent_classifier_from_model",
+    "intent_classifier_from_generator",
 ]
 
 
@@ -51,7 +53,7 @@ _TYPE_SYMBOLS = frozenset(
 _PROTOCOL_SYMBOLS = frozenset({"IntentClassifier", "ContextBuilder", "CandidateGenerator"})
 _DEFAULT_SYMBOLS = frozenset({"DefaultIntentClassifier"})
 _LLM_SYMBOLS = frozenset({"LLMCandidateGenerator"})
-_FACTORY_SYMBOLS = frozenset({"intent_classifier_from_model"})
+_FACTORY_SYMBOLS = frozenset({"intent_classifier_from_model", "intent_classifier_from_generator"})
 
 
 def __getattr__(name: str) -> Any:
@@ -87,9 +89,9 @@ def __getattr__(name: str) -> Any:
 
         value = LLMCandidateGenerator
     elif name in _FACTORY_SYMBOLS:
-        from .factories import intent_classifier_from_model
+        from . import factories as _factories
 
-        value = intent_classifier_from_model
+        value = getattr(_factories, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value

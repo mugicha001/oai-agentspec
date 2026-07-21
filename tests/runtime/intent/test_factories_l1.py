@@ -1,8 +1,10 @@
-"""L1: `runtime.intent.factories.intent_classifier_from_model` の組み立て契約ピン留め。
+"""L1: `runtime.intent.factories` の 2 factory の組み立て契約ピン留め。
 
-model / prompt / policy / history_limit / include_policy_in_system が
-DefaultIntentClassifier(DefaultContextBuilder + LLMCandidateGenerator) の
-対応する属性へそのまま流れることを検証する。実 SDK / 実 LLM は呼ばない。
+`intent_classifier_from_model`: model / prompt / policy / history_limit /
+include_policy_in_system が DefaultIntentClassifier(DefaultContextBuilder +
+LLMCandidateGenerator) の対応する属性へそのまま流れることを検証する。
+`intent_classifier_from_generator`: 自作 generator の素通し格納（非検証契約）と
+DefaultContextBuilder の組み立てを検証する。実 SDK / 実 LLM は呼ばない。
 """
 
 from __future__ import annotations
@@ -16,7 +18,10 @@ from oai_agentspec.runtime.intent._default import (
     DefaultIntentClassifier,
 )
 from oai_agentspec.runtime.intent._llm import LLMCandidateGenerator
-from oai_agentspec.runtime.intent.factories import intent_classifier_from_model
+from oai_agentspec.runtime.intent.factories import (
+    intent_classifier_from_generator,
+    intent_classifier_from_model,
+)
 from oai_agentspec.runtime.intent.types import (
     IntentCategory,
     IntentContext,
@@ -119,3 +124,36 @@ def test_factory_policy_is_keyword_only() -> None:
     """policy は keyword-only（位置引数で渡すと TypeError）。"""
     with pytest.raises(TypeError):
         intent_classifier_from_model(object(), _prompt, _policy())  # type: ignore[misc]
+
+
+def test_from_generator_returns_default_intent_classifier() -> None:
+    """from_generator は DefaultIntentClassifier インスタンスを返す。"""
+    clf = intent_classifier_from_generator(object())
+    assert isinstance(clf, DefaultIntentClassifier)
+
+
+def test_from_generator_generator_is_stored_as_is() -> None:
+    """generator はそのまま格納される（isinstance 検証しない非検証契約・同一性 pin）。"""
+    sentinel = object()
+    clf = intent_classifier_from_generator(sentinel)
+    assert clf.generator is sentinel
+
+
+def test_from_generator_context_builder_default_history_limit_is_20() -> None:
+    """context_builder は DefaultContextBuilder で history_limit デフォルト 20。"""
+    clf = intent_classifier_from_generator(object())
+    assert isinstance(clf.context_builder, DefaultContextBuilder)
+    assert clf.context_builder.history_limit == 20
+
+
+def test_from_generator_history_limit_is_propagated() -> None:
+    """history_limit=5 を渡すと DefaultContextBuilder に反映される。"""
+    clf = intent_classifier_from_generator(object(), history_limit=5)
+    assert isinstance(clf.context_builder, DefaultContextBuilder)
+    assert clf.context_builder.history_limit == 5
+
+
+def test_from_generator_history_limit_is_keyword_only() -> None:
+    """history_limit は keyword-only（位置引数で渡すと TypeError）。"""
+    with pytest.raises(TypeError):
+        intent_classifier_from_generator(object(), 5)  # type: ignore[misc]
