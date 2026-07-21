@@ -59,37 +59,42 @@ def validate_extra_kwargs(
     dedicated: frozenset[str],
     field_names: frozenset[str],
     agent_label: str,
+    subject_label: str = "agent",
 ) -> None:
-    """spec.extra の専用フィールド衝突・未知キーを検証する（両ルートのアダプタが共有）。
+    """spec.extra の専用フィールド衝突・未知キーを検証する（Agent / Tool の両ルートが共有）。
 
-    通常ルート（`build_agent`）と Realtime 専用ルート（`build_realtime_agent`）の
-    extra 検証を一元化する。SDK 型の有効 kwarg 集合（`field_names`）と専用フィールド集合
-    （`dedicated`）は各アダプタで算出済みの `frozenset` を渡すため、本ヘルパは agents 非依存を
-    保つ。衝突検査を未知検査より先に行う順序・両メッセージ文字列を単一ソースで維持する。
+    Agent ルート（`build_agent` / `build_realtime_agent`）と Tool ルート
+    （`build_function_tool`）の extra 検証を一元化する。SDK 型の有効 kwarg 集合
+    （`field_names`）と専用フィールド集合（`dedicated`）は各アダプタで算出済みの
+    `frozenset` を渡すため、本ヘルパは agents 非依存を保つ。衝突検査を未知検査より先に
+    行う順序・両メッセージ文字列を単一ソースで維持する。
 
     Args:
-        agent_name: エラーメッセージに含めるエージェント名。
+        agent_name: エラーメッセージに含める subject 名（Agent の場合は agent 名、
+            Tool の場合は tool 名）。引数名は既存呼び出し互換性のため維持している。
         extra: spec の extra（キー集合のみ参照する）。
         dedicated: spec 側で別扱いする専用フィールド名の集合（extra から除外する対象）。
-        field_names: 対象 SDK Agent が受け付ける有効 kwarg 名の集合。
-        agent_label: 未知キーメッセージに埋め込む SDK クラス表示名
-            （`agents.Agent` / `agents.realtime.RealtimeAgent`）。
+        field_names: 対象 SDK 型が受け付ける有効 kwarg 名の集合。
+        agent_label: 未知キーメッセージに埋め込む SDK クラス/関数の表示名
+            （`agents.Agent` / `agents.realtime.RealtimeAgent` / `agents.function_tool`）。
+        subject_label: エラーメッセージの主語ラベル（既定 `"agent"` で後方互換）。
+            Tool ルートからは `"tool"` を指定する。
 
     Raises:
-        ValueError: extra に専用フィールド名と同名のキー、または対象 Agent が受け付けない
+        ValueError: extra に専用フィールド名と同名のキー、または対象 SDK 型が受け付けない
             未知のキーが含まれる場合。
     """
     collisions = dedicated & extra.keys()
     if collisions:
         raise ValueError(
-            f"agent {agent_name!r}: extra に専用フィールドと同名のキーが含まれます: "
+            f"{subject_label} {agent_name!r}: extra に専用フィールドと同名のキーが含まれます: "
             f"{sorted(collisions)}"
         )
     unknown = extra.keys() - field_names
     if unknown:
         raise ValueError(
-            f"agent {agent_name!r}: extra に {agent_label} が受け付けないキーが含まれます: "
-            f"{sorted(unknown)}"
+            f"{subject_label} {agent_name!r}: extra に {agent_label} が"
+            f"受け付けないキーが含まれます: {sorted(unknown)}"
         )
 
 
