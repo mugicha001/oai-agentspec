@@ -125,6 +125,7 @@ from .session import (
     close_session,
     make_session,
 )
+from .tools import build_function_tool
 from .tracing import (  # noqa: F401 - workflow 層への内部窓口（公開 __all__ には積まない）
     WorkflowTracer,
     make_workflow_tracer,
@@ -146,6 +147,7 @@ __all__ = [
     "ToolContext",
     "Usage",
     "build_agent",
+    "build_function_tool",
     "mock_spec_tools",
     "DefaultAgentBuilder",
     "DefaultRunnerAdapter",
