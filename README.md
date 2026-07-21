@@ -40,6 +40,7 @@
 | **ワークフロー（実験的）** | `WorkflowGraph` でノード（AGENT/FUNCTION）+ エッジ（通常 / 条件 / fan-in）を宣言、順次 / 並列 / 条件分岐 / 合流 / ループを表現 / build-time `validate()` / SDK tracing 自動配線（`workflow.*` span + AGENT 内側 `Runner.run` の親子接続・`set_tracing_disabled(True)` 時オーバーヘッド 0） |
 | **会話 Helper** | `ConversationService`（in-process または `[serve]` + `[cli]` のクライアント・サーバ型）/ SDK `Session` で永続化・途中再開 / HITL 承認（`function_tool(needs_approval=True)` を call_id 単位で approve / reject）/ compaction（`CompactionConfig.enabled=True` で履歴圧縮を明示有効化） |
 | **LLMOps（extras）** | `[llmops]` で観点別採点 + 統合 verdict（DeepEval ベース・任意で `[llmops-langfuse]` で Langfuse 観測）/ `[lightning]` で `AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning へ委譲して自動改善（textual gradient + beam search） |
+| **意図予測（extras）** | `[intent]` で発話 / 会話履歴からの意図分類基盤（`runtime/intent`）/ 信頼度 5 段階の候補列（`IntentPrediction`）/ `IntentPolicy` で意図集合・返却制約を宣言 / Protocol DI で全体・内部段を差し替え / `intent_classifier_from_model` の 1 行ヘルパ |
 
 詳細・サンプルは [コアコンセプト](#コアコンセプト) / [サンプル](#サンプル) を参照。
 
@@ -56,6 +57,7 @@ uv add "oai-agentspec[serve,cli] @ git+https://github.com/mugicha001/oai-agentsp
 uv add "oai-agentspec[llmops] @ git+https://github.com/mugicha001/oai-agentspec.git"
 uv add "oai-agentspec[llmops,llmops-langfuse] @ git+https://github.com/mugicha001/oai-agentspec.git"
 uv add "oai-agentspec[lightning] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[intent] @ git+https://github.com/mugicha001/oai-agentspec.git"
 
 # ローカルクローンで開発する場合
 git clone https://github.com/mugicha001/oai-agentspec.git
@@ -69,7 +71,7 @@ extra は実行寄り層でのみ必要。コアの宣言 API（`AgentSpec` / `A
 `WorkflowGraph` / `ConversationService` の in-process 利用）は extra なしで動く。`serve` = FastAPI
 サーバ入口、`cli` = 接続 CLI（`oai-agentspec chat`）、`llmops` = 評価採点コア（DeepEval）、
 `llmops-langfuse` = Langfuse 観測（`llmops` 前提・任意）、`lightning` = Agent Lightning APO
-（プロンプト最適化）。
+（プロンプト最適化）、`intent` = 意図予測（pydantic のみ）。
 
 ## クイックスタート
 

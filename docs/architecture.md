@@ -44,7 +44,9 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ AGT ガバナンス (runtime/governance 公開窓口・governance extra・agents/agent-governance-toolkit 非依存・装飾 builder)
    │
-利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build）
+   ┊ 意図予測 (runtime/intent 公開窓口・intent extra・agents 非依存・pydantic BaseModel ベース・上位利用支援層)
+   │
+利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify）
    │ import       │
    ▼              │
 __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
@@ -98,14 +100,14 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
 | `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
 | `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
-| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
+| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -1539,6 +1541,150 @@ governance（AGT を各ツール呼び出しごとの実行時強制 + ライフ
 実行時）と粒度（一括ゲート vs tool 単位）が異なる補完層である。詳細は `docs/integrity.md` を参照する。
 governance（「何をできるか」）は内容ガードレール（`guardrails` extra・「何を言うか」）とも直交する。
 
+## 意図予測（`runtime/intent`）
+
+LLM を用いた意図予測（分類）の汎用土台を `runtime/intent` に置く。分類器は `AgentSpec` / `Runner` に強制
+結線されない独立サービスで、利用側が任意のタイミングで `IntentClassifier.classify(query)` を呼び、返却された
+意図候補を後段のルーティング・分岐・UI・監視等で自由に扱う。実行分岐（PolicyEngine 相当）は本ライブラリの
+スコープ外であり、返却フォーマットと分類 taxonomy の契約のみを本層が担う。`oai-agentspec[intent]` extra で
+opt-in 導入し、extra は `pydantic>=2` に依存する（`openai-agents` の推移的依存で既に導入されるため実質増加
+ゼロ）。SDK 隔離規約は「SDK 隔離と依存性注入（DI）」節が SoT・本節では再掲しない。
+
+### 2 段構成と Protocol DI
+
+分類器は 2 段の内部構造で、各段が Protocol で差し替え可能。
+
+- `ContextBuilder.build(query) -> IntentContext`: `IntentQuery`（`utterance` / `history` / `run_context`。
+  `utterance` は既定 `""` で省略可＝履歴のみで分類するモード。utterance と history のどちらか一方は必要）
+  を受け、`query.history.get_items(limit=history_limit)` を duck-typed（SDK `Session` 互換）で呼び、戻り値を
+  そのまま `tuple(...)` 化して `IntentContext.history_items: tuple[Mapping[str, Any], ...]` に pass-through
+  する。lib 側では item の意味的検証（role の allowlist 等）を行わない。pydantic 側の型検証で各 item は
+  `Mapping[str, Any]` として validate され、内部的に plain `dict` へ shallow copy される（同一性は保存
+  されない）。SDK 由来の `TResponseInputItem`（TypedDict）はこの制約を満たすため今日の SDK では問題なく
+  流通する。上位層は SDK `Session` 型に触れずに履歴を扱える。
+- `CandidateGenerator.generate(context) -> IntentPrediction`: LLM を呼んで意図候補と（任意で）整合性
+  レポートを返す責務。
+
+`IntentClassifier.classify(query) -> IntentPrediction` は 2 段を束ねる上位 Protocol。既定実装は
+`DefaultIntentClassifier`（`DefaultContextBuilder` + `LLMCandidateGenerator`）。3 Protocol は
+`@runtime_checkable` で async 統一（LLM 実装が本質的 I/O バウンドのため）。
+
+### `IntentPolicy` 契約（必須）
+
+`IntentPolicy` は分類器が返せる意図集合と返却フォーマットの契約を型付きで表現する frozen BaseModel で、
+`LLMCandidateGenerator` / `intent_classifier_from_model` の必須引数。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `categories` | `tuple[IntentCategory, ...]` | 許容意図カテゴリ（非空・name 一意）。`IntentCandidate.text` はこの `name` 集合のいずれかのみ許容 |
+| `max_candidates` | `int` | 返却候補件数の上限（既定 3・`ge=1`） |
+| `extra_instructions` | `str` | 利用側がプロンプト先頭に注入する任意の追加指示（既定 `""`・空文字時は非出力・見出しなし） |
+| `include_rationale_in_prompt` | `bool` | 出力例 JSON に `rationale` フィールドを載せて LLM に生成を促すか（既定 `False`＝rationale を促さず速度優先）。どちらでも parser は rationale を optional として受け入れる |
+
+`IntentPolicy.render_prompt()` は `extra_instructions`（非空時のみ先頭に挿入・空白のみは非出力）+ 固定の
+タスク指示 1 行（「ユーザー発話を以下のカテゴリに分類し、JSON のみを出力してください。」）+ 手書き
+4 セクション（`# カテゴリ` / `# 信頼度 (level)` / `# 出力形式` / `# 制約`）を Markdown 見出しで区切って
+組み立てる固定文字列を返す。タスク指示行と `# 制約` の「JSON 以外のテキストを含めない」行は、prompt
+callable が発話を素通しする最小構成でも低精度・高速モデルが分類タスクとして JSON のみを返すための
+固定文。`IntentPrediction.model_json_schema()` は prompt 生成には使わない（Field description は pydantic
+schema 利用者向けメタで、LLM への提示は本文の手書きセクションが担う）。既定は
+`include_rationale_in_prompt=False` で出力例に `rationale` を含めず、LLM の生成トークン・レイテンシを
+抑える（rationale が欲しい利用者は `include_rationale_in_prompt=True` に切り替える）。カスタマイズ引数は
+`extra_instructions` と `include_rationale_in_prompt` のみで、他は `_llm.py` の parser と serialize を
+単一契約に固定するため持たない。
+
+### `ConfidenceLevel`（5 段階カテゴリカル）
+
+意図候補の信頼度は 5 段階の `ConfidenceLevel(str, Enum)` で表す:
+`CERTAIN` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATIVE`。`IntentPrediction.candidates` は
+`CERTAIN > HIGH > MEDIUM > LOW > SPECULATIVE` の降順にソートされ、同レベル内は LLM 出力順を保存する。
+`policy.max_candidates` で切り詰められる。
+
+各値の意味は module 内の単一ソース `_CONFIDENCE_LEVEL_MEANINGS: dict[str, str]` に集約され、
+`IntentCandidate.level` の `Field(description=...)`（pydantic schema 利用者向け）と
+`IntentPolicy.render_prompt()` の `# 信頼度 (level)` セクション（LLM 向け）の双方が同じ dict から派生する。
+`_LEVEL_ORDER`（`_llm.py` の post-hoc sort キー）は `enumerate(ConfidenceLevel)` で enum 宣言順から
+導出され、値追加時に二重管理を発生させない。値の意味をカスタマイズする API は提供しない（1 箇所編集で
+完結する構造を維持する）。
+
+### プロンプトの契約と自動注入 / escape hatch
+
+利用側は `prompt: Callable[[IntentContext], str]` を必須で渡す（str テンプレートは提供しない）。callable の
+責務は「現在発話の user content 生成のみ」に純化されており、`IntentContext.utterance` / `history_items` /
+`run_context` を型付きで受け取り、user メッセージ本文（str）を返す。履歴の文字列埋め込みは不要（SDK が
+`Runner.run(input=list[dict])` で multi-turn として `history_items` を別途送るため）。既定運用では
+`lambda ctx: ctx.utterance` の 1 行で足りる。
+
+`LLMCandidateGenerator` / `intent_classifier_from_model` の既定（`include_policy_in_system=True`）では
+`policy.render_prompt()` の出力を LLM 呼び出しの system role に自動注入する。`extra_instructions` は
+`render_prompt()` の先頭に組み込まれるため、自動注入経路でも system の先頭に届く。利用側が prompt 内へ
+手動で組み込みたい場合は `include_policy_in_system=False` を指定して自動注入を抑制する（escape hatch）。
+両フラグは目的が独立で衝突しない。
+
+### pydantic BaseModel による単一ソース化
+
+`runtime/intent/types.py` の全型（`IntentCategory` / `IntentPolicy` / `IntentQuery` / `IntentContext` /
+`IntentCandidate` / `ConsistencyReport` / `IntentPrediction`）は pydantic BaseModel（`frozen=True`）で
+定義される。`IntentQuery` / `IntentContext` は `Generic[TContext]`（`arbitrary_types_allowed=True`）で
+`run_context` の型を利用側が特定できる。
+
+pydantic 採用により、LLM I/O 契約は次のように単一ソース化される。
+
+- スキーマ生成: `IntentPrediction.model_json_schema()` は pydantic 利用者向けメタとして自動導出される
+  が、`render_prompt()` は使わない（LLM 提示は手書き 4 セクションが担う）。
+- Parse 検証: LLM 出力（adapter は raw `str` を返す）を `_llm.py` 側で
+  `IntentPrediction.model_validate_json(text)` により pydantic parse する。SDK の `output_type`（strict
+  structured output）は生成速度への影響が大きいため採用しない。パース前に `_strip_code_fence` で
+  Markdown コードフェンス（```json ... ```）を剥がす耐性を持つ（低精度・高速モデルが「JSON のみ」の
+  指示に反してフェンスで包む既知の失敗モードへの保険）。型検査 / 必須フィールド検査 /
+  `ConfidenceLevel` の未知値は parse エラーとして扱う（構造破綻）。
+- Post-hoc 加工は次の 3 段のみを lib 側で行う（過剰な in-band 加工を避け SDK Span でトレースする方針）:
+  1. **allowlist フィルタ**: `text ∈ policy.categories.name` を満たさない候補を silent に除外し、除外が
+     発生した場合のみ `logger.warning(...)` で最低限の可視性を残す（discoverability 目的）。
+  2. **sort**: `ConfidenceLevel` 降順（`CERTAIN > HIGH > MEDIUM > LOW > SPECULATIVE`・同レベル内は LLM
+     出力順を保存）。
+  3. **truncate**: `policy.max_candidates` で切り詰め。
+
+  rationale の必須性検証や `metadata.rejected` への記録は行わない（rationale を強制したい利用者は
+  `extra_instructions` に自然文で書く）。
+
+  post-hoc 3 段は `LLMCandidateGenerator` の責務であり、`DefaultIntentClassifier` は generator の
+  出力を素通しする（policy を強制しない）。独自 `CandidateGenerator` を DI する場合、policy を
+  守らせたいなら実装側で同等の適用を行う。`IntentPrediction.candidates` の降順ソートは既定実装のみが
+  保証し、Protocol / 型としては強制されない。
+
+### `agents.Model` の DI と SDK 隔離
+
+`LLMCandidateGenerator(model, prompt, *, policy, include_policy_in_system=True)` の `model` は
+`agents.Model` 相当を不透明型（`Any`）として受ける DI。環境変数は参照しない（env 参照は runtime レイヤの
+規約通り `runtime/cli` 境界に閉じる）。
+
+SDK 結合は `_adapters/intent.py`（薄いラッパ
+`async run_intent_prompt(model, system, history_items, user_content, *, context=None) -> str`）に閉じる。
+adapter は `Agent(name="intent-classifier", instructions=system or None, model=model)` を組み、
+`Runner.run(agent, input=input_items, context=raw_ctx)` を呼んで `str(result.final_output)`（`None` の
+場合は `""`）を返す。`input_items` は `history_items` に、`user_content` が非空の場合のみ
+`{"role":"user","content":user_content}` を末尾 append した list（空文字の `user_content` は turn を
+追加せず履歴のみを送る）。utterance と history の両方が空で `input_items` が空になる場合は
+`Runner.run` 到達前に `ValueError` で fail-fast する。返り値型は `str` のままで `output_type=` は
+付けない。`context` は共有ヘルパ `unwrap_run_context`（`_adapters/run_context.py`）で
+`RunContextWrapper` を開封してから forward する。この 1 経路で「単一発話（`history_items=()`）/ 履歴付き / 履歴のみ
+（`user_content=""`）/ RunContext 付き」のケースを switch なしで捌く。
+
+`runtime/intent/` の非 `_adapters` ファイルは `from agents` / `from openai` を含めない。`agents` の import は
+`_adapters/intent.py` 内の関数内遅延で行い、`import oai_agentspec` は intent extra 未導入でも壊れない
+（PEP 562 遅延再エクスポート）。SDK 隔離 grep（`_adapters` 外に `from agents` / `import agents` を許さない）
+と単方向依存（`runtime/intent` からコア `_adapters` / 宣言層型への上向き参照のみ）は既存規約通り。
+`_default.py` から呼ぶ `history.get_items(limit=...)` は opaque object への duck-typed メソッド呼び出しで
+あり、NFR-1（`from agents` / `import agents` の import 文）の対象外。
+
+### 公開窓口と配置
+
+公開窓口は `oai_agentspec.runtime.intent`（他 runtime extra と同型・コア `__all__` には載せない）。公開シンボル:
+`ConfidenceLevel` / `IntentQuery` / `IntentContext` / `IntentCategory` / `IntentPolicy` / `IntentPrediction` /
+`IntentCandidate` / `ConsistencyReport` / `IntentClassifier` / `ContextBuilder` / `CandidateGenerator` /
+`DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model`。
+
 ## テスト層
 
 | 層 | 依存 | 対象 |
@@ -1555,6 +1701,15 @@ assert・テスト名は docstring を一次情報とする既存方針を踏襲
 （コア `__all__` に Realtime シンボルを含まない・`import oai_agentspec` が `realtime` を連鎖 import しない・
 L1 テストダブルが `agents` に依存しない）は clean subprocess での import 検証と `__all__` の introspection
 テストで機械的に固定する。
+
+intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（frozen・`IntentPolicy` の categories
+検証等）と `render_prompt()` の出力・`intent_classifier_from_model` の組み立てを `agents` 非依存で
+pin する。L2 は `LLMCandidateGenerator` の post-hoc 3 段（allowlist / sort / truncate）・コードフェンス
+耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
+検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
+空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
+PEP 562 遅延再エクスポートと `__all__` 14 件の pin、履歴のみモード（`utterance=""` + history）の
+end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
 
 L2 には SDK バージョン耐性トリップワイヤ（NFR-7）を置く。openai-agents SDK との結合点で手組みしている
 前提（`Model` 抽象メソッド集合・手組みレスポンス型の必須フィールド集合・入口入力の正規化形式への依存・
