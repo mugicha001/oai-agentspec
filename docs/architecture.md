@@ -288,12 +288,12 @@ spec 側リストの事後 mutation が伝播しない（`tools` と同じ遮断
 | フィールド | 役割 |
 |---|---|
 | `func` | sync / async の生 Python 関数（必須） |
-| `name` | Registry キー。省略時は `func.__name__`。登録後の変更は非サポート（`func` も同様。登録時に確定） |
+| `name` | Registry キー。省略時は `func.__name__`。登録後の変更は非サポート（`func` も同様。登録時に確定）。`name_override` 未指定時は本フィールドの値が SDK 提示名（`name_override` 相当）にも反映される（Registry キーと LLM 提示名が既定で一致・`name_override` 明示指定はそれを上書きする） |
 | `enabled` | 有効/無効（既定 `True`）。SDK `is_enabled` へ「Registry 現在値を参照する callable」として結線される |
 | `needs_approval` | 承認要否（SDK `needs_approval` へ委譲） |
 | `timeout` / `timeout_behavior` / `timeout_error_function` | タイムアウト（SDK 同名引数へ委譲） |
 | `failure_error_function` | 失敗時エラー文言。「未指定（SDK 既定 formatter に委ねる）/ 関数指定 / `None` 明示（例外を文字列化せず素通し）」の 3 値を区別する。未指定は Registry 独自の module-level センチネル既定で表現し、当該 kwarg を渡さない（SDK private センチネル非依存） |
-| `name_override` / `description_override` | SDK 提示名 / 説明の上書き（Registry キーとは独立） |
+| `name_override` / `description_override` | SDK 提示名 / 説明の上書き。Registry の登録キー（属性アクセスに使う `<name>`）とは独立に指定できる。`name_override` 未指定時は `name` フィールドの値が SDK 提示名として使われる |
 | `strict_mode` | 厳格スキーマの有効/無効。未指定（`None`）は SDK 既定に委ねる |
 | `extra` | 上記以外の `function_tool()` kwarg 素通し（`AgentSpec.extra` と同型思想の予約キー / 未知キー検証つき。構築時に `ValueError`） |
 
