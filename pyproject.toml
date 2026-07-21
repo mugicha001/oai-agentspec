@@ -60,6 +60,10 @@ governance = [
     # opa/torch 等の重い推移依存なし）。次の major (5.x) が出たら回帰確認の上で pin を上げる。
     "agent-governance-toolkit[openai-agents]>=4.0,<5",
 ]
+intent = [
+    # openai-agents の推移依存として既に入っているが、runtime/intent/ 配下が直接依存する意図で明示宣言する。
+    "pydantic>=2",
+]
 
 [dependency-groups]
 dev = [
