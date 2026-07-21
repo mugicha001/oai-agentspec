@@ -100,9 +100,10 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
 | `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
 | `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
-| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
+| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ Tool メタデータの `function_tool` 結線（tools。`build_function_tool` = メタデータの SDK 引数流し込み・is_enabled callable 結線）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
+| `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
@@ -135,6 +136,8 @@ __all__ = [
     "PromptStore",
     "PromptLayout",
     "PromptTemplate",
+    "ToolRegistry",  # Tool 一元管理（詳細は「Tool Registry」節）
+    "ToolSpec",      # Tool メタデータ宣言 dataclass
     "WorkflowGraph",
     "function_tool",         # HITL: 承認必須ツール宣言用（_adapters 再エクスポート・コア公開）
     "default_input_filter", # ヘルパー
@@ -186,6 +189,8 @@ Realtime シンボル（`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `Realtim
 | `PromptStore` | 利用側が渡す root 配下のテンプレートをロードし instructions を合成するストア |
 | `PromptLayout` | 合成セグメントのディレクトリ構成（必須・明示指定） |
 | `PromptTemplate` | テンプレート文字列ラッパー（本文 + メタデータ） |
+| `ToolRegistry` | Tool の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル（詳細は「Tool Registry」節） |
+| `ToolSpec` | Tool メタデータの宣言 dataclass（func + enabled / 承認要否 / タイムアウト / 失敗時エラー文言 / 名前・説明上書き / strict_mode / extra） |
 | `dynamic_prompt` | ctx 由来の id/version/variables から `agents.Prompt` 参照を生成するヘルパー（`AgentSpec.prompt` 用） |
 | `from_specs` | `AgentSpec` 群の `handoffs` 宣言から `HandoffGraph` を構築 |
 | `WorkflowGraph` | ワークフローのノード/エッジ宣言 DSL。`add_agent_node` / `add_function_node` でノード、`add_edge` / `add_conditional_edges` / `add_fan_in_edge` でエッジを宣言し、`validate` / `mermaid` / `as_agent_spec`（経路C）/ `as_facade_spec`（経路A / D）を提供 |
@@ -264,6 +269,65 @@ spec 側リストの事後 mutation が伝播しない（`tools` と同じ遮断
 混在登録・混在ハンドオフできる。spec 複製（`freeze` / `clone`）の外部 mutation 遮断は、spec の
 全 dataclass フィールドを走査して list / dict 値を新コンテナに複製する方式であり、サブクラス
 固有の可変フィールド（`capabilities` 等）にも列挙の手動同期なしで適用される。
+
+## Tool Registry
+
+`ToolRegistry` は Tool の宣言（生の Python 関数 + メタデータ）を一元管理するコア公開 API である。
+利用者は lib 非依存の純関数を散在するファイルに置いたまま、組み立てポイントで
+`register(ToolSpec(...))` により一元登録し、`tool_registry.<name>` の属性アクセスでメタデータ
+適用済みの SDK `FunctionTool` を取得して `AgentSpec(tools=[...])` にそのまま渡す。
+`AgentSpec` / `AgentRegistry` からは完全に独立で、opt-in の注入点も設けない（橋渡しは利用者
+コードの `tools=[tool_registry.<name>]` のみ）。
+
+### ToolSpec（メタデータ宣言）
+
+`ToolSpec` は mutable な dataclass である。SDK にネイティブ機構が存在するメタデータは独自の
+実行時機構を作らず、対応する `function_tool()` 引数へ委譲する（build-don't-run。実行時の
+有効判定・承認・タイムアウトは SDK が担う）。
+
+| フィールド | 役割 |
+|---|---|
+| `func` | sync / async の生 Python 関数（必須） |
+| `name` | Registry キー。省略時は `func.__name__`。登録後の変更は非サポート（`func` も同様。登録時に確定） |
+| `enabled` | 有効/無効（既定 `True`）。SDK `is_enabled` へ「Registry 現在値を参照する callable」として結線される |
+| `needs_approval` | 承認要否（SDK `needs_approval` へ委譲） |
+| `timeout` / `timeout_behavior` / `timeout_error_function` | タイムアウト（SDK 同名引数へ委譲） |
+| `failure_error_function` | 失敗時エラー文言。「未指定（SDK 既定 formatter に委ねる）/ 関数指定 / `None` 明示（例外を文字列化せず素通し）」の 3 値を区別する。未指定は Registry 独自の module-level センチネル既定で表現し、当該 kwarg を渡さない（SDK private センチネル非依存） |
+| `name_override` / `description_override` | SDK 提示名 / 説明の上書き（Registry キーとは独立） |
+| `strict_mode` | 厳格スキーマの有効/無効。未指定（`None`）は SDK 既定に委ねる |
+| `extra` | 上記以外の `function_tool()` kwarg 素通し（`AgentSpec.extra` と同型思想の予約キー / 未知キー検証つき。構築時に `ValueError`） |
+
+冪等性（idempotent）フィールドは持たない。未指定のメタデータは kwargs に積まず SDK 既定値に
+委ね、Registry 側で SDK 既定値を再現・ハードコードしない（None-omission）。
+
+### ToolRegistry（登録・取得・照会・動的更新）
+
+- `register(spec: ToolSpec) -> None`: 宣言の保持のみを行い、この時点では SDK に触れない
+  （遅延ラップ）。二重登録、および属性アクセスで到達不能な名前（公開メソッド名との衝突 /
+  `_` 始まり / 非識別子）は `ValueError`。
+- `names() -> list[str]`: 登録済み Tool 名の昇順リスト。
+- `metadata(name) -> ToolSpec`: live な `ToolSpec` を返す。未登録名は登録済み名一覧つき
+  `KeyError`。属性代入による動的更新の反映範囲は、`enabled` = 構築済み Tool へ即反映（後述）、
+  それ以外 = 照会値のみ（SDK 引数の値は構築時に確定し、invalidate・再構築の機構は設けない）。
+- 属性アクセス `tool_registry.<name> -> FunctionTool`: `_adapters` 経由で `function_tool()` を
+  1 回だけ呼んで構築しキャッシュする（同一インスタンス返却。`AgentRegistry` の遅延構築と同型）。
+  未登録名は登録済み名一覧つき `AttributeError`（`_` 始まり名・実在属性は通常解決）。
+- 並行制御は `AgentRegistry` と同じく利用者責任（単一スレッド前提）。
+
+`enabled` の動的トグル: 構築時に `is_enabled` へ bool を焼き込まず「`ToolSpec.enabled` の
+現在値を読む callable」を結線するため、`metadata(name).enabled = False` は構築済み Agent /
+Tool の再構築なしに次の run から当該 Tool を LLM から隠す（SDK `is_enabled` のネイティブ挙動へ
+委譲。`True` へ戻せば同様に再提示される）。
+
+### Tool 宣言の 2 経路
+
+`function_tool` の直接宣言（コア公開の `_adapters` 再エクスポート）はメタデータの一元管理が
+不要な単発 Tool 向け、`ToolRegistry` 登録は一元管理・照会・enabled 動的トグルが必要な Tool
+向けであり、両経路は併存する。
+
+SDK ラップ（`function_tool()` 呼び出し・メタデータの SDK 引数への流し込み・is_enabled callable
+結線）は `_adapters/tools.py` の `build_function_tool` に閉じる（SDK 隔離）。設計判断の経緯は
+`docs/adr/0001-tool-metadata-centralization.md` を参照。
 
 ## SDK 隔離と依存性注入（DI）
 
