@@ -46,7 +46,9 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ 意図予測 (runtime/intent 公開窓口・intent extra・agents 非依存・pydantic BaseModel ベース・上位利用支援層)
    │
-利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify）
+   ┊ Resilience (runtime/resilience 公開窓口・resilience extra・agents 非依存・宣言層)
+   │
+利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify・resilience build）
    │ import       │
    ▼              │
 __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
@@ -108,7 +110,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -1758,6 +1760,97 @@ adapter は `Agent(name="intent-classifier", instructions=system or None, model=
 `IntentCandidate` / `ConsistencyReport` / `IntentClassifier` / `ContextBuilder` / `CandidateGenerator` /
 `DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
 `intent_classifier_from_generator`。
+
+## Resilience（Model Retry と Run Budget・`runtime/resilience`）
+
+Model 呼び出しの一時失敗リトライと run 全体の予算超過制御の宣言型を `runtime/resilience` に置く。
+宣言型 2 種（frozen dataclass）を SDK ネイティブ機構（`ModelSettings.retry` / `Runner.run(hooks=...)`）へ
+コンパイルするのみで、lib 独自の実行ループ・公開の実行 API を持たない（build-don't-run）。例外は SDK の
+伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]` extra で opt-in 導入し、extra は
+追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア `__all__`・`AgentSpec` の
+フィールド集合は不変。設計判断の検討経緯は `docs/adr/0002-resilience-declarative-compilation.md` を参照。
+
+### 配置と依存方向
+
+- `runtime/resilience/`: 宣言型（`_types.py`）・例外（`_errors.py`）・公開窓口（`__init__.py`）。
+  `agents` 非依存の宣言層
+- `_adapters/resilience.py`: SDK 結線の単一窓口。`build_model_retry` / `build_run_budget_hooks` と
+  内部 `_BudgetHooks(RunHooksBase)` を持ち、`from agents` はここに閉じる
+- 依存は `runtime/resilience` からコア（`_adapters` / `constants`）への上向き単方向のみ。コア
+  （spec / registry / handoffs / prompts / workflow）から `runtime/resilience` への依存辺はない
+
+### `ModelRetryPolicy`（Model 呼び出し retry の宣言）
+
+Model 呼び出しの retry 条件（回数・backoff・条件）を宣言する frozen dataclass。
+`build_model_retry(policy)` が SDK `ModelRetrySettings` へコンパイルし、`ModelSettings.retry` に埋め込む。
+
+- セマンティックフラグ（`retry_on_network_error` / `retry_on_timeout` / `retry_on_rate_limit` /
+  `retry_on_server_error` / `retry_on_retry_after`。既定すべて True）と `extra_retry_statuses` を
+  `retry_policies.any(...)` へ合成し、**必ず `policy` を埋める**（SDK の `policy` 未指定 silent no-op
+  = max_retries だけでは一切 retry しない挙動を構造的に排除する）
+- 生の `policy` callable を渡した場合はセマンティックフラグを無視して `policy` を優先する
+  （エスケープハッチ・条件の組み立ては利用者責務）
+- build-time 検証（`ValueError` で fail-fast）: `max_retries` 負数 / `backoff_multiplier < 1` /
+  `initial_delay > max_delay`。**有効条件ゼロ（全フラグ False かつ `extra_retry_statuses` なしかつ
+  生 `policy` なし）で `max_retries` が正の場合も矛盾宣言として `ValueError`**
+- backoff 値の未指定は SDK 既定に委譲する（lib 側で既定値をハードコードしない）
+- Agent 単位（`Agent.model_settings`）/ Runner 単位（`RunConfig.model_settings`）の両方で設定でき、
+  両方指定時のマージは SDK `_merge_retry_settings` に完全委譲する（Runner 側が Agent 側を上書き。
+  lib 側のマージ実装は持たない）
+- **`retry_on_network_error` と `retry_on_timeout` は SDK `retry_policies.network_error()` に
+  まとめてコンパイルされ、独立に無効化できない**（どちらか True なら両方が retry 対象になる）。
+  SDK に timeout 単独の retry プリミティブが存在しない制約に由来する。timeout のみを retry
+  したい場合は生 `policy` にカスタム callable を渡す
+
+### `RunBudgetPolicy`（run 全体の累積上限の宣言）と `RunBudgetExceeded`
+
+1 回の `Runner.run` に閉じる累積時間 / 累積トークンの上限（`max_elapsed_seconds` /
+`max_total_tokens`）を宣言する frozen dataclass。`build_run_budget_hooks(policy)` が
+`RunHooksBase` サブクラスインスタンスへコンパイルし、`Runner.run(hooks=...)` に渡す。両上限とも
+None の場合は no-op hooks を返す（意図的な無効化の許容・`ValueError` にしない）。上限の負数は
+build-time `ValueError`。
+
+上限超過時は `RunBudgetExceeded`（plain Exception・`runtime/resilience/_errors.py`）を送出する。
+`usage`（トークン内訳・不透明型）・`elapsed_seconds`（累積秒）・`context`（トリガした agent 名・
+LLM 呼び出し回数・超過した上限名）を属性として保持する。SDK `error_handlers` は
+`MaxTurnsExceeded` / `ModelRefusalError` 限定の isinstance dispatch のため、`RunBudgetExceeded` は
+素通しで呼び出し元まで伝播する（塗りつぶしなし・SDK ネイティブ `RunErrorHandlers` と併用可能で
+相互干渉しない）。
+
+enforcement 特性:
+
+- 判定は `on_llm_end` のターン境界のみ（graceful）。tool 実行中の割り込みはしない。ハード timeout
+  （tool 実行中も含む即中断）が必要な場合は、利用者が `asyncio.wait_for(Runner.run(...), timeout=...)`
+  を自前で被せる（docstring で案内）
+- 累積トークンは `context.usage` を読むだけで自前加算しない（SDK run_loop が `on_llm_end` 直前に
+  加算済みのため、自前加算は二重計上になる）。usage が取得できないターンは 0 として扱い、無音に
+  せず `logger.warning`（構造化: agent 名・ターン番号・理由。logger 名は
+  `constants.RESILIENCE_LOGGER_NAME`）で通知する
+- 経過時間は最初の `on_llm_start` で `time.monotonic()` を遅延初期化する（hooks 構築から run 開始
+  までの待機時間を予算に混入させない）
+- hooks は 1 run 1 インスタンス（`build_run_budget_hooks` は毎回新インスタンスを返す）。他の
+  `RunHooksBase` との合成（chain）機構は提供せず、複数 hooks の合成は利用者責務（docstring で案内）
+
+### 実行モード
+
+- `Runner.run`: 超過時に即 raise
+- `Runner.run_streamed`: 例外は `stream_events()` 消費時に raise される（イベントを回さないと観測
+  されない）。`ModelRetryPolicy` / `RunBudgetPolicy` とも streaming で透過的に効く
+- `Runner.run_sync`: 対応（内部で `run` を呼ぶため透過的に効く）
+- Realtime（`RealtimeRunner` / `RealtimeSession`）は非対応
+
+### 公開窓口と配置
+
+公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
+PEP 562 遅延再エクスポートで、宣言型・例外（`ModelRetryPolicy` / `RunBudgetPolicy` /
+`RunBudgetExceeded`）は外部依存ゼロのため直 import、`build_model_retry` / `build_run_budget_hooks` と
+SDK 生型は `__getattr__` で `_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を
+発火させない（extra 未導入耐性）。
+
+SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
+`ModelRetrySettings` / `ModelRetryBackoffSettings` / `retry_policies` / `RetryDecision` /
+`RetryPolicyContext` / `ModelRetryNormalizedError` / `RunErrorHandlers` / `RunErrorHandlerResult` /
+`RunErrorHandlerInput` / `RunErrorData`。
 
 ## テスト層
 
