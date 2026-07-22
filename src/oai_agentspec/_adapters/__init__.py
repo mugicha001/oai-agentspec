@@ -89,6 +89,7 @@ from .models import (
     WorkflowModel,
     workflow_as_tool,
 )
+from .resilience import build_model_retry, build_run_budget_hooks
 from .responses import (
     _completed_event as _completed_event,
 )
@@ -148,6 +149,8 @@ __all__ = [
     "Usage",
     "build_agent",
     "build_function_tool",
+    "build_model_retry",
+    "build_run_budget_hooks",
     "mock_spec_tools",
     "DefaultAgentBuilder",
     "DefaultRunnerAdapter",

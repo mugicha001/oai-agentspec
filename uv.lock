@@ -1973,7 +1973,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.27" },
     { name = "websockets", marker = "extra == 'cli'", specifier = ">=12" },
 ]
-provides-extras = ["conversation", "guardrails", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "governance", "intent"]
+provides-extras = ["conversation", "guardrails", "resilience", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "governance", "intent"]
 
 [package.metadata.requires-dev]
 dev = [

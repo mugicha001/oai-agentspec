@@ -32,6 +32,7 @@ oai-agentspec = "oai_agentspec.runtime.cli.main:main"
 [project.optional-dependencies]
 conversation = []
 guardrails = []
+resilience = []
 serve = [
     "fastapi>=0.110",
     "uvicorn>=0.27",
