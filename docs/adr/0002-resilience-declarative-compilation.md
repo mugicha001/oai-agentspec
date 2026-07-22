@@ -1,6 +1,6 @@
 # 0002: Resilience 宣言型は SDK ネイティブ機構へのコンパイルとして実装する
 
-- Status: accepted
+- Status: accepted (partially superseded by 0003)
 - Date: 2026-07-22
 
 ## Context
