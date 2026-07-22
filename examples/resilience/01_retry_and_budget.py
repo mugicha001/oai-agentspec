@@ -24,10 +24,12 @@ import sys
 from pathlib import Path
 
 from agents import Agent, ModelSettings, RunConfig, Runner
+from agents.lifecycle import RunHooksBase
 
+from oai_agentspec.exceptions import RunBudgetExceeded
+from oai_agentspec.runtime.hooks import chain_hooks
 from oai_agentspec.runtime.resilience import (
     ModelRetryPolicy,
-    RunBudgetExceeded,
     RunBudgetPolicy,
     build_model_retry,
     build_run_budget_hooks,
@@ -128,11 +130,54 @@ async def _run_hard_timeout_pattern() -> None:
         print("[hard-timeout] hard timeout tripped by asyncio.wait_for")
 
 
+class _LoggingHooks(RunHooksBase):  # type: ignore[type-arg]
+    """LLM 呼び出し境界を print で記録する軽量な自作 hooks（chain_hooks 実演用）。"""
+
+    def __init__(self, label: str) -> None:
+        super().__init__()
+        self._label = label
+        self._calls = 0
+
+    async def on_llm_start(self, context, agent, system_prompt, input_items) -> None:  # noqa: ANN001
+        self._calls += 1
+        print(f"[{self._label}] on_llm_start #{self._calls}")
+
+    async def on_llm_end(self, context, agent, response) -> None:  # noqa: ANN001
+        print(f"[{self._label}] on_llm_end")
+
+
+async def _run_chain_hooks_pattern() -> None:
+    """`chain_hooks` で budget hooks と自作 logging hooks を合成する（Issue #31）。
+
+    `Runner.run(hooks=...)` は単数の `RunHooksBase` しか受け付けない。複数 hook を併用したい
+    場合は `chain_hooks(*hooks)` で宣言順に順次 `await` する単一 hook にまとめる。前段が
+    raise したら後段は呼ばれず例外がそのまま伝播する（fail-fast）。
+    """
+    agent = Agent(
+        name="assistant",
+        instructions="Reply briefly.",
+        model=azure_model(),
+    )
+
+    budget_hooks = build_run_budget_hooks(RunBudgetPolicy(max_total_tokens=100_000))
+    logging_hooks = _LoggingHooks(label="chain")
+
+    # 宣言順に順次 await される: budget_hooks -> logging_hooks
+    hooks = chain_hooks(budget_hooks, logging_hooks)
+
+    try:
+        result = await Runner.run(agent, "Hello.", hooks=hooks)
+        print("[chain] final_output =", result.final_output)
+    except RunBudgetExceeded as exc:
+        print("[chain] budget exceeded:", exc)
+
+
 async def main() -> None:
-    """3 パターンを順に実行する。"""
+    """4 パターンを順に実行する。"""
     await _run_normal()
     await _run_streaming_observation_pattern()
     await _run_hard_timeout_pattern()
+    await _run_chain_hooks_pattern()
 
 
 if __name__ == "__main__":

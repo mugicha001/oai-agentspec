@@ -85,6 +85,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
   `protocols` / `spec` / `_adapters`）から `runtime/` 配下への依存辺は存在せず、`__init__ -> runtime` 方向の
   import を持たない。runtime から上向きにコア（`_adapters` / `registry` / `constants`）と宣言層型
   （`AgentSpec` / `WorkflowGraph` / `HandoffGraph` を read-only で参照）を辿る単方向のみが成立する。
+- **`exceptions.py`（例外統一窓口）はコア依存鎖に属さない横断窓口**である。コア namespace 直下に置かれるが、コア列挙群（`__init__` / `registry` / `handoffs` / `prompts` / `workflow` / `protocols` / `spec` / `_adapters`）のいずれからも import されず、`oai_agentspec/__init__.py` は `exceptions` を連鎖 import しない。`exceptions.py` はコア各所（`registry` / `integrity` / `prompts` / `workflow/graph`）と runtime 各所（`runtime/resilience/_errors` / `runtime/conversation/types` / 遅延で `runtime/lightning/types` / `runtime/cli/_models`）の例外定義を上向きに参照するだけの葉（何からも import されない末端）であり、逆方向（コア・runtime -> `exceptions`）の依存辺を作らない。これにより「コアから `runtime/` への依存辺は存在しない」不変条件は不変のまま保たれる。realtime の第 3 の並列ルートと同様、コア公開 API ツリー外の独立 import パス（`import oai_agentspec.exceptions`）で提供する。
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
@@ -109,8 +110,9 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
+| `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（`RunHooksBase` 合成ヘルパー `chain_hooks` の公開窓口・extra 不要＝`agents` はコア依存）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -206,6 +208,33 @@ Realtime シンボル（`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `Realtim
 | `PromptTemplateIntegrityError` | `IntegrityError` 継承。`lockdown` の store verify 段で manifest 不一致時に raise |
 | `RegistryFrozenError` | `RuntimeError` 継承。`AgentRegistry.freeze()` 後の書換違反で raise |
 | `WorkflowFrozenError` | `RuntimeError` 継承。`WorkflowGraph.freeze()` 後の書換違反で raise |
+
+### 例外の統一窓口（`oai_agentspec.exceptions`）
+
+lib 独自例外は各モジュールに定義実体を持つが、利用者が catch する際の import 経路を単一化するため、
+`oai_agentspec.exceptions` を統一窓口として提供する（SDK が `agents.exceptions` に集約する慣行に倣う）。
+再エクスポート専用窓口であり定義実体は移動しない。窓口経由で得た例外は定義元と同一クラスオブジェクトで、
+`isinstance` / `issubclass` は完全互換に保たれる。`import oai_agentspec.exceptions` は extra 未導入環境でも
+壊れず、遅延 2 種の親パッケージ（`runtime.lightning` / `runtime.cli`）を連鎖 import しない（PEP 562 遅延の
+実効性を subprocess 隔離テストで担保する）。
+
+`__all__` は次の 9 例外を掲載する。取得方式は依存の重さで振り分ける:
+
+- **直 import（7 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
+  `PromptTemplateIntegrityError`（`integrity`）/ `PromptResolutionError`（`prompts`）/
+  `WorkflowFrozenError`（`workflow/graph`）/ `RunBudgetExceeded`（`runtime/resilience/_errors`）/
+  `ConversationError`（`runtime/conversation/types`）
+- **PEP 562 遅延取得（`__getattr__` / `__dir__`・2 種）**: `OptimizeError`（`runtime/lightning/types`）/
+  `ConversationClientError`（`runtime/cli/_models`）。サブモジュール import が親 package `__init__` を
+  実行する分の import コスト膨張を避け、将来の import 構造変更に対し窓口を頑健に保つため遅延する。
+  既存の resilience 窓口と異なり遅延先が `_adapters` ではなくモジュール自体になる差分理由は module
+  docstring に明記する。`__all__` 外の名前アクセスは `AttributeError`
+
+コア `__all__` との関係: `IntegrityError` / `PromptTemplateIntegrityError` / `RegistryFrozenError` /
+`WorkflowFrozenError` はコア `__all__` にも掲載済みで、`exceptions` 窓口との二重公開を許容する
+（コア `__all__` の集合は契約のため不変維持）。`PromptResolutionError` / `ConversationClientError` は
+従来どおりコア `__all__` に載せず、統一窓口のみで公開する。docs の正規経路案内は
+`oai_agentspec.exceptions` を推す。
 
 ## AgentSpec
 
@@ -1828,8 +1857,27 @@ enforcement 特性:
   `constants.RESILIENCE_LOGGER_NAME`）で通知する
 - 経過時間は最初の `on_llm_start` で `time.monotonic()` を遅延初期化する（hooks 構築から run 開始
   までの待機時間を予算に混入させない）
-- hooks は 1 run 1 インスタンス（`build_run_budget_hooks` は毎回新インスタンスを返す）。他の
-  `RunHooksBase` との合成（chain）機構は提供せず、複数 hooks の合成は利用者責務（docstring で案内）
+- hooks は 1 run 1 インスタンス（`build_run_budget_hooks` は毎回新インスタンスを返す）。budget hooks と
+  他の `RunHooksBase` を併用したい場合は `chain_hooks`（下記）で合成する
+
+### hooks 合成（`chain_hooks`）
+
+`Runner.run(hooks=...)` が単数の `RunHooksBase` しか受けない制約を埋めるため、複数の `RunHooksBase` を
+宣言順に fan-out する汎用ヘルパー `chain_hooks(*hooks) -> RunHooksBase` を提供する。公開窓口は
+`oai_agentspec.runtime.hooks`（PEP 562 遅延再エクスポート・窓口 import 時に `agents` を発火させない）で、
+実装実体は `_adapters/hooks.py`（`_ChainedHooks(RunHooksBase)` のサブクラス定義に `agents.lifecycle` の
+import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
+
+合成仕様:
+
+- 7 メソッド（`on_llm_start` / `on_llm_end` / `on_agent_start` / `on_agent_end` / `on_handoff` /
+  `on_tool_start` / `on_tool_end`）を宣言順に順次 await する（状態を持たない薄いプロキシ）
+- fail-fast: 前段が例外を送出したら後段は呼ばず即伝播する（`return_exceptions` 非対応）
+- `chain_hooks()`（0 引数）は全メソッド no-op の `RunHooksBase()` 素インスタンスを返す
+- `chain_hooks(single)`（1 引数）は `single` をそのまま返す（合成ラッパを被せない最適化）
+- SDK に hook メソッドが追加された際の追随手順（オーバーライド追加）は module docstring に明記する
+
+詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md` を参照。
 
 ### 実行モード
 
@@ -1842,10 +1890,11 @@ enforcement 特性:
 ### 公開窓口と配置
 
 公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
-PEP 562 遅延再エクスポートで、宣言型・例外（`ModelRetryPolicy` / `RunBudgetPolicy` /
-`RunBudgetExceeded`）は外部依存ゼロのため直 import、`build_model_retry` / `build_run_budget_hooks` と
-SDK 生型は `__getattr__` で `_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を
-発火させない（extra 未導入耐性）。
+PEP 562 遅延再エクスポートで、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存ゼロのため
+直 import、`build_model_retry` / `build_run_budget_hooks` と SDK 生型は `__getattr__` で
+`_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を発火させない（extra 未導入
+耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は `oai_agentspec.exceptions`
+（統一窓口）。
 
 SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
 `ModelRetrySettings` / `ModelRetryBackoffSettings` / `retry_policies` / `RetryDecision` /

@@ -17,7 +17,9 @@
 
 ## 使い方
 
-- import: `from oai_agentspec.runtime.resilience import ModelRetryPolicy, RunBudgetPolicy, RunBudgetExceeded, build_model_retry, build_run_budget_hooks`
+- import: `from oai_agentspec.runtime.resilience import ModelRetryPolicy, RunBudgetPolicy, build_model_retry, build_run_budget_hooks`
+- 例外の import: `from oai_agentspec.exceptions import RunBudgetExceeded`（lib 独自例外の統一窓口。extra 未導入でも import は壊れない）
+- hooks 合成の import: `from oai_agentspec.runtime.hooks import chain_hooks`（budget hooks と自作 hooks の併用時）
 - extras: `pip install oai-agentspec[resilience]`（追加外部依存なし）
 - 依存 env: なし
 
@@ -42,7 +44,25 @@ spec = AgentSpec(
 # Runner.run(..., hooks=budget_hooks) は SDK 側で受け渡し
 ```
 
-`RunBudgetExceeded` は SDK `error_handlers` を素通しで伝播し、`on_llm_end` ターン境界で判定されます（詳細は architecture.md）。
+`Runner.run(hooks=...)` は単数の `RunHooksBase` しか受けないため、budget hooks と自作 hooks を併用する場合は `chain_hooks` で合成します。
+
+```python
+from oai_agentspec.runtime.hooks import chain_hooks
+
+hooks = chain_hooks(budget_hooks, MyLoggingHooks())  # 宣言順に順次 await・前段 raise で後段スキップ
+result = await Runner.run(agent, msg, hooks=hooks)
+```
+
+`RunBudgetExceeded` は `oai_agentspec.exceptions` から catch します。SDK `error_handlers` を素通しで伝播し、`on_llm_end` ターン境界で判定されます（詳細は architecture.md）。
+
+```python
+from oai_agentspec.exceptions import RunBudgetExceeded
+
+try:
+    result = await Runner.run(agent, msg, hooks=budget_hooks)
+except RunBudgetExceeded as e:
+    audit_log(usage=e.usage, elapsed=e.elapsed_seconds)
+```
 
 ## パラメータ一覧
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
@@ -95,7 +115,7 @@ spec = AgentSpec(
 ## 参照
 
 - 詳細設計: `docs/architecture.md`（Resilience 節）
-- 設計判断: `docs/adr/0002-resilience-declarative-compilation.md`
+- 設計判断: `docs/adr/0002-resilience-declarative-compilation.md` / `docs/adr/0003-hooks-chain-helper.md`（`chain_hooks`）
 - 具体例: `examples/resilience/01_retry_and_budget.py`
 
 ## 次
