@@ -46,3 +46,8 @@ INTEGRITY_REJECTED_HASH_ALGORITHMS: Final[frozenset[str]] = frozenset({"md5", "s
 # 組み立てで `is not TOOL_UNSET` の同一性判定に使うため、必ず単一インスタンスを共有する。
 # コア層に置くことで `_adapters -> tool_registry` の実行時上向き参照を解消する。
 TOOL_UNSET: Final[object] = object()
+
+# Resilience: `_BudgetHooks`（`_adapters.resilience`）が emit する構造化ログの logger 名（固定）。
+# 利用者は ``logging.getLogger(RESILIENCE_LOGGER_NAME)`` で観測性基盤に接続する。
+# ``INTEGRITY_LOGGER_NAME`` と同型の運用（ドット区切りの階層 logger 名）。
+RESILIENCE_LOGGER_NAME: Final[str] = "oai_agentspec.resilience"

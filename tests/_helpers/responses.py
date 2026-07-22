@@ -23,6 +23,31 @@ def text_response(text: str) -> ModelResponse:
     return ModelResponse(output=[message], usage=Usage(), response_id=None)
 
 
+def text_response_with_usage(text: str, *, total_tokens: int, requests: int = 1) -> ModelResponse:
+    """usage（トークン数・requests）付きのテキスト ModelResponse を作る（run 予算検証用）。
+
+    SDK run loop は `on_llm_end` 直前に `context.usage.add(response.usage)` を行うため、
+    予算超過（`RunBudgetExceeded`）を Runner 経由で実測するには usage を載せた応答が要る。
+
+    Args:
+        text: アシスタントテキスト。
+        total_tokens: この応答の累積対象トークン数。
+        requests: この応答の requests 数（usage 欠損検知の回避に 1 以上を既定とする）。
+
+    Returns:
+        usage を持つ単一テキストメッセージの ModelResponse。
+    """
+    message = ResponseOutputMessage(
+        id="msg_fake",
+        type="message",
+        role="assistant",
+        status="completed",
+        content=[ResponseOutputText(type="output_text", text=text, annotations=[])],
+    )
+    usage = Usage(requests=requests, total_tokens=total_tokens)
+    return ModelResponse(output=[message], usage=usage, response_id=None)
+
+
 def tool_call_response(
     name: str, arguments: str = "{}", call_id: str = "call_fake"
 ) -> ModelResponse:
