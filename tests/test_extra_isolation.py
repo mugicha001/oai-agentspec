@@ -127,6 +127,33 @@ def test_importing_realtime_window_does_not_load_realtime_sdk() -> None:
     assert loaded == [], f"realtime 窓口 import で SDK がロードされました: {loaded}"
 
 
+def test_importing_exceptions_window_does_not_load_lazy_extras() -> None:
+    """`import oai_agentspec.exceptions` で lightning / cli 親パッケージを強制ロードしない。
+
+    exceptions 窓口は直 import 7 種（コア + resilience / conversation）と PEP 562 遅延 2 種
+    （lightning の `OptimizeError` / cli の `ConversationClientError`）で構成される。窓口
+    module import だけでは遅延分の親パッケージ（`oai_agentspec.runtime.lightning` /
+    `oai_agentspec.runtime.cli`）が `sys.modules` に載らないことを固定し、PEP 562 遅延の
+    実効性を担保する（Issue #31 D1 の頑健性理由）。`agents` は core 依存として本体 import で
+    既に載っているため対象外（`_FORBIDDEN_EXTRAS` に含めていない既存不変と整合）。
+    """
+    probe = (
+        "import sys\n"
+        "import oai_agentspec.exceptions\n"
+        "loaded = sorted(\n"
+        "    m for m in sys.modules\n"
+        "    if m == 'oai_agentspec.runtime.lightning'\n"
+        "    or m.startswith('oai_agentspec.runtime.lightning.')\n"
+        "    or m == 'oai_agentspec.runtime.cli'\n"
+        "    or m.startswith('oai_agentspec.runtime.cli.')\n"
+        ")\n"
+        "print(','.join(loaded))\n"
+    )
+    out = _import_in_clean_subprocess(probe)
+    loaded = [m for m in out.split(",") if m]
+    assert loaded == [], f"exceptions 窓口 import で lightning / cli がロードされました: {loaded}"
+
+
 def test_l1_fake_builder_helper_is_agents_free() -> None:
     """L1 用テストダブル（fake_realtime_builder）は `agents` を一切ロードしない。
 

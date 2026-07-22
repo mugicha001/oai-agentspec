@@ -1,13 +1,10 @@
 """L1: `runtime.resilience.__init__` の公開窓口契約（直 import + PEP 562 遅延）。
 
 intent 窓口（`tests/runtime/intent/test_init_pep562_l1.py`）を直接の踏襲元とする。
-resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）と例外
-（`RunBudgetExceeded`）は外部依存ゼロのため module import 時点で直 import 済みであり、
-`build_*` ヘルパと SDK 生型 10 種のみ `__getattr__` で `_adapters.resilience` 経由の
-遅延取得になる。
-
-T7 の RED 先行テスト。窓口 `__init__.py` 未実装（空ファイル）のため、`__all__` チェックは
-`AttributeError` = RED 状態が正しい。実装後に GREEN へ転じる。
+resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存
+ゼロのため module import 時点で直 import 済みであり、`build_*` ヘルパと SDK 生型 10 種
+のみ `__getattr__` で `_adapters.resilience` 経由の遅延取得になる。lib 独自例外
+`RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`（本窓口からは撤去済み）。
 """
 
 from __future__ import annotations
@@ -17,11 +14,10 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-# lib 独自 5 種。うち直 import は宣言型 2 + 例外 1、遅延は build_* 2。
+# lib 独自 4 種。うち直 import は宣言型 2、遅延は build_* 2。
 _DIRECT_SYMBOLS = {
     "ModelRetryPolicy",
     "RunBudgetPolicy",
-    "RunBudgetExceeded",
 }
 _LAZY_BUILD_SYMBOLS = {
     "build_model_retry",
@@ -45,15 +41,15 @@ _EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 15 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 14 件で設計仕様通りのメンバ集合と一致する。"""
     from oai_agentspec.runtime import resilience as mod
 
     assert set(mod.__all__) == _EXPECTED_ALL
-    assert len(mod.__all__) == 15
+    assert len(mod.__all__) == 14
 
 
-def test_declaration_and_error_symbols_are_directly_imported() -> None:
-    """宣言型・例外は外部依存ゼロのため module import 時点で `__dict__` に載る（直 import）。"""
+def test_declaration_symbols_are_directly_imported() -> None:
+    """宣言型は外部依存ゼロのため module import 時点で `__dict__` に載る（直 import）。"""
     from oai_agentspec.runtime import resilience as mod
 
     for name in _DIRECT_SYMBOLS:
@@ -97,7 +93,7 @@ def test_lazy_sdk_raw_types_resolve_and_cache() -> None:
 
 
 def test_all_symbols_are_resolvable_via_getattr() -> None:
-    """`__all__` の全 15 シンボルが `getattr` で解決可能（漏れがない）。"""
+    """`__all__` の全 14 シンボルが `getattr` で解決可能（漏れがない）。"""
     from oai_agentspec.runtime import resilience as mod
 
     for name in mod.__all__:
@@ -115,16 +111,16 @@ def test_getattr_unknown_attribute_raises() -> None:
 
 
 def test_dir_includes_all_symbols_even_before_access() -> None:
-    """`dir()` は未 import 状態でも `__all__` の全 15 シンボルを含む。"""
+    """`dir()` は未 import 状態でも `__all__` の全 14 シンボルを含む。"""
     from oai_agentspec.runtime import resilience as mod
 
     listing = set(mod.__dir__())
     assert _EXPECTED_ALL.issubset(listing)
 
 
-def test_run_budget_exceeded_accessible_via_window() -> None:
-    """lib 独自例外 `RunBudgetExceeded` は窓口経由で取得でき、Exception サブクラス。"""
+def test_run_budget_exceeded_is_removed_from_window() -> None:
+    """`RunBudgetExceeded` は窓口から撤去済み。正規経路は `oai_agentspec.exceptions`。"""
     from oai_agentspec.runtime import resilience as mod
 
-    exc_cls = mod.RunBudgetExceeded
-    assert issubclass(exc_cls, Exception)
+    with pytest.raises(AttributeError):
+        mod.__getattr__("RunBudgetExceeded")

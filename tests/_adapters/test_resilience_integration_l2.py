@@ -29,9 +29,9 @@ from agents import (
 )
 
 from oai_agentspec._adapters import build_agent
+from oai_agentspec.exceptions import RunBudgetExceeded
 from oai_agentspec.runtime.resilience import (
     ModelRetryPolicy,
-    RunBudgetExceeded,
     RunBudgetPolicy,
     build_model_retry,
     build_run_budget_hooks,

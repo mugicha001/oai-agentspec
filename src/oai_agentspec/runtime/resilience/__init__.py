@@ -1,10 +1,13 @@
 """Resilience 系宣言型の公開窓口（`oai-agentspec[resilience]` extra・agents 非依存の窓口）。
 
-宣言型 `ModelRetryPolicy` / `RunBudgetPolicy` と例外 `RunBudgetExceeded`（すべて
-`agents` に依存しない）、build 関数 2 種（`build_model_retry` / `build_run_budget_hooks`）、
-および SDK 生型 10 種（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再エクスポートする。
+宣言型 `ModelRetryPolicy` / `RunBudgetPolicy`（いずれも `agents` に依存しない）、
+build 関数 2 種（`build_model_retry` / `build_run_budget_hooks`）、および SDK 生型 10 種
+（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再エクスポートする。
 
-`_types` / `_errors` は追加の外部依存を持たない（`agents` / `pydantic` などを import しない）
+例外 `RunBudgetExceeded` は本窓口からは撤去済み（Breaking Change）。正規の取得経路は
+`oai_agentspec.exceptions`（lib 独自例外 9 種の統一窓口）を参照する。
+
+`_types` は追加の外部依存を持たない（`agents` / `pydantic` などを import しない）
 ため**直 import** で `__all__` へ載せる。intent 窓口は pydantic 依存のため全シンボルを
 PEP 562 で遅延化しているが、本窓口では依存を持たないシンボルは直 import としてよい
 （差分理由）。`build_*` と SDK 生型 10 種は SDK への上向き参照を持つため、`__getattr__` で
@@ -18,7 +21,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ._errors import RunBudgetExceeded
 from ._types import ModelRetryPolicy, RunBudgetPolicy
 
 __all__ = [
@@ -28,7 +30,6 @@ __all__ = [
     "ModelRetrySettings",
     "RetryDecision",
     "RetryPolicyContext",
-    "RunBudgetExceeded",
     "RunBudgetPolicy",
     "RunErrorData",
     "RunErrorHandlerInput",
@@ -58,10 +59,10 @@ _DEFERRED_SYMBOLS = frozenset(
     }
 )
 
-# 直 import 済みシンボル（`_types` / `_errors` 由来・agents 非依存）。通常は module import
-# 時に `globals()` に載っており `__getattr__` に来ないが、テスト等で `pop` された場合の
+# 直 import 済みシンボル（`_types` 由来・agents 非依存）。通常は module import 時に
+# `globals()` に載っており `__getattr__` に来ないが、テスト等で `pop` された場合の
 # 再解決のためのフォールバック。
-_DIRECT_SYMBOLS = frozenset({"ModelRetryPolicy", "RunBudgetPolicy", "RunBudgetExceeded"})
+_DIRECT_SYMBOLS = frozenset({"ModelRetryPolicy", "RunBudgetPolicy"})
 
 
 def __getattr__(name: str) -> Any:
@@ -85,15 +86,10 @@ def __getattr__(name: str) -> Any:
         value = getattr(_resilience, name)
     elif name in _DIRECT_SYMBOLS:
         # 通常は module import 時に globals() に載っているため本 branch には来ない。
-        # `pop` されたケース（テスト等）のフォールバックとして _types / _errors から再解決する。
-        if name in {"ModelRetryPolicy", "RunBudgetPolicy"}:
-            from . import _types
+        # `pop` されたケース（テスト等）のフォールバックとして _types から再解決する。
+        from . import _types
 
-            value = getattr(_types, name)
-        else:
-            from . import _errors
-
-            value = getattr(_errors, name)
+        value = getattr(_types, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
