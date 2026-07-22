@@ -1890,10 +1890,11 @@ import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
 ### 公開窓口と配置
 
 公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
-PEP 562 遅延再エクスポートで、宣言型・例外（`ModelRetryPolicy` / `RunBudgetPolicy` /
-`RunBudgetExceeded`）は外部依存ゼロのため直 import、`build_model_retry` / `build_run_budget_hooks` と
-SDK 生型は `__getattr__` で `_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を
-発火させない（extra 未導入耐性）。
+PEP 562 遅延再エクスポートで、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存ゼロのため
+直 import、`build_model_retry` / `build_run_budget_hooks` と SDK 生型は `__getattr__` で
+`_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を発火させない（extra 未導入
+耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は `oai_agentspec.exceptions`
+（統一窓口）。
 
 SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
 `ModelRetrySettings` / `ModelRetryBackoffSettings` / `retry_policies` / `RetryDecision` /
