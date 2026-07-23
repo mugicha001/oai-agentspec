@@ -1824,10 +1824,10 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
     `Callable[..., TrainedIntentEstimator]` の型エイリアスで、lib は trainer を呼び出さず戻り値型のみを
     契約とする。`make_trained_estimator` は利用者自作 trainer の成果物を束ねる builder。
   - `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`: 学習済み
-    estimator（`predict_proba` / `classes_` を要求。欠如は `TypeError`）から推論 callable を組み立てる
+    estimator（`predict_proba` / `classes_` を要求。欠如は `AttributeError`）から推論 callable を組み立てる
     （fit を駆動しない）。
   - `fit_ml_estimator(estimator, *, x_train, y_train, policy, transform=None, label_encoding=None)`:
-    sklearn 互換 estimator（`fit` 属性を要求。欠如は `TypeError`）の `estimator.fit()` を 1 回駆動し
+    sklearn 互換 estimator（`fit` 属性を要求。欠如は `AttributeError`）の `estimator.fit()` を 1 回駆動し
     `ml_inference_from_estimator` を内部再利用して `TrainedIntentEstimator` を返す。
     `label_encoding: Mapping[str, Any] | None` はラベル文字列→内部表現の写像（`None` は素通し）で、
     逆写像は本写像から lib が構築し推論 callable に組み込む。

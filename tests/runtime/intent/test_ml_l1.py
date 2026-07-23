@@ -113,6 +113,27 @@ def test_mapper_out_of_range_score_clamps_when_requested() -> None:
     assert mapper(-0.5) is ConfidenceLevel.SPECULATIVE
 
 
+def test_mapper_nan_score_raises_by_default() -> None:
+    """NaN スコアは範囲比較をすり抜けず、既定 on_out_of_range='error' で ValueError。"""
+    mapper = _mapper()
+    with pytest.raises(ValueError):
+        mapper(float("nan"))
+
+
+def test_mapper_nan_score_raises_even_with_clamp() -> None:
+    """NaN は clamp で救えないため、on_out_of_range='clamp' 指定時も ValueError。"""
+    mapper = confidence_mapper_from_thresholds(
+        certain=0.90,
+        high=0.75,
+        medium=0.50,
+        low=0.25,
+        speculative=0.0,
+        on_out_of_range="clamp",
+    )
+    with pytest.raises(ValueError):
+        mapper(float("nan"))
+
+
 def test_mapper_thresholds_are_keyword_only() -> None:
     """閾値引数は keyword-only (位置引数で渡すと TypeError)。"""
     with pytest.raises(TypeError):

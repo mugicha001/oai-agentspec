@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Any, Literal
 
@@ -105,7 +106,11 @@ def confidence_mapper_from_thresholds(
 
         Raises:
             ValueError: `on_out_of_range="error"` かつスコアが 0.0〜1.0 外の場合。
+                スコアが NaN の場合は `on_out_of_range` の値に関わらず送出する
+                （NaN は clamp で救えない不正値のため）。
         """
+        if math.isnan(score):
+            raise ValueError(f"score must be within [{_SCORE_MIN}, {_SCORE_MAX}], got {score}")
         if score < _SCORE_MIN or score > _SCORE_MAX:
             if on_out_of_range == "error":
                 raise ValueError(f"score must be within [{_SCORE_MIN}, {_SCORE_MAX}], got {score}")

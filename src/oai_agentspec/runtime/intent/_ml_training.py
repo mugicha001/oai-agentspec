@@ -167,6 +167,8 @@ def fit_ml_estimator(
 
     Raises:
         AttributeError: `estimator` に `fit` メソッドが無い場合。
+        ValueError: `label_encoding` が単射でない（複数キーが同一のエンコード値へ
+            衝突する）場合。
     """
     if getattr(estimator, "fit", None) is None:
         raise AttributeError("estimator must provide a 'fit' method")
@@ -175,6 +177,8 @@ def fit_ml_estimator(
         y_encoded = y_train
         decoder: Callable[[Any], str] | None = None
     else:
+        if len(set(label_encoding.values())) != len(label_encoding):
+            raise ValueError("label_encoding must be injective (duplicate encoded values)")
         y_encoded = [label_encoding[y] for y in y_train]
         _reverse = dict(zip(label_encoding.values(), label_encoding.keys(), strict=True))
 

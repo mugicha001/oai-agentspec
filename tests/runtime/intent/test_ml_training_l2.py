@@ -293,6 +293,22 @@ def test_fit_encodes_y_with_label_encoding_before_calling_fit() -> None:
     assert y_train == ["refund", "cancel", "refund"]
 
 
+def test_fit_raises_when_label_encoding_is_not_injective() -> None:
+    """非単射な label_encoding（複数キーが同一値へ衝突）は構築時に ValueError で拒否される。"""
+    from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
+
+    est = FakeFittableEstimator(classes=(0, 1), proba_rows=[[0.6, 0.4]])
+
+    with pytest.raises(ValueError):
+        fit_ml_estimator(
+            est,
+            x_train=[[0.0], [1.0], [0.0]],
+            y_train=["refund", "cancel", "other"],
+            policy=_policy(),
+            label_encoding={"refund": 0, "cancel": 0, "other": 1},
+        )
+
+
 # ---------------------------------------------------------------------------
 # 受け入れ基準: 戻り値 TrainedIntentEstimator（同一 estimator 保持）
 # ---------------------------------------------------------------------------
