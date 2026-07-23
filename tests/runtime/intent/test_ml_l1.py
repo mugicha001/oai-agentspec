@@ -13,16 +13,16 @@
 from __future__ import annotations
 
 import pytest
-from oai_agentspec.runtime.intent._ml import (
-    confidence_mapper_from_thresholds,
-    prediction_from_scored_labels,
-)
 
 from oai_agentspec.runtime.intent import (
     ConfidenceLevel,
     IntentCategory,
     IntentPolicy,
     IntentPrediction,
+)
+from oai_agentspec.runtime.intent._ml import (
+    confidence_mapper_from_thresholds,
+    prediction_from_scored_labels,
 )
 
 pytestmark = pytest.mark.unit
