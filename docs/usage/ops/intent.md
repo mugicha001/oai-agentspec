@@ -13,6 +13,7 @@
 | 挟まない | 従来通り LLM handoff に任せる | 意図分類が過剰・レイテンシ最優先 |
 | `intent_classifier_from_model` | Model 1 本で分類 | 最小構成・PoC |
 | `intent_classifier_from_generator` | 自作 `CandidateGenerator` を束ねる | LLM を使わないキーワード分類等 |
+| `intent_classifier_from_ml_inference` | sklearn 互換 ML 推論 callable を束ねる | 定型発話が多く低レイテンシ・低コストを優先したい |
 | `include_policy_in_system=True`（既定） | `IntentPolicy` を system prompt に含める | 意図集合を LLM に明示 |
 | `include_policy_in_system=False` | 全無効化（prompt engineering を非同梱） | prompt を完全に利用者管理したい |
 
@@ -38,6 +39,43 @@ clf = intent_classifier_from_model(
 )
 pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 ```
+
+### ML ベース分類器（sklearn 互換 estimator）
+
+LLM を使わず、学習済みの sklearn 互換 estimator（`fit` / `predict_proba` / `classes_`）で分類する。
+`fit_ml_estimator` は estimator の `fit()` を 1 回駆動するゼロコード fit ヘルパ（build-don't-run 不変
+条件からの明示的逸脱・詳細は `docs/adr/0004-intent-ml-fit-deviation.md`）。学習を lib に任せない場合
+は、学習済み estimator を `ml_inference_from_estimator` でラップする（`fit` を駆動しない）。
+
+```python
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+from oai_agentspec.runtime.intent import (
+    IntentCategory, IntentPolicy, IntentQuery,
+    fit_ml_estimator, intent_classifier_from_ml_inference,
+)
+
+policy = IntentPolicy(categories=(
+    IntentCategory(name="billing", description="請求関連"),
+    IntentCategory(name="support", description="技術問い合わせ"),
+))
+pipeline = Pipeline([
+    ("tfidf", TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 3))),
+    ("clf", LogisticRegression(max_iter=1000)),
+])
+trained = fit_ml_estimator(
+    pipeline, x_train=x_train_texts, y_train=y_train_labels, policy=policy,
+)
+clf = intent_classifier_from_ml_inference(
+    trained, thresholds={"certain": 0.90, "high": 0.75, "medium": 0.50, "low": 0.25, "speculative": 0.0},
+)
+pred = await clf.classify(IntentQuery(utterance="請求書ください"))
+```
+
+- extras: `scikit-learn` は lib 本体・`[intent]` extra には含まれない（`[dependency-groups].examples` のみ）。利用側で個別インストールする
+- 具体例: `examples/intent/08_ml_sklearn_pipeline.py`（生テキスト経路）/ `09_ml_pretrained_features.py`（事前ベクトル化）/ `10_ml_custom_trainer.py`（学習手段非依存の最小契約）/ `11_ml_persist_reload.py`（pickle 永続化・再接続）
 
 ## パラメータ一覧
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
@@ -74,6 +112,26 @@ pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 | `generator` | `CandidateGenerator` | 必須 | 自作 Protocol 実装 |
 | `history_limit` | `int` | `20` | 上と同じ |
 
+### `intent_classifier_from_ml_inference(inference, *, policy=None, mapper=None, thresholds=None, history_limit=20)`
+
+| パラメータ | 型 | 既定 | 説明 |
+|---|---|---|---|
+| `inference` | `Callable \| TrainedIntentEstimator` | 必須 | ML 推論 callable、または `fit_ml_estimator` 等の成果物 |
+| `policy` | `IntentPolicy \| None` | `None` | 省略時は成果物が保持する policy から自動解決（明示指定が優先・両方なしは `ValueError`） |
+| `mapper` / `thresholds` | 排他 | `None` | スコア→`ConfidenceLevel` の変換（`thresholds` は5段階名のdict） |
+| `history_limit` | `int` | `20` | 上と同じ |
+
+### `fit_ml_estimator(estimator, *, x_train, y_train, policy, transform=None, label_encoding=None)`
+
+sklearn 互換 estimator（`fit` 欠如は `AttributeError`）の `fit()` を 1 回駆動し `TrainedIntentEstimator`
+を返す。`transform` 既定は `[ctx.utterance]`（単一サンプル列）。`label_encoding` は非単射（値の重複）
+だと `ValueError`。
+
+### `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`
+
+学習済み estimator（`predict_proba` / `classes_` 欠如は `AttributeError`）から `fit` を駆動せず推論
+callable を組み立てる。
+
 ### `IntentQuery`（BaseModel・generic `[TContext]`）
 
 `utterance: str = ""` / `history: Any | None = None` / `run_context: TContext | None = None`。
@@ -88,17 +146,20 @@ pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 - 意図集合を明示制約したい → **`IntentPolicy` + `intent_classifier_from_model`**
 - LLM を使わずルールで分類したい → **`intent_classifier_from_generator` + 自作 `CandidateGenerator`**
 - prompt を完全に自前管理したい → **`include_policy_in_system=False`**
+- 定型発話が多くレイテンシ・コストを優先したい → **`fit_ml_estimator` + `intent_classifier_from_ml_inference`**
 
 ## 落とし穴
 
 - `IntentPolicy.render_prompt()` の固定文（タスク指示・出力形式）は lib 側 parser との出力契約の serialize。`include_policy_in_system=False` で全無効化可能
 - 窓口は PEP 562 遅延 import。extra 未導入時は属性アクセスで `ImportError`
 - `IntentPolicy.categories` は tuple（`list` を渡してもよいが frozen として保持される）
+- `fit_ml_estimator` は build-don't-run 不変条件からの唯一の逸脱（`estimator.fit()` を lib が駆動）。scikit-learn は lib 本体・`[intent]` extra に含まれず利用側で個別インストールが必要
 
 ## 参照
 
 - 詳細設計: `docs/architecture.md`（意図予測節）
-- 具体例: `examples/intent/01_basic_classification.py` 〜 `07_custom_candidate_generator.py`
+- 検討経緯: `docs/adr/0004-intent-ml-fit-deviation.md`（ML 学習支援の build-don't-run 逸脱）
+- 具体例: `examples/intent/01_basic_classification.py` 〜 `07_custom_candidate_generator.py`（LLM 版）/ `08_ml_sklearn_pipeline.py` 〜 `11_ml_persist_reload.py`（ML 版）
 
 ## 次
 
