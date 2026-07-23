@@ -1788,7 +1788,59 @@ adapter は `Agent(name="intent-classifier", instructions=system or None, model=
 `ConfidenceLevel` / `IntentQuery` / `IntentContext` / `IntentCategory` / `IntentPolicy` / `IntentPrediction` /
 `IntentCandidate` / `ConsistencyReport` / `IntentClassifier` / `ContextBuilder` / `CandidateGenerator` /
 `DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
-`intent_classifier_from_generator`。
+`intent_classifier_from_generator` / `confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
+`MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` / `make_trained_estimator` /
+`fit_ml_estimator` / `ml_inference_from_estimator` / `intent_classifier_from_ml_inference`（計 24 件）。
+
+### ML ベース分類器支援
+
+`LLMCandidateGenerator` と独立並置で、ML 分類器（sklearn / 軽量 Transformer / ONNX 等・方式非依存）を
+`CandidateGenerator` Protocol へ差し込むための支援層を持つ。LLM 版との連携はなく、「文章・数値特徴量 →
+ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・規約で扱う。ライブラリ本体は ML フレームワークへ
+一切依存せず（estimator は duck-typed `Any`）、SDK 隔離・単方向依存の規約は「SDK 隔離と依存性注入（DI）」
+節が SoT で本節では再掲しない。
+
+ファイル構成は推論側 `_ml.py` と学習側 `_ml_training.py` の 2 分割。学習側に build-don't-run の唯一の
+逸脱（`fit_ml_estimator` が `estimator.fit()` を駆動する）を物理隔離する。検討経緯は
+`docs/adr/0004-intent-ml-fit-deviation.md` を参照する。
+
+- **推論側（`_ml.py`）**:
+  - `confidence_mapper_from_thresholds(*, certain, high, medium, low, speculative, on_out_of_range="error")`:
+    5 段階の閾値から `float -> ConfidenceLevel` の mapper を組み立てる。`on_out_of_range="clamp"`
+    指定時のみ範囲外スコアを clamp し、既定（`"error"`）では `ValueError`。
+  - `prediction_from_scored_labels(scored_labels, *, policy, mapper)`: `(label, score)` 列から
+    `IntentPrediction` を組み立てる。処理順は「重複ラベルは最高スコアに集約 → `policy.categories` の
+    allowlist フィルタ（除外は `_llm.py` と同一トーンの `logger.warning`）→ mapper で
+    `ConfidenceLevel` へ変換 → level 降順 sort（同レベル内は入力順を保存）→ `policy.max_candidates`
+    で truncate」。ソートキー `_LEVEL_ORDER` は `_llm.py` と単一ソースを共有する。
+  - `MLCandidateGenerator(inference, *, policy, mapper)`: `CandidateGenerator` Protocol 実装。
+    `inference: IntentContext -> Sequence[tuple[str, float]]`（同期/非同期いずれも可）を構築時に
+    `inspect.iscoroutinefunction` で判別し、同期 callable は `asyncio.to_thread` でイベントループを
+    ブロックせず実行する。例外は握り潰さず伝播する。
+- **学習側（`_ml_training.py`）**:
+  - `TrainedIntentEstimator`（frozen dataclass）: `inference`（推論 callable）・`estimator`（学習済み
+    estimator を利用者が再利用・保存できるよう保持。既定 `None`）・`decoder`（ラベル逆写像。既定
+    `None` = 恒等）を持つ学習成果物。`IntentTrainer` は
+    `Callable[..., TrainedIntentEstimator]` の型エイリアスで、lib は trainer を呼び出さず戻り値型のみを
+    契約とする。`make_trained_estimator` は利用者自作 trainer の成果物を束ねる builder。
+  - `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`: 学習済み
+    estimator（`predict_proba` / `classes_` を要求。欠如は `AttributeError`）から推論 callable を組み立てる
+    （fit を駆動しない）。
+  - `fit_ml_estimator(estimator, *, x_train, y_train, policy, transform=None, label_encoding=None)`:
+    sklearn 互換 estimator（`fit` 属性を要求。欠如は `AttributeError`）の `estimator.fit()` を 1 回駆動し
+    `ml_inference_from_estimator` を内部再利用して `TrainedIntentEstimator` を返す。
+    `label_encoding: Mapping[str, Any] | None` はラベル文字列→内部表現の写像（`None` は素通し）で、
+    逆写像は本写像から lib が構築し推論 callable に組み込む。
+- **結線（`factories.py`）**: `intent_classifier_from_ml_inference(inference, *, policy, mapper=None,
+  thresholds=None, history_limit=20)` は `MLCandidateGenerator` を組み立てて既存
+  `intent_classifier_from_generator` に結線し `DefaultIntentClassifier` を返す（LLM 版
+  `intent_classifier_from_model` と対称の 1 回呼び出しファクトリ）。`mapper` と `thresholds`
+  （5 段階名をキーとする `Mapping[str, float]`。内部で `confidence_mapper_from_thresholds` へ展開）は
+  排他で、両方指定・どちらも未指定は `ValueError`。`inference` に `TrainedIntentEstimator` を直渡しした
+  場合は内部で `.inference` を取り出す。
+
+依存はライブラリ本体に一切追加しない（sklearn は examples 実行時のみ `[dependency-groups]` の `examples`
+グループで導入する）。
 
 ## Resilience（Model Retry と Run Budget・`runtime/resilience`）
 
@@ -1924,8 +1976,13 @@ intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（fro
 耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
 検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
 空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
-PEP 562 遅延再エクスポートと `__all__` 15 件の pin、履歴のみモード（`utterance=""` + history）の
+PEP 562 遅延再エクスポートと `__all__` 24 件の pin、履歴のみモード（`utterance=""` + history）の
 end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
+
+ML ベース分類器支援は同じ 2 層で検証する。L2 の `test_ml_l2.py` / `test_ml_training_l2.py` は
+`predict_proba` / `classes_` / `fit` を持つ duck-typed fake estimator（sklearn 非依存）で
+mapper・dedup・allowlist・sort・truncate・同期/非同期ブリッジ・fit 駆動・ラベルエンコード/復号を
+検証する。sklearn 自体はテストスイートで一切使用せず、examples 実行時のみの依存に留める。
 
 L2 には SDK バージョン耐性トリップワイヤ（NFR-7）を置く。openai-agents SDK との結合点で手組みしている
 前提（`Model` 抽象メソッド集合・手組みレスポンス型の必須フィールド集合・入口入力の正規化形式への依存・
