@@ -24,7 +24,14 @@ uv run python examples/intent/01_basic_classification.py
 ```
 
 各例は分類実行時に LLM へ流れる合成プロンプトを `[SYSTEM]` / `[USER]` として stdout に表示する。
-例外は 07 で、LLM を使わないため環境変数なしでオフライン実行できる。
+例外は 07・08・09・10・11 で、LLM を使わないため環境変数なしでオフライン実行できる。
+
+08〜11 は ML 分類器支援（LLM 不使用）の例で、sklearn は `[dependency-groups]` の `examples`
+グループでのみ導入する（`[intent]` extra には含まれない）。API キーは不要:
+
+```bash
+uv run --group examples python examples/intent/08_ml_sklearn_pipeline.py
+```
 
 ## 例の一覧
 
@@ -37,6 +44,10 @@ uv run python examples/intent/01_basic_classification.py
 | 05 | `05_intent_based_routing.py` | 信頼度分岐の統合フロー。`ConfidenceLevel` が certain/high なら下流 `AgentSpec` へ dispatch、それ未満なら実行せず複数候補を提示して聞き返す（実行しない判断・信頼度・複数候補は分類結果をデータとして持つ intent 固有のユースケース） |
 | 06 | `06_dynamic_edge_routing.py` | `HandoffGraph.dynamic_edge` と intent 分類器の合成による入口ルーティング。triage が `tool_choice="required"` で強制された `route` tool の引数として発話を分類しやすくリライトし、async resolver がそのリライト文を `intent_classifier_from_model` に入れて転送先を実行時決定する。taxonomy（分類対象）と routing 候補（転送先）を分離し、候補なし・信頼度不足は `reception`（受付・分類対象外の fallback）へ。分類結果は run ごとの state（`Runner.run(context=...)`）経由で reception の dynamic instructions（callable）に渡り、分類器が実際に迷った候補だけを提示して聞き返す |
 | 07 | `07_custom_candidate_generator.py` | `CandidateGenerator` Protocol を自作（キーワードマッチ・LLM 不使用）し、`intent_classifier_from_generator` の 1 行で束ねる。policy 強制（sort / truncate）が generator 責務であることの実演。環境変数不要・オフライン実行 |
+| 08 | `08_ml_sklearn_pipeline.py` | 生テキスト → sklearn `Pipeline` を `fit_ml_estimator` へ渡すゼロコード fit（FR-4b）。`intent_classifier_from_ml_inference` で `DefaultIntentClassifier` を組み上げる。`--group examples` 実行・API キー不要 |
+| 09 | `09_ml_pretrained_features.py` | 事前ベクトル化済みの数値特徴量から `ml_inference_from_estimator`（FR-4c）で推論 callable を組み立てる経路（fit を lib が駆動しない）。`--group examples` 実行・API キー不要 |
+| 10 | `10_ml_custom_trainer.py` | 学習手段非依存の `IntentTrainer` / `TrainedIntentEstimator` / `make_trained_estimator`（FR-4a）を標準ライブラリのみで直接適合する例。sklearn なしで実行可能・API キー不要 |
+| 11 | `11_ml_persist_reload.py` | `fit_ml_estimator` で学習した estimator を pickle で永続化し、別プロセス想定で復元して `ml_inference_from_estimator` に再接続する例。pickle のセキュリティ注意と保存対象（`.estimator` のみ）を明示。`--group examples` 実行・API キー不要 |
 
 ## ルーティングの使い分け
 
