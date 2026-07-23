@@ -3,9 +3,12 @@
 意図分類の型（`IntentQuery` / `IntentContext` / `IntentCategory` / `IntentPolicy` /
 `IntentPrediction` / `IntentCandidate` / `ConsistencyReport` / `ConfidenceLevel`）、
 Protocol（`IntentClassifier` / `ContextBuilder` / `CandidateGenerator`）、
-デフォルト実装（`DefaultIntentClassifier` / `LLMCandidateGenerator`）、および 1 行
-ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator`）を
-再エクスポートする。
+デフォルト実装（`DefaultIntentClassifier` / `LLMCandidateGenerator`）、ML 系実装
+（`confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
+`MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` /
+`make_trained_estimator` / `ml_inference_from_estimator` / `fit_ml_estimator`）、
+および 1 行ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator` /
+`intent_classifier_from_ml_inference`）を再エクスポートする。
 
 型は pydantic に依存するため、本窓口は PEP 562 (`__getattr__`) による遅延再エクスポートに
 統一する。窓口 import 自体は intent extra 未導入でも壊れず、属性アクセス時に初めて
@@ -33,8 +36,17 @@ __all__ = [
     "CandidateGenerator",
     "DefaultIntentClassifier",
     "LLMCandidateGenerator",
+    "confidence_mapper_from_thresholds",
+    "prediction_from_scored_labels",
+    "MLCandidateGenerator",
+    "IntentTrainer",
+    "TrainedIntentEstimator",
+    "make_trained_estimator",
+    "ml_inference_from_estimator",
+    "fit_ml_estimator",
     "intent_classifier_from_model",
     "intent_classifier_from_generator",
+    "intent_classifier_from_ml_inference",
 ]
 
 
@@ -53,7 +65,29 @@ _TYPE_SYMBOLS = frozenset(
 _PROTOCOL_SYMBOLS = frozenset({"IntentClassifier", "ContextBuilder", "CandidateGenerator"})
 _DEFAULT_SYMBOLS = frozenset({"DefaultIntentClassifier"})
 _LLM_SYMBOLS = frozenset({"LLMCandidateGenerator"})
-_FACTORY_SYMBOLS = frozenset({"intent_classifier_from_model", "intent_classifier_from_generator"})
+_ML_SYMBOLS = frozenset(
+    {
+        "confidence_mapper_from_thresholds",
+        "prediction_from_scored_labels",
+        "MLCandidateGenerator",
+    }
+)
+_ML_TRAINING_SYMBOLS = frozenset(
+    {
+        "IntentTrainer",
+        "TrainedIntentEstimator",
+        "make_trained_estimator",
+        "ml_inference_from_estimator",
+        "fit_ml_estimator",
+    }
+)
+_FACTORY_SYMBOLS = frozenset(
+    {
+        "intent_classifier_from_model",
+        "intent_classifier_from_generator",
+        "intent_classifier_from_ml_inference",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:
@@ -88,6 +122,14 @@ def __getattr__(name: str) -> Any:
         from ._llm import LLMCandidateGenerator
 
         value = LLMCandidateGenerator
+    elif name in _ML_SYMBOLS:
+        from . import _ml
+
+        value = getattr(_ml, name)
+    elif name in _ML_TRAINING_SYMBOLS:
+        from . import _ml_training
+
+        value = getattr(_ml_training, name)
     elif name in _FACTORY_SYMBOLS:
         from . import factories as _factories
 

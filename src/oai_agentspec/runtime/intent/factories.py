@@ -4,18 +4,22 @@
 `DefaultIntentClassifier`（`DefaultContextBuilder` + `LLMCandidateGenerator`）を
 組み立てる薄い便宜関数。`intent_classifier_from_generator` はその対称形で、
 自作 `CandidateGenerator` から同構成を組み立てる（LLM 不使用の分類器等）。
+`intent_classifier_from_ml_inference` は ML 推論 callable（または
+`TrainedIntentEstimator`）から同構成を組み立てる、LLM 版の対称形。
 ContextBuilder まで差し替える場合は `DefaultIntentClassifier` を直接組み立てる。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from ._default import DefaultContextBuilder, DefaultIntentClassifier
 from ._llm import LLMCandidateGenerator
+from ._ml import MLCandidateGenerator, confidence_mapper_from_thresholds
+from ._ml_training import TrainedIntentEstimator
 from .protocols import CandidateGenerator
-from .types import IntentContext, IntentPolicy
+from .types import ConfidenceLevel, IntentContext, IntentPolicy
 
 
 def intent_classifier_from_model(
@@ -78,4 +82,73 @@ def intent_classifier_from_generator(
     return DefaultIntentClassifier(
         context_builder=DefaultContextBuilder(history_limit=history_limit),
         generator=generator,
+    )
+
+
+def intent_classifier_from_ml_inference(
+    inference: Any,
+    *,
+    policy: IntentPolicy | None = None,
+    mapper: Callable[[float], ConfidenceLevel] | None = None,
+    thresholds: Mapping[str, float] | None = None,
+    history_limit: int = 20,
+) -> DefaultIntentClassifier:
+    """ML 推論 callable から既定構成の `DefaultIntentClassifier` を組み立てる。
+
+    `intent_classifier_from_model` の対称形。`inference` は `IntentContext` を受け取り
+    (ラベル, スコア) 列を返す callable、または `fit_ml_estimator` 等が返す
+    `TrainedIntentEstimator` をそのまま渡してよい（後者の場合は内部で `.inference`
+    を取り出す）。
+
+    Args:
+        inference: (ラベル, スコア) 列を返す推論 callable、または
+            `TrainedIntentEstimator`。
+        policy: 分類器が守る契約。keyword-only。省略時は `TrainedIntentEstimator`
+            直渡しの成果物が保持する policy から自動解決する（明示指定が優先）。
+        mapper: スコアを `ConfidenceLevel` に変換する callable。keyword-only。
+            `thresholds` と同時指定不可（排他）。
+        thresholds: 5 段階名（`certain` / `high` / `medium` / `low` / `speculative`）を
+            キーとする閾値マッピング。keyword-only。内部で
+            `confidence_mapper_from_thresholds` に展開する。`mapper` と同時指定不可（排他）。
+        history_limit: `DefaultContextBuilder` が history から取得する上限件数。
+            keyword-only。
+
+    Returns:
+        `DefaultContextBuilder` + `MLCandidateGenerator` を束ねた
+        `DefaultIntentClassifier`。
+
+    Raises:
+        ValueError: `mapper` と `thresholds` を両方指定、または両方省略した場合。
+            policy を指定せず、`TrainedIntentEstimator` からも解決できない場合。
+        TypeError: `thresholds` が必要な 5 段階名（`certain` / `high` / `medium` /
+            `low` / `speculative`）を欠く、または未知のキーを含む場合
+            （`confidence_mapper_from_thresholds` への keyword 引数展開時に発生）。
+    """
+    resolved_policy = policy
+    if resolved_policy is None and isinstance(inference, TrainedIntentEstimator):
+        resolved_policy = inference.policy
+    if resolved_policy is None:
+        raise ValueError(
+            "policy を指定するか、policy を保持した TrainedIntentEstimator を渡してください"
+        )
+
+    if mapper is None and thresholds is None:
+        raise ValueError("mapper と thresholds のいずれかを指定してください")
+    if mapper is not None and thresholds is not None:
+        raise ValueError("mapper と thresholds は同時指定できません")
+
+    resolved_mapper = (
+        mapper
+        if mapper is not None
+        else confidence_mapper_from_thresholds(
+            **thresholds  # type: ignore[arg-type]
+        )
+    )
+    resolved_inference = (
+        inference.inference if isinstance(inference, TrainedIntentEstimator) else inference
+    )
+
+    return intent_classifier_from_generator(
+        MLCandidateGenerator(resolved_inference, policy=resolved_policy, mapper=resolved_mapper),
+        history_limit=history_limit,
     )
