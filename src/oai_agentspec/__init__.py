@@ -15,7 +15,8 @@ from .integrity import (
 )
 from .prompts import PromptLayout, PromptStore, PromptTemplate, dynamic_prompt
 from .registry import AgentRegistry, RegistryFrozenError
-from .spec import AgentSpec, HandoffConfig
+from .spec import AgentSpec, HandoffConfig, SandboxAgentSpec
+from .tool_registry import ToolRegistry, ToolSpec
 from .workflow import (
     END,
     START,
@@ -54,6 +55,9 @@ __all__ = [
     "PromptTemplateIntegrityError",
     "RegistryFrozenError",
     "Router",
+    "SandboxAgentSpec",
+    "ToolRegistry",
+    "ToolSpec",
     "WorkflowFrozenError",
     "WorkflowGraph",
     "default_input_filter",

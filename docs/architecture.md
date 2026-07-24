@@ -24,7 +24,9 @@ openai-agents の `Agent` の薄い宣言的 Wrapper（`AgentSpec`）と、ハ�
 コアから runtime へは流れない一方向に保つ。コアは宣言・build-time 検証・SDK 隔離窓口に徹し、
 runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops`）は会話実行・
 サーバ入口・CLI クライアント・LLMOps 評価というローカル開発支援の実行寄り機能を `runtime/` 配下へ
-集約する。
+集約する。加えて Realtime エージェントの宣言ルート（`realtime/`）はこの 2 群のいずれにも属さない第 3 の
+並列宣言ルートであり、コア公開 API ツリー外・専用窓口（`oai_agentspec.realtime`）経由で提供する
+（詳細は「Realtime エージェント（専用宣言ルート）」節）。
 
 ```
    CLI クライアント (別プロセス・cli extra・[project.scripts]・runtime/cli)
@@ -42,7 +44,11 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ AGT ガバナンス (runtime/governance 公開窓口・governance extra・agents/agent-governance-toolkit 非依存・装飾 builder)
    │
-利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build）
+   ┊ 意図予測 (runtime/intent 公開窓口・intent extra・agents 非依存・pydantic BaseModel ベース・上位利用支援層)
+   │
+   ┊ Resilience (runtime/resilience 公開窓口・resilience extra・agents 非依存・宣言層)
+   │
+利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify・resilience build）
    │ import       │
    ▼              │
 __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
@@ -54,8 +60,10 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
    │                 ├─→ protocols.py (Protocol。agents 非依存)
    │                 │        │
    │                 │        ▼
-   │                 └─→ spec.py (AgentSpec。agents 非依存・最下層)
-   │                           │
+   │                 ├─→ spec.py (AgentSpec。agents 非依存・最下層)
+   │                 │
+   │                 └─→ _validation.py (共有バリデーションヘルパ。agents 非依存・最下層。
+   │                           │          realtime/registry・_adapters も下向き参照)
    └────────────────→ _adapters/ (agents / 外部クライアント への import 単一窓口) ◄── 会話サービス / LLMOps 評価 / Agent Lightning 最適化
                               │ runtime import
                               ▼
@@ -77,10 +85,11 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
   `protocols` / `spec` / `_adapters`）から `runtime/` 配下への依存辺は存在せず、`__init__ -> runtime` 方向の
   import を持たない。runtime から上向きにコア（`_adapters` / `registry` / `constants`）と宣言層型
   （`AgentSpec` / `WorkflowGraph` / `HandoffGraph` を read-only で参照）を辿る単方向のみが成立する。
+- **`exceptions.py`（例外統一窓口）はコア依存鎖に属さない横断窓口**である。コア namespace 直下に置かれるが、コア列挙群（`__init__` / `registry` / `handoffs` / `prompts` / `workflow` / `protocols` / `spec` / `_adapters`）のいずれからも import されず、`oai_agentspec/__init__.py` は `exceptions` を連鎖 import しない。`exceptions.py` はコア各所（`registry` / `integrity` / `prompts` / `workflow/graph`）と runtime 各所（`runtime/resilience/_errors` / `runtime/conversation/types` / 遅延で `runtime/lightning/types` / `runtime/cli/_models`）の例外定義を上向きに参照するだけの葉（何からも import されない末端）であり、逆方向（コア・runtime -> `exceptions`）の依存辺を作らない。これにより「コアから `runtime/` への依存辺は存在しない」不変条件は不変のまま保たれる。realtime の第 3 の並列ルートと同様、コア公開 API ツリー外の独立 import パス（`import oai_agentspec.exceptions`）で提供する。
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -91,13 +100,19 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 |---|---|
 | `spec.py` | `AgentSpec` の定義。`agents.Agent` の薄い Wrapper。`agents` 非依存の宣言的データ。最下層 |
 | `protocols.py` | `AgentBuilder` の Protocol 定義。`agents` 非依存 |
-| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
+| `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
+| `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
+| `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
+| `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ Tool メタデータの `function_tool` 結線（tools。`build_function_tool` = メタデータの SDK 引数流し込み・is_enabled callable 結線）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
+| `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
+| `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（`RunHooksBase` 合成ヘルパー `chain_hooks` の公開窓口・extra 不要＝`agents` はコア依存）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -125,6 +140,8 @@ __all__ = [
     "PromptStore",
     "PromptLayout",
     "PromptTemplate",
+    "ToolRegistry",  # Tool 一元管理（詳細は「Tool Registry」節）
+    "ToolSpec",      # Tool メタデータ宣言 dataclass
     "WorkflowGraph",
     "function_tool",         # HITL: 承認必須ツール宣言用（_adapters 再エクスポート・コア公開）
     "default_input_filter", # ヘルパー
@@ -155,6 +172,11 @@ Union（`StreamDelta` / `StreamDone` / `StreamError` の 3 メンバ）には混
 `AgentBuilder`（DI 拡張点）は `oai_agentspec.protocols` に置き、トップレベル公開 API には
 含めない（テスト/上級用途向け。SDK 隔離は `_adapters` が担う）。
 
+Realtime シンボル（`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `RealtimeAgentRegistry`）はコア
+`__all__` に載せず、`oai_agentspec.runtime.conversation` と同様に `oai_agentspec.realtime` 公開窓口で
+参照する。`RealtimeAgentBuilder` は `AgentBuilder` と同様どの `__all__` にも載せず、
+`oai_agentspec.realtime.protocols` の直接 import でのみ参照する。
+
 `WorkflowModel` / `workflow_as_tool` / runner シーム Protocol は非公開である。`WorkflowModel` と
 `workflow_as_tool` は `_adapters` に閉じた SDK 結合実装であり、runner シーム Protocol は内部 / テスト用
 の構築シーム（利用者は runner を渡さない）として `workflow/` パッケージ内に置く。公開されるのは宣言 DSL の
@@ -171,6 +193,8 @@ Union（`StreamDelta` / `StreamDone` / `StreamError` の 3 メンバ）には混
 | `PromptStore` | 利用側が渡す root 配下のテンプレートをロードし instructions を合成するストア |
 | `PromptLayout` | 合成セグメントのディレクトリ構成（必須・明示指定） |
 | `PromptTemplate` | テンプレート文字列ラッパー（本文 + メタデータ） |
+| `ToolRegistry` | Tool の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル（詳細は「Tool Registry」節） |
+| `ToolSpec` | Tool メタデータの宣言 dataclass（func + enabled / 承認要否 / タイムアウト / 失敗時エラー文言 / 名前・説明上書き / strict_mode / extra） |
 | `dynamic_prompt` | ctx 由来の id/version/variables から `agents.Prompt` 参照を生成するヘルパー（`AgentSpec.prompt` 用） |
 | `from_specs` | `AgentSpec` 群の `handoffs` 宣言から `HandoffGraph` を構築 |
 | `WorkflowGraph` | ワークフローのノード/エッジ宣言 DSL。`add_agent_node` / `add_function_node` でノード、`add_edge` / `add_conditional_edges` / `add_fan_in_edge` でエッジを宣言し、`validate` / `mermaid` / `as_agent_spec`（経路C）/ `as_facade_spec`（経路A / D）を提供 |
@@ -184,6 +208,33 @@ Union（`StreamDelta` / `StreamDone` / `StreamError` の 3 メンバ）には混
 | `PromptTemplateIntegrityError` | `IntegrityError` 継承。`lockdown` の store verify 段で manifest 不一致時に raise |
 | `RegistryFrozenError` | `RuntimeError` 継承。`AgentRegistry.freeze()` 後の書換違反で raise |
 | `WorkflowFrozenError` | `RuntimeError` 継承。`WorkflowGraph.freeze()` 後の書換違反で raise |
+
+### 例外の統一窓口（`oai_agentspec.exceptions`）
+
+lib 独自例外は各モジュールに定義実体を持つが、利用者が catch する際の import 経路を単一化するため、
+`oai_agentspec.exceptions` を統一窓口として提供する（SDK が `agents.exceptions` に集約する慣行に倣う）。
+再エクスポート専用窓口であり定義実体は移動しない。窓口経由で得た例外は定義元と同一クラスオブジェクトで、
+`isinstance` / `issubclass` は完全互換に保たれる。`import oai_agentspec.exceptions` は extra 未導入環境でも
+壊れず、遅延 2 種の親パッケージ（`runtime.lightning` / `runtime.cli`）を連鎖 import しない（PEP 562 遅延の
+実効性を subprocess 隔離テストで担保する）。
+
+`__all__` は次の 9 例外を掲載する。取得方式は依存の重さで振り分ける:
+
+- **直 import（7 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
+  `PromptTemplateIntegrityError`（`integrity`）/ `PromptResolutionError`（`prompts`）/
+  `WorkflowFrozenError`（`workflow/graph`）/ `RunBudgetExceeded`（`runtime/resilience/_errors`）/
+  `ConversationError`（`runtime/conversation/types`）
+- **PEP 562 遅延取得（`__getattr__` / `__dir__`・2 種）**: `OptimizeError`（`runtime/lightning/types`）/
+  `ConversationClientError`（`runtime/cli/_models`）。サブモジュール import が親 package `__init__` を
+  実行する分の import コスト膨張を避け、将来の import 構造変更に対し窓口を頑健に保つため遅延する。
+  既存の resilience 窓口と異なり遅延先が `_adapters` ではなくモジュール自体になる差分理由は module
+  docstring に明記する。`__all__` 外の名前アクセスは `AttributeError`
+
+コア `__all__` との関係: `IntegrityError` / `PromptTemplateIntegrityError` / `RegistryFrozenError` /
+`WorkflowFrozenError` はコア `__all__` にも掲載済みで、`exceptions` 窓口との二重公開を許容する
+（コア `__all__` の集合は契約のため不変維持）。`PromptResolutionError` / `ConversationClientError` は
+従来どおりコア `__all__` に載せず、統一窓口のみで公開する。docs の正規経路案内は
+`oai_agentspec.exceptions` を推す。
 
 ## AgentSpec
 
@@ -217,6 +268,98 @@ Union（`StreamDelta` / `StreamDone` / `StreamError` の 3 メンバ）には混
 model_settings / hooks）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
 場合は構築時に `ValueError` を送出する。
 
+### SandboxAgentSpec
+
+`SandboxAgentSpec` は `AgentSpec` を継承し、`agents.sandbox.SandboxAgent`（`agents.Agent` の
+正式なサブクラス）向けの専用フィールドを追加する dataclass。`AgentSpec` の全フィールド
+（`tools` / `handoffs` / `model` / `model_settings` / `hooks` / `input_guardrails` /
+`output_guardrails` / `sub_agents` 等）をそのまま継承して保持する。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `default_manifest` | `Any \| None` | サンドボックスのファイルシステム / env / マウント定義（SDK `Manifest` 相当。不透明型） |
+| `capabilities` | `Any \| None` | サンドボックスが提供する機能のトグル列（SDK `Sequence[Capability]` 相当。不透明型） |
+| `run_as` | `Any \| None` | サンドボックス実行時のユーザーコンテキスト（不透明型） |
+| `base_instructions` | `str \| Callable \| None` | サンドボックス実行エージェント向けの基底システムプロンプト。文字列、または `(context, agent)` の 2 引数 callable |
+
+`default_manifest` / `capabilities` / `run_as` / `base_instructions` は `agents.sandbox` の
+実型を持たない不透明型として宣言され、`spec.py` は `agents.sandbox` を import しない
+（`AgentSpec.model_settings` / `hooks` と同じ不透明型パターン）。4 フィールドとも未指定
+（`None`）の場合は構築時の kwargs に積まず、`SandboxAgent` 自身の既定値に委ねる（ライブラリ
+側で SDK の既定値を再現・ハードコードしない）。`capabilities` 未指定時の SDK 既定はシェル実行を
+含む機能群を有効化しうるため、最小権限にしたい場合は `capabilities` を明示指定すること。
+指定された list 値（`capabilities` 等）は build 時に新しい list へコピーされ、構築済み Agent へ
+spec 側リストの事後 mutation が伝播しない（`tools` と同じ遮断挙動）。
+
+`base_instructions` に callable を渡す場合、SDK が `(context, agent)` の 2 引数 callable を
+要求する点は `instructions` と同様だが、検証タイミングが異なる。`instructions` は
+`AgentRegistry` の register 時に検証されるのに対し、`base_instructions` の callable arity
+検証は `_adapters/builders.py` の build 時（`build_agent` 内）で行われる。これは `registry.py`
+が `SandboxAgentSpec` 固有の分岐を持たない（属性アクセスのみで動作する）方針を維持するための
+非対称である。`registry.py` は sandbox 固有の分岐を持たず、`AgentSpec` と `SandboxAgentSpec` を
+混在登録・混在ハンドオフできる。spec 複製（`freeze` / `clone`）の外部 mutation 遮断は、spec の
+全 dataclass フィールドを走査して list / dict 値を新コンテナに複製する方式であり、サブクラス
+固有の可変フィールド（`capabilities` 等）にも列挙の手動同期なしで適用される。
+
+## Tool Registry
+
+`ToolRegistry` は Tool の宣言（生の Python 関数 + メタデータ）を一元管理するコア公開 API である。
+利用者は lib 非依存の純関数を散在するファイルに置いたまま、組み立てポイントで
+`register(ToolSpec(...))` により一元登録し、`tool_registry.<name>` の属性アクセスでメタデータ
+適用済みの SDK `FunctionTool` を取得して `AgentSpec(tools=[...])` にそのまま渡す。
+`AgentSpec` / `AgentRegistry` からは完全に独立で、opt-in の注入点も設けない（橋渡しは利用者
+コードの `tools=[tool_registry.<name>]` のみ）。
+
+### ToolSpec（メタデータ宣言）
+
+`ToolSpec` は mutable な dataclass である。SDK にネイティブ機構が存在するメタデータは独自の
+実行時機構を作らず、対応する `function_tool()` 引数へ委譲する（build-don't-run。実行時の
+有効判定・承認・タイムアウトは SDK が担う）。
+
+| フィールド | 役割 |
+|---|---|
+| `func` | sync / async の生 Python 関数（必須） |
+| `name` | Registry キー。省略時は `func.__name__`。登録後の変更は非サポート（`func` も同様。登録時に確定）。`name_override` 未指定時は本フィールドの値が SDK 提示名（`name_override` 相当）にも反映される（Registry キーと LLM 提示名が既定で一致・`name_override` 明示指定はそれを上書きする） |
+| `enabled` | 有効/無効（既定 `True`）。SDK `is_enabled` へ「Registry 現在値を参照する callable」として結線される |
+| `needs_approval` | 承認要否（SDK `needs_approval` へ委譲） |
+| `timeout` / `timeout_behavior` / `timeout_error_function` | タイムアウト（SDK 同名引数へ委譲） |
+| `failure_error_function` | 失敗時エラー文言。「未指定（SDK 既定 formatter に委ねる）/ 関数指定 / `None` 明示（例外を文字列化せず素通し）」の 3 値を区別する。未指定は Registry 独自の module-level センチネル既定で表現し、当該 kwarg を渡さない（SDK private センチネル非依存） |
+| `name_override` / `description_override` | SDK 提示名 / 説明の上書き。Registry の登録キー（属性アクセスに使う `<name>`）とは独立に指定できる。`name_override` 未指定時は `name` フィールドの値が SDK 提示名として使われる |
+| `strict_mode` | 厳格スキーマの有効/無効。未指定（`None`）は SDK 既定に委ねる |
+| `extra` | 上記以外の `function_tool()` kwarg 素通し（`AgentSpec.extra` と同型思想の予約キー / 未知キー検証つき。構築時に `ValueError`） |
+
+冪等性（idempotent）フィールドは持たない。未指定のメタデータは kwargs に積まず SDK 既定値に
+委ね、Registry 側で SDK 既定値を再現・ハードコードしない（None-omission）。
+
+### ToolRegistry（登録・取得・照会・動的更新）
+
+- `register(spec: ToolSpec) -> None`: 宣言の保持のみを行い、この時点では SDK に触れない
+  （遅延ラップ）。二重登録、および属性アクセスで到達不能な名前（公開メソッド名との衝突 /
+  `_` 始まり / 非識別子）は `ValueError`。
+- `names() -> list[str]`: 登録済み Tool 名の昇順リスト。
+- `metadata(name) -> ToolSpec`: live な `ToolSpec` を返す。未登録名は登録済み名一覧つき
+  `KeyError`。属性代入による動的更新の反映範囲は、`enabled` = 構築済み Tool へ即反映（後述）、
+  それ以外 = 照会値のみ（SDK 引数の値は構築時に確定し、invalidate・再構築の機構は設けない）。
+- 属性アクセス `tool_registry.<name> -> FunctionTool`: `_adapters` 経由で `function_tool()` を
+  1 回だけ呼んで構築しキャッシュする（同一インスタンス返却。`AgentRegistry` の遅延構築と同型）。
+  未登録名は登録済み名一覧つき `AttributeError`（`_` 始まり名・実在属性は通常解決）。
+- 並行制御は `AgentRegistry` と同じく利用者責任（単一スレッド前提）。
+
+`enabled` の動的トグル: 構築時に `is_enabled` へ bool を焼き込まず「`ToolSpec.enabled` の
+現在値を読む callable」を結線するため、`metadata(name).enabled = False` は構築済み Agent /
+Tool の再構築なしに次の run から当該 Tool を LLM から隠す（SDK `is_enabled` のネイティブ挙動へ
+委譲。`True` へ戻せば同様に再提示される）。
+
+### Tool 宣言の 2 経路
+
+`function_tool` の直接宣言（コア公開の `_adapters` 再エクスポート）はメタデータの一元管理が
+不要な単発 Tool 向け、`ToolRegistry` 登録は一元管理・照会・enabled 動的トグルが必要な Tool
+向けであり、両経路は併存する。
+
+SDK ラップ（`function_tool()` 呼び出し・メタデータの SDK 引数への流し込み・is_enabled callable
+結線）は `_adapters/tools.py` の `build_function_tool` に閉じる（SDK 隔離）。設計判断の経緯は
+`docs/adr/0001-tool-metadata-centralization.md` を参照。
+
 ## SDK 隔離と依存性注入（DI）
 
 openai-agents への結合の隔離は `_adapters/__init__.py`（`from agents import ...` の単一窓口）が
@@ -226,7 +369,9 @@ openai-agents への結合の隔離は `_adapters/__init__.py`（`from agents im
 `protocols.py` の `AgentBuilder` Protocol は、これとは別の「生成処理そのものの差し替え」拡張点。
 
 - `AgentBuilder`: `build(spec) -> Agent`。handoffs を空にした Agent を 1 つ構築する責務。
-  デフォルト実装（`build_agent`）は `_adapters` に置く。
+  デフォルト実装（`build_agent`）は `_adapters` に置く。`build_agent` は spec を
+  `isinstance(spec, SandboxAgentSpec)` で分岐し、構築先クラス（`agents.Agent` /
+  `agents.sandbox.SandboxAgent`）を切り替える。
 - 注入点は `AgentRegistry.__init__(agent_builder=None)`。省略時は `_adapters` のデフォルト実装。
 
 `AgentBuilder` はテスト（`agents.Agent` を構築しないフェイク `FakeAgentBuilder` の注入）と、
@@ -351,6 +496,8 @@ mutation が成立する。
 
 `register` 時点ではビルドしない（遅延性を維持）。構築後、object identity が保証される
 （`a.handoffs[0] is registry.get("b")` かつ `b.handoffs[0] is registry.get("a")`）。
+
+到達可能収集と 2 パス + 巻き戻しの骨格は共有 leaf `_registry_core` に一元化し、通常 / Realtime 両 registry が委譲する（差分点の注入方式はコンポーネントの責務表を参照）。
 
 詳細な検討経緯は `docs/rationale/handoff-cycle-resolution.md` を参照。
 
@@ -651,6 +798,143 @@ checkpoint）も持たない。
 - ノード名・グラフ名は span name と data 属性に乗り外部 trace backend（OpenAI tracing / Langfuse 等）へ
   送信されるため、PII / 秘密文字列をノード名 / グラフ名に含めない（命名は宣言時にユーザーが完全コントロール
   可能・ライブラリ側でのサニタイズは観測性を壊すため行わない）。
+
+## Realtime エージェント（専用宣言ルート）
+
+Realtime エージェント（`agents.realtime.RealtimeAgent`・音声エージェント）を宣言的に扱う専用ルートを
+`src/oai_agentspec/realtime/` に置く。通常の `AgentSpec` / `AgentRegistry` とは共用せず、RealtimeAgent が
+非対応とするフィールドをそもそも型として持たない専用宣言型・専用 registry・専用公開窓口を提供する。
+宣言と実行の分離という流儀を Realtime でも保ちつつ、非対応フィールドは型レベルで排除し、型で排除しきれない
+経路のみ build 時に reject する。
+
+### モジュール配置と依存方向
+
+`realtime/` はコア（宣言層）・runtime（実行寄り層）のいずれの群にも属さない第 3 の並列宣言ルートであり、
+コア公開 API ツリー外・専用窓口（`oai_agentspec.realtime`）経由で提供する。専用 registry が `_adapters` を
+上向きに参照する単方向依存の形は runtime と同型だが、配置はコア直下の宣言層である。
+
+```
+realtime/__init__   →  { realtime/registry, realtime/spec, realtime/protocols }
+realtime/registry   →  { realtime/spec, realtime/protocols, _adapters }
+realtime/spec, realtime/protocols  →  （最下層・agents 非依存）
+_adapters/realtime  →  agents.realtime（SDK 結合はここに閉じる）
+```
+
+- SDK import（`from agents.realtime import RealtimeAgent, realtime_handoff`）は `_adapters/realtime.py`
+  にのみ置く。`realtime/spec.py` / `realtime/registry.py` / `realtime/protocols.py` / `realtime/__init__.py`
+  は plain データと不透明型のみ扱う（SDK 隔離）。
+- コアから `realtime/` への依存辺は持たない。`oai_agentspec/__init__.py` に `realtime` の import を
+  追加せず、`import oai_agentspec` は `oai_agentspec.realtime` を連鎖 import しない（遅延 import 境界）。
+
+### RealtimeAgentSpec / RealtimeHandoffConfig
+
+`RealtimeAgentSpec` は RealtimeAgent が対応するフィールドのみを持つ宣言 dataclass で、`agents` 非依存。
+非対応フィールド（`model` / `model_settings` / `input_guardrails` / `sub_agents` / `sub_agent_tools` /
+`dynamic_handoffs`）は型として持たない（第一防御・型レベル排除。`dataclasses.fields` に含まれない）。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `name` | `str` | エージェント名（registry 内で一意） |
+| `instructions` | `str \| Callable \| None` | システムプロンプト。文字列、または `(context, agent)` の 2 引数 callable |
+| `prompt` | `Any \| None` | 静的 Prompt のみ。callable（`DynamicPromptFunction`）は非対応（register 時 / build 時に `ValueError`） |
+| `tools` | `list` | RealtimeAgent に渡すツール |
+| `hooks` | `Any \| None` | RealtimeAgent フック |
+| `output_guardrails` | `list` | 出力ガードレール（`input_guardrails` は持たない） |
+| `handoff_description` | `str \| None` | AgentBase 由来のハンドオフ説明 |
+| `mcp_servers` | `list` | AgentBase 由来の MCP サーバ |
+| `mcp_config` | `dict` | AgentBase 由来の MCP 設定 |
+| `handoffs` | `list[str]` | ハンドオフ先エージェント名（グラフ連携） |
+| `handoff_options` | `dict[str, RealtimeHandoffConfig]` | dst 名 -> per-edge 設定 |
+| `extra` | `dict` | 上記以外の RealtimeAgent kwarg の検証付き前方互換口。現 SDK では RealtimeAgent の全フィールドが専用フィールド化されており非空 `extra` は常に reject される（SDK が将来フィールドを追加した場合にのみ素通しが機能する） |
+
+`RealtimeHandoffConfig`（frozen dataclass）は `on_handoff` / `input_type` / `tool_name_override` /
+`tool_description_override` / `is_enabled` を保持し、`input_filter` を型として持たない（`realtime_handoff()`
+が `input_filter` 非対応のため）。通常ルートの `HandoffConfig` / `DynamicHandoff` のフィールド対称性契約とは
+別物であり、その対称性テストの対象外である。
+
+### 専用 registry と handoff 結線
+
+`RealtimeAgentRegistry` は `register` / `get` / `names` / `validate` / `entry_name` を持ち、通常 registry の
+2 パス遅延バインドを踏襲する。依存辺は `spec.handoffs` のみ（`sub_agents` / `dynamic_handoffs` を持たない）。
+
+- `register` は spec の保存のみを行い、同名の重複登録は `ValueError`。
+- `get(name)` は到達可能かつ未ビルドの spec を `handoffs` のみ辿って収集し（visited 集合で循環を打ち切る）、
+  パス 1 で各 spec を `handoffs=[]` でビルド、パス 2 で `realtime_handoff()` により handoff を後付け結線する。
+  結線中の例外では本呼び出しで新規ビルドした agent を巻き戻す（トランザクショナル）。
+- `validate()` は全 spec の `handoffs` 参照が既知名かを一括検証し、未解決を集約して報告する。
+- `register` は次を検証し、違反はエージェント名・エッジ名入りの `ValueError` で前倒し reject する
+  （SDK `realtime_handoff()` の厳格検査を build/run より前に引き上げる）。
+  - callable `instructions` は `(context, agent)` の 2 引数で呼び出せること（デフォルト引数・可変長は
+    許容。シグネチャ取得不能な callable は検証をスキップし実行時に委ねる）。
+  - `prompt` が callable の場合は `ValueError`（build 時の第二防御も併存）。
+  - `handoff_options` のキーが `handoffs` に存在しない場合は `ValueError`（per-edge 設定の silent drop 防止）。
+  - `input_type` 指定時は `on_handoff` が必須。
+  - `on_handoff` の引数個数は `input_type` ありで 2・なしで 1。
+- 上記のうち handoff 系検証（`handoff_options` のキー整合・`input_type`→`on_handoff` 必須・`on_handoff` の
+  arity）は `_validation` の共有バリデータへ一元化され、`register`（`_validate_spec` 経由）と後述の
+  `RealtimeHandoffGraph.apply` の双方から呼ばれる（反映順序に依らず最終 spec が検証される）。
+- デフォルトビルダーは関数内遅延 import で取得し、registry import 時点で `agents.realtime` を読み込まない。
+
+### 宣言的ハンドオフグラフ（RealtimeHandoffGraph）
+
+`RealtimeHandoffGraph` はハンドオフのトポロジを宣言し、`RealtimeAgentSpec` 群へ `apply(specs)` して各 src の
+`handoffs`（名前リスト）と `handoff_options`（dst -> `RealtimeHandoffConfig`）を書き込む宣言アーティファクトで
+ある。registry は変更せず（built 無効化・freeze を要さない）、`spec.handoffs` に名前を直接宣言する場合と構造的
+に同一の結線になる。
+
+- `apply(specs)` は 2 パスで反映する: パス 1 で全 src の反映値を組み立てて handoff 系検証を `_validation` の
+  共有バリデータで実行し、パス 2 で一括代入する。途中の失敗ではどの spec も変異しない（原子性）。`register`（`_validate_spec` 経由）も同じバリデータを共有するため、`apply → register`
+  でも `register → apply` でも最終 spec が必ず検証される（反映順序に依らず検証は迂回されない）。src がグラフに
+  現れるが `specs` に無い場合は `KeyError`。
+- build 前ワンショット反映の制約: apply は spec のみを書き換え、registry のキャッシュには関与しない。
+  `registry.get()` で構築済みのエージェントはキャッシュから返るため、構築後に apply しても既存エージェントの
+  結線は変わらない。apply は必ず最初の `get()` より前に行う。再 `apply` 時に前回反映して今回消えた src の
+  `handoffs` を自動クリアしない（一回性）。エッジを持つ src の `handoffs` のみを replace 上書きし、エッジを
+  持たない src の spec には触れない。
+- `edge()` の引数は `RealtimeHandoffConfig` のフィールドへ次のとおりマップする。`input_filter` は露出させない。
+
+  | `edge()` 引数 | `RealtimeHandoffConfig` フィールド |
+  |---|---|
+  | `on_handoff` | `on_handoff` |
+  | `input_type` | `input_type` |
+  | `tool_name` | `tool_name_override` |
+  | `tool_description` | `tool_description_override` |
+  | `is_enabled` | `is_enabled` |
+
+- `mermaid()` は静的エッジのみを `flowchart TD` として返す（`start([start]) --> {entry}` / `{src} -->|{label}| {dst}`）。
+  ラベル源は `tool_description_override`（未設定時は無ラベル）で、動的エッジ破線・`input_filter` を持たない。
+- `from_specs(specs, entry=None)` は各 spec の `handoffs` から静的エッジを張ってグラフを構築する。
+- コアの `HandoffGraph` とは統合しない独立アーティファクトであり（`input_filter`・動的エッジを型として持たず、
+  registry 内部プリミティブへ委譲しない）、相互の対称性契約の対象外である。
+
+### build 時の reject（型で排除しきれない経路）
+
+`_adapters/realtime.py` の `build_realtime_agent` / `make_realtime_handoff` が第二防御を担う。
+
+- `extra` に専用フィールドと同名のキー、または RealtimeAgent / AgentBase が受け付けない未知キー
+  （`model` / `model_settings` / `output_type` / `tool_use_behavior` / `input_guardrails` 等）が含まれる
+  場合は `ValueError`（agent 名と該当キー名を含む）。有効 kwarg は `RealtimeAgent` の dataclass フィールドから
+  導出する。判定・メッセージは通常ルートと共有の `_validation` leaf（`validate_extra_kwargs`）に一元化する
+  （既存の `ensure_static_prompt` 共有委譲と同流儀。各アダプタは算出済みフィールド名 frozenset とラベル文字列を渡す）。
+- `RealtimeHandoffConfig` は `input_filter` / `options` / `extra` を型として持たないため、非対応の
+  `input_filter` を渡す経路自体が存在しない（型レベル排除で完結し、実行時 reject は不要）。
+- 未指定（None / 空）のフィールドは kwargs に積まず RealtimeAgent の既定に委ねる（明示的に None を渡さない）。
+  ただし `instructions` は例外で、None でも明示的に渡す（RealtimeAgent の既定も None のため挙動は等価）。
+
+`make_realtime_handoff` は `realtime_handoff(agent, tool_name_override=..., tool_description_override=...,
+on_handoff=..., input_type=..., is_enabled=...)` へ委譲する（`input_filter` は渡さない）。実行は SDK
+`RealtimeRunner` に委ね、lib は build に徹する（build-don't-run）。
+
+### 公開窓口
+
+Realtime シンボルはコア `__all__` に載せず、`oai_agentspec.runtime.conversation` と同様に
+`oai_agentspec.realtime` の公開窓口で参照する。`realtime/__init__.py` は再エクスポート専用で、`__all__` に
+`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `RealtimeAgentRegistry` / `RealtimeHandoffGraph` /
+`RealtimeHandoffEdge` / `from_specs` を掲載する。利用側は
+`from oai_agentspec.realtime import RealtimeAgentSpec, RealtimeAgentRegistry` で取得する。
+`RealtimeAgentBuilder`（DI 拡張点の Protocol）はコア `AgentBuilder` と同様どの `__all__` にも載せず、
+`from oai_agentspec.realtime.protocols import RealtimeAgentBuilder` の直接 import でのみ参照する。
+新規 extra は設けない（`agents.realtime` は既存 `agents` SDK に同梱）。
 
 ## パラメータのカスタマイズ
 
@@ -1352,12 +1636,353 @@ governance（AGT を各ツール呼び出しごとの実行時強制 + ライフ
 実行時）と粒度（一括ゲート vs tool 単位）が異なる補完層である。詳細は `docs/integrity.md` を参照する。
 governance（「何をできるか」）は内容ガードレール（`guardrails` extra・「何を言うか」）とも直交する。
 
+## 意図予測（`runtime/intent`）
+
+LLM を用いた意図予測（分類）の汎用土台を `runtime/intent` に置く。分類器は `AgentSpec` / `Runner` に強制
+結線されない独立サービスで、利用側が任意のタイミングで `IntentClassifier.classify(query)` を呼び、返却された
+意図候補を後段のルーティング・分岐・UI・監視等で自由に扱う。実行分岐（PolicyEngine 相当）は本ライブラリの
+スコープ外であり、返却フォーマットと分類 taxonomy の契約のみを本層が担う。`oai-agentspec[intent]` extra で
+opt-in 導入し、extra は `pydantic>=2` に依存する（`openai-agents` の推移的依存で既に導入されるため実質増加
+ゼロ）。SDK 隔離規約は「SDK 隔離と依存性注入（DI）」節が SoT・本節では再掲しない。
+
+### 2 段構成と Protocol DI
+
+分類器は 2 段の内部構造で、各段が Protocol で差し替え可能。
+
+- `ContextBuilder.build(query) -> IntentContext`: `IntentQuery`（`utterance` / `history` / `run_context`。
+  `utterance` は既定 `""` で省略可＝履歴のみで分類するモード。utterance と history のどちらか一方は必要）
+  を受け、`query.history.get_items(limit=history_limit)` を duck-typed（SDK `Session` 互換）で呼び、戻り値を
+  そのまま `tuple(...)` 化して `IntentContext.history_items: tuple[Mapping[str, Any], ...]` に pass-through
+  する。lib 側では item の意味的検証（role の allowlist 等）を行わない。pydantic 側の型検証で各 item は
+  `Mapping[str, Any]` として validate され、内部的に plain `dict` へ shallow copy される（同一性は保存
+  されない）。SDK 由来の `TResponseInputItem`（TypedDict）はこの制約を満たすため今日の SDK では問題なく
+  流通する。上位層は SDK `Session` 型に触れずに履歴を扱える。
+- `CandidateGenerator.generate(context) -> IntentPrediction`: LLM を呼んで意図候補と（任意で）整合性
+  レポートを返す責務。
+
+`IntentClassifier.classify(query) -> IntentPrediction` は 2 段を束ねる上位 Protocol。既定実装は
+`DefaultIntentClassifier`（`DefaultContextBuilder` + `LLMCandidateGenerator`）。3 Protocol は
+`@runtime_checkable` で async 統一（LLM 実装が本質的 I/O バウンドのため）。
+
+### `IntentPolicy` 契約（必須）
+
+`IntentPolicy` は分類器が返せる意図集合と返却フォーマットの契約を型付きで表現する frozen BaseModel で、
+`LLMCandidateGenerator` / `intent_classifier_from_model` の必須引数。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `categories` | `tuple[IntentCategory, ...]` | 許容意図カテゴリ（非空・name 一意）。`IntentCandidate.text` はこの `name` 集合のいずれかのみ許容 |
+| `max_candidates` | `int` | 返却候補件数の上限（既定 3・`ge=1`） |
+| `extra_instructions` | `str` | 利用側がプロンプト先頭に注入する任意の追加指示（既定 `""`・空文字時は非出力・見出しなし） |
+| `include_rationale_in_prompt` | `bool` | 出力例 JSON に `rationale` フィールドを載せて LLM に生成を促すか（既定 `False`＝rationale を促さず速度優先）。どちらでも parser は rationale を optional として受け入れる |
+
+`IntentPolicy.render_prompt()` は `extra_instructions`（非空時のみ先頭に挿入・空白のみは非出力）+ 固定の
+タスク指示 1 行（「ユーザー発話を以下のカテゴリに分類し、JSON のみを出力してください。」）+ 手書き
+4 セクション（`# カテゴリ` / `# 信頼度 (level)` / `# 出力形式` / `# 制約`）を Markdown 見出しで区切って
+組み立てる固定文字列を返す。タスク指示行と `# 制約` の「JSON 以外のテキストを含めない」行は、prompt
+callable が発話を素通しする最小構成でも低精度・高速モデルが分類タスクとして JSON のみを返すための
+固定文。`IntentPrediction.model_json_schema()` は prompt 生成には使わない（Field description は pydantic
+schema 利用者向けメタで、LLM への提示は本文の手書きセクションが担う）。既定は
+`include_rationale_in_prompt=False` で出力例に `rationale` を含めず、LLM の生成トークン・レイテンシを
+抑える（rationale が欲しい利用者は `include_rationale_in_prompt=True` に切り替える）。カスタマイズ引数は
+`extra_instructions` と `include_rationale_in_prompt` のみで、他は `_llm.py` の parser と serialize を
+単一契約に固定するため持たない。
+
+### `ConfidenceLevel`（5 段階カテゴリカル）
+
+意図候補の信頼度は 5 段階の `ConfidenceLevel(str, Enum)` で表す:
+`CERTAIN` / `HIGH` / `MEDIUM` / `LOW` / `SPECULATIVE`。`IntentPrediction.candidates` は
+`CERTAIN > HIGH > MEDIUM > LOW > SPECULATIVE` の降順にソートされ、同レベル内は LLM 出力順を保存する。
+`policy.max_candidates` で切り詰められる。
+
+各値の意味は module 内の単一ソース `_CONFIDENCE_LEVEL_MEANINGS: dict[str, str]` に集約され、
+`IntentCandidate.level` の `Field(description=...)`（pydantic schema 利用者向け）と
+`IntentPolicy.render_prompt()` の `# 信頼度 (level)` セクション（LLM 向け）の双方が同じ dict から派生する。
+`_LEVEL_ORDER`（`_llm.py` の post-hoc sort キー）は `enumerate(ConfidenceLevel)` で enum 宣言順から
+導出され、値追加時に二重管理を発生させない。値の意味をカスタマイズする API は提供しない（1 箇所編集で
+完結する構造を維持する）。
+
+### プロンプトの契約と自動注入 / escape hatch
+
+利用側は `prompt: Callable[[IntentContext], str]` を必須で渡す（str テンプレートは提供しない）。callable の
+責務は「現在発話の user content 生成のみ」に純化されており、`IntentContext.utterance` / `history_items` /
+`run_context` を型付きで受け取り、user メッセージ本文（str）を返す。履歴の文字列埋め込みは不要（SDK が
+`Runner.run(input=list[dict])` で multi-turn として `history_items` を別途送るため）。既定運用では
+`lambda ctx: ctx.utterance` の 1 行で足りる。
+
+`LLMCandidateGenerator` / `intent_classifier_from_model` の既定（`include_policy_in_system=True`）では
+`policy.render_prompt()` の出力を LLM 呼び出しの system role に自動注入する。`extra_instructions` は
+`render_prompt()` の先頭に組み込まれるため、自動注入経路でも system の先頭に届く。利用側が prompt 内へ
+手動で組み込みたい場合は `include_policy_in_system=False` を指定して自動注入を抑制する（escape hatch）。
+両フラグは目的が独立で衝突しない。
+
+### pydantic BaseModel による単一ソース化
+
+`runtime/intent/types.py` の全型（`IntentCategory` / `IntentPolicy` / `IntentQuery` / `IntentContext` /
+`IntentCandidate` / `ConsistencyReport` / `IntentPrediction`）は pydantic BaseModel（`frozen=True`）で
+定義される。`IntentQuery` / `IntentContext` は `Generic[TContext]`（`arbitrary_types_allowed=True`）で
+`run_context` の型を利用側が特定できる。
+
+pydantic 採用により、LLM I/O 契約は次のように単一ソース化される。
+
+- スキーマ生成: `IntentPrediction.model_json_schema()` は pydantic 利用者向けメタとして自動導出される
+  が、`render_prompt()` は使わない（LLM 提示は手書き 4 セクションが担う）。
+- Parse 検証: LLM 出力（adapter は raw `str` を返す）を `_llm.py` 側で
+  `IntentPrediction.model_validate_json(text)` により pydantic parse する。SDK の `output_type`（strict
+  structured output）は生成速度への影響が大きいため採用しない。パース前に `_strip_code_fence` で
+  Markdown コードフェンス（```json ... ```）を剥がす耐性を持つ（低精度・高速モデルが「JSON のみ」の
+  指示に反してフェンスで包む既知の失敗モードへの保険）。型検査 / 必須フィールド検査 /
+  `ConfidenceLevel` の未知値は parse エラーとして扱う（構造破綻）。
+- Post-hoc 加工は次の 3 段のみを lib 側で行う（過剰な in-band 加工を避け SDK Span でトレースする方針）:
+  1. **allowlist フィルタ**: `text ∈ policy.categories.name` を満たさない候補を silent に除外し、除外が
+     発生した場合のみ `logger.warning(...)` で最低限の可視性を残す（discoverability 目的）。
+  2. **sort**: `ConfidenceLevel` 降順（`CERTAIN > HIGH > MEDIUM > LOW > SPECULATIVE`・同レベル内は LLM
+     出力順を保存）。
+  3. **truncate**: `policy.max_candidates` で切り詰め。
+
+  rationale の必須性検証や `metadata.rejected` への記録は行わない（rationale を強制したい利用者は
+  `extra_instructions` に自然文で書く）。
+
+  post-hoc 3 段は `LLMCandidateGenerator` の責務であり、`DefaultIntentClassifier` は generator の
+  出力を素通しする（policy を強制しない）。独自 `CandidateGenerator` を DI する場合、policy を
+  守らせたいなら実装側で同等の適用を行う。`IntentPrediction.candidates` の降順ソートは既定実装のみが
+  保証し、Protocol / 型としては強制されない。独自 generator の組み立ては
+  `intent_classifier_from_generator(generator, *, history_limit=20)`（`intent_classifier_from_model` の
+  対称形・`DefaultContextBuilder` を内部で束ねる 1 行ヘルパ）で行える。generator の型検証は行わず
+  素通しで格納する（既存 factory と同一の非検証契約）。ContextBuilder まで差し替える場合は
+  `DefaultIntentClassifier` を直接組み立てる。
+
+### `agents.Model` の DI と SDK 隔離
+
+`LLMCandidateGenerator(model, prompt, *, policy, include_policy_in_system=True, model_settings=None)` の
+`model` は `agents.Model` 相当を不透明型（`Any`）として受ける DI。`model_settings` も同様に
+`agents.ModelSettings` 相当の不透明型 DI で、reasoning effort / verbosity / max_tokens 等の
+チューニングを利用側から渡す（None なら SDK 既定。`intent_classifier_from_model` も同名 kwarg で
+pass-through する）。環境変数は参照しない（env 参照は runtime レイヤの規約通り `runtime/cli` 境界に
+閉じる）。
+
+SDK 結合は `_adapters/intent.py`（薄いラッパ
+`async run_intent_prompt(model, system, history_items, user_content, *, context=None,
+model_settings=None) -> str`）に閉じる。
+adapter は `Agent(name="intent-classifier", instructions=system or None, model=model)`（`model_settings`
+が非 None のときのみ `model_settings=` を付与）を組み、
+`Runner.run(agent, input=input_items, context=raw_ctx)` を呼んで `str(result.final_output)`（`None` の
+場合は `""`）を返す。`input_items` は `history_items` に、`user_content` が非空の場合のみ
+`{"role":"user","content":user_content}` を末尾 append した list（空文字の `user_content` は turn を
+追加せず履歴のみを送る）。utterance と history の両方が空で `input_items` が空になる場合は
+`Runner.run` 到達前に `ValueError` で fail-fast する。返り値型は `str` のままで `output_type=` は
+付けない。`context` は共有ヘルパ `unwrap_run_context`（`_adapters/run_context.py`）で
+`RunContextWrapper` を開封してから forward する。この 1 経路で「単一発話（`history_items=()`）/ 履歴付き / 履歴のみ
+（`user_content=""`）/ RunContext 付き」のケースを switch なしで捌く。
+
+`runtime/intent/` の非 `_adapters` ファイルは `from agents` / `from openai` を含めない。`agents` の import は
+`_adapters/intent.py` 内の関数内遅延で行い、`import oai_agentspec` は intent extra 未導入でも壊れない
+（PEP 562 遅延再エクスポート）。SDK 隔離 grep（`_adapters` 外に `from agents` / `import agents` を許さない）
+と単方向依存（`runtime/intent` からコア `_adapters` / 宣言層型への上向き参照のみ）は既存規約通り。
+`_default.py` から呼ぶ `history.get_items(limit=...)` は opaque object への duck-typed メソッド呼び出しで
+あり、NFR-1（`from agents` / `import agents` の import 文）の対象外。
+
+### 公開窓口と配置
+
+公開窓口は `oai_agentspec.runtime.intent`（他 runtime extra と同型・コア `__all__` には載せない）。公開シンボル:
+`ConfidenceLevel` / `IntentQuery` / `IntentContext` / `IntentCategory` / `IntentPolicy` / `IntentPrediction` /
+`IntentCandidate` / `ConsistencyReport` / `IntentClassifier` / `ContextBuilder` / `CandidateGenerator` /
+`DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
+`intent_classifier_from_generator` / `confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
+`MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` / `make_trained_estimator` /
+`fit_ml_estimator` / `ml_inference_from_estimator` / `intent_classifier_from_ml_inference`（計 24 件）。
+
+### ML ベース分類器支援
+
+`LLMCandidateGenerator` と独立並置で、ML 分類器（sklearn / 軽量 Transformer / ONNX 等・方式非依存）を
+`CandidateGenerator` Protocol へ差し込むための支援層を持つ。LLM 版との連携はなく、「文章・数値特徴量 →
+ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・規約で扱う。ライブラリ本体は ML フレームワークへ
+一切依存せず（estimator は duck-typed `Any`）、SDK 隔離・単方向依存の規約は「SDK 隔離と依存性注入（DI）」
+節が SoT で本節では再掲しない。
+
+ファイル構成は推論側 `_ml.py` と学習側 `_ml_training.py` の 2 分割。学習側に build-don't-run の唯一の
+逸脱（`fit_ml_estimator` が `estimator.fit()` を駆動する）を物理隔離する。検討経緯は
+`docs/adr/0004-intent-ml-fit-deviation.md` を参照する。
+
+- **推論側（`_ml.py`）**:
+  - `confidence_mapper_from_thresholds(*, certain, high, medium, low, speculative, on_out_of_range="error")`:
+    5 段階の閾値から `float -> ConfidenceLevel` の mapper を組み立てる。`on_out_of_range="clamp"`
+    指定時のみ範囲外スコアを clamp し、既定（`"error"`）では `ValueError`。
+  - `prediction_from_scored_labels(scored_labels, *, policy, mapper)`: `(label, score)` 列から
+    `IntentPrediction` を組み立てる。処理順は「重複ラベルは最高スコアに集約 → `policy.categories` の
+    allowlist フィルタ（除外は `_llm.py` と同一トーンの `logger.warning`）→ mapper で
+    `ConfidenceLevel` へ変換 → level 降順 sort（同レベル内は入力順を保存）→ `policy.max_candidates`
+    で truncate」。ソートキー `_LEVEL_ORDER` は `_llm.py` と単一ソースを共有する。
+  - `MLCandidateGenerator(inference, *, policy, mapper)`: `CandidateGenerator` Protocol 実装。
+    `inference: IntentContext -> Sequence[tuple[str, float]]`（同期/非同期いずれも可）を構築時に
+    `inspect.iscoroutinefunction` で判別し、同期 callable は `asyncio.to_thread` でイベントループを
+    ブロックせず実行する。例外は握り潰さず伝播する。
+- **学習側（`_ml_training.py`）**:
+  - `TrainedIntentEstimator`（frozen dataclass）: `inference`（推論 callable）・`estimator`（学習済み
+    estimator を利用者が再利用・保存できるよう保持。既定 `None`）・`decoder`（ラベル逆写像。既定
+    `None` = 恒等）を持つ学習成果物。`IntentTrainer` は
+    `Callable[..., TrainedIntentEstimator]` の型エイリアスで、lib は trainer を呼び出さず戻り値型のみを
+    契約とする。`make_trained_estimator` は利用者自作 trainer の成果物を束ねる builder。
+  - `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`: 学習済み
+    estimator（`predict_proba` / `classes_` を要求。欠如は `AttributeError`）から推論 callable を組み立てる
+    （fit を駆動しない）。
+  - `fit_ml_estimator(estimator, *, x_train, y_train, policy, transform=None, label_encoding=None)`:
+    sklearn 互換 estimator（`fit` 属性を要求。欠如は `AttributeError`）の `estimator.fit()` を 1 回駆動し
+    `ml_inference_from_estimator` を内部再利用して `TrainedIntentEstimator` を返す。
+    `label_encoding: Mapping[str, Any] | None` はラベル文字列→内部表現の写像（`None` は素通し）で、
+    逆写像は本写像から lib が構築し推論 callable に組み込む。
+- **結線（`factories.py`）**: `intent_classifier_from_ml_inference(inference, *, policy, mapper=None,
+  thresholds=None, history_limit=20)` は `MLCandidateGenerator` を組み立てて既存
+  `intent_classifier_from_generator` に結線し `DefaultIntentClassifier` を返す（LLM 版
+  `intent_classifier_from_model` と対称の 1 回呼び出しファクトリ）。`mapper` と `thresholds`
+  （5 段階名をキーとする `Mapping[str, float]`。内部で `confidence_mapper_from_thresholds` へ展開）は
+  排他で、両方指定・どちらも未指定は `ValueError`。`inference` に `TrainedIntentEstimator` を直渡しした
+  場合は内部で `.inference` を取り出す。
+
+依存はライブラリ本体に一切追加しない（sklearn は examples 実行時のみ `[dependency-groups]` の `examples`
+グループで導入する）。
+
+## Resilience（Model Retry と Run Budget・`runtime/resilience`）
+
+Model 呼び出しの一時失敗リトライと run 全体の予算超過制御の宣言型を `runtime/resilience` に置く。
+宣言型 2 種（frozen dataclass）を SDK ネイティブ機構（`ModelSettings.retry` / `Runner.run(hooks=...)`）へ
+コンパイルするのみで、lib 独自の実行ループ・公開の実行 API を持たない（build-don't-run）。例外は SDK の
+伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]` extra で opt-in 導入し、extra は
+追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア `__all__`・`AgentSpec` の
+フィールド集合は不変。設計判断の検討経緯は `docs/adr/0002-resilience-declarative-compilation.md` を参照。
+
+### 配置と依存方向
+
+- `runtime/resilience/`: 宣言型（`_types.py`）・例外（`_errors.py`）・公開窓口（`__init__.py`）。
+  `agents` 非依存の宣言層
+- `_adapters/resilience.py`: SDK 結線の単一窓口。`build_model_retry` / `build_run_budget_hooks` と
+  内部 `_BudgetHooks(RunHooksBase)` を持ち、`from agents` はここに閉じる
+- 依存は `runtime/resilience` からコア（`_adapters` / `constants`）への上向き単方向のみ。コア
+  （spec / registry / handoffs / prompts / workflow）から `runtime/resilience` への依存辺はない
+
+### `ModelRetryPolicy`（Model 呼び出し retry の宣言）
+
+Model 呼び出しの retry 条件（回数・backoff・条件）を宣言する frozen dataclass。
+`build_model_retry(policy)` が SDK `ModelRetrySettings` へコンパイルし、`ModelSettings.retry` に埋め込む。
+
+- セマンティックフラグ（`retry_on_network_error` / `retry_on_timeout` / `retry_on_rate_limit` /
+  `retry_on_server_error` / `retry_on_retry_after`。既定すべて True）と `extra_retry_statuses` を
+  `retry_policies.any(...)` へ合成し、**必ず `policy` を埋める**（SDK の `policy` 未指定 silent no-op
+  = max_retries だけでは一切 retry しない挙動を構造的に排除する）
+- 生の `policy` callable を渡した場合はセマンティックフラグを無視して `policy` を優先する
+  （エスケープハッチ・条件の組み立ては利用者責務）
+- build-time 検証（`ValueError` で fail-fast）: `max_retries` 負数 / `backoff_multiplier < 1` /
+  `initial_delay > max_delay`。**有効条件ゼロ（全フラグ False かつ `extra_retry_statuses` なしかつ
+  生 `policy` なし）で `max_retries` が正の場合も矛盾宣言として `ValueError`**
+- backoff 値の未指定は SDK 既定に委譲する（lib 側で既定値をハードコードしない）
+- Agent 単位（`Agent.model_settings`）/ Runner 単位（`RunConfig.model_settings`）の両方で設定でき、
+  両方指定時のマージは SDK `_merge_retry_settings` に完全委譲する（Runner 側が Agent 側を上書き。
+  lib 側のマージ実装は持たない）
+- **`retry_on_network_error` と `retry_on_timeout` は SDK `retry_policies.network_error()` に
+  まとめてコンパイルされ、独立に無効化できない**（どちらか True なら両方が retry 対象になる）。
+  SDK に timeout 単独の retry プリミティブが存在しない制約に由来する。timeout のみを retry
+  したい場合は生 `policy` にカスタム callable を渡す
+
+### `RunBudgetPolicy`（run 全体の累積上限の宣言）と `RunBudgetExceeded`
+
+1 回の `Runner.run` に閉じる累積時間 / 累積トークンの上限（`max_elapsed_seconds` /
+`max_total_tokens`）を宣言する frozen dataclass。`build_run_budget_hooks(policy)` が
+`RunHooksBase` サブクラスインスタンスへコンパイルし、`Runner.run(hooks=...)` に渡す。両上限とも
+None の場合は no-op hooks を返す（意図的な無効化の許容・`ValueError` にしない）。上限の負数は
+build-time `ValueError`。
+
+上限超過時は `RunBudgetExceeded`（plain Exception・`runtime/resilience/_errors.py`）を送出する。
+`usage`（トークン内訳・不透明型）・`elapsed_seconds`（累積秒）・`context`（トリガした agent 名・
+LLM 呼び出し回数・超過した上限名）を属性として保持する。SDK `error_handlers` は
+`MaxTurnsExceeded` / `ModelRefusalError` 限定の isinstance dispatch のため、`RunBudgetExceeded` は
+素通しで呼び出し元まで伝播する（塗りつぶしなし・SDK ネイティブ `RunErrorHandlers` と併用可能で
+相互干渉しない）。
+
+enforcement 特性:
+
+- 判定は `on_llm_end` のターン境界のみ（graceful）。tool 実行中の割り込みはしない。ハード timeout
+  （tool 実行中も含む即中断）が必要な場合は、利用者が `asyncio.wait_for(Runner.run(...), timeout=...)`
+  を自前で被せる（docstring で案内）
+- 累積トークンは `context.usage` を読むだけで自前加算しない（SDK run_loop が `on_llm_end` 直前に
+  加算済みのため、自前加算は二重計上になる）。usage が取得できないターンは 0 として扱い、無音に
+  せず `logger.warning`（構造化: agent 名・ターン番号・理由。logger 名は
+  `constants.RESILIENCE_LOGGER_NAME`）で通知する
+- 経過時間は最初の `on_llm_start` で `time.monotonic()` を遅延初期化する（hooks 構築から run 開始
+  までの待機時間を予算に混入させない）
+- hooks は 1 run 1 インスタンス（`build_run_budget_hooks` は毎回新インスタンスを返す）。budget hooks と
+  他の `RunHooksBase` を併用したい場合は `chain_hooks`（下記）で合成する
+
+### hooks 合成（`chain_hooks`）
+
+`Runner.run(hooks=...)` が単数の `RunHooksBase` しか受けない制約を埋めるため、複数の `RunHooksBase` を
+宣言順に fan-out する汎用ヘルパー `chain_hooks(*hooks) -> RunHooksBase` を提供する。公開窓口は
+`oai_agentspec.runtime.hooks`（PEP 562 遅延再エクスポート・窓口 import 時に `agents` を発火させない）で、
+実装実体は `_adapters/hooks.py`（`_ChainedHooks(RunHooksBase)` のサブクラス定義に `agents.lifecycle` の
+import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
+
+合成仕様:
+
+- 7 メソッド（`on_llm_start` / `on_llm_end` / `on_agent_start` / `on_agent_end` / `on_handoff` /
+  `on_tool_start` / `on_tool_end`）を宣言順に順次 await する（状態を持たない薄いプロキシ）
+- fail-fast: 前段が例外を送出したら後段は呼ばず即伝播する（`return_exceptions` 非対応）
+- `chain_hooks()`（0 引数）は全メソッド no-op の `RunHooksBase()` 素インスタンスを返す
+- `chain_hooks(single)`（1 引数）は `single` をそのまま返す（合成ラッパを被せない最適化）
+- SDK に hook メソッドが追加された際の追随手順（オーバーライド追加）は module docstring に明記する
+
+詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md` を参照。
+
+### 実行モード
+
+- `Runner.run`: 超過時に即 raise
+- `Runner.run_streamed`: 例外は `stream_events()` 消費時に raise される（イベントを回さないと観測
+  されない）。`ModelRetryPolicy` / `RunBudgetPolicy` とも streaming で透過的に効く
+- `Runner.run_sync`: 対応（内部で `run` を呼ぶため透過的に効く）
+- Realtime（`RealtimeRunner` / `RealtimeSession`）は非対応
+
+### 公開窓口と配置
+
+公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
+PEP 562 遅延再エクスポートで、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存ゼロのため
+直 import、`build_model_retry` / `build_run_budget_hooks` と SDK 生型は `__getattr__` で
+`_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を発火させない（extra 未導入
+耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は `oai_agentspec.exceptions`
+（統一窓口）。
+
+SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
+`ModelRetrySettings` / `ModelRetryBackoffSettings` / `retry_policies` / `RetryDecision` /
+`RetryPolicyContext` / `ModelRetryNormalizedError` / `RunErrorHandlers` / `RunErrorHandlerResult` /
+`RunErrorHandlerInput` / `RunErrorData`。
+
 ## テスト層
 
 | 層 | 依存 | 対象 |
 |---|---|---|
 | L1（純ロジック） | `agents` 非依存 | registry / handoffs / prompts のロジックを `FakeAgentBuilder` で検証。workflow は `FakeRunnerAdapter`（runner シーム fake）を内部インタプリタへ注入し、エッジ走査 / fan-out / fan-in / 条件分岐 / ループ / メッセージ受け渡し / fan-out + session fail-fast を検証。HITL は承認待ちの検知・承認/却下の解決ロジック（call_id 単位・部分解決・全解決での再開・却下時継続・承認系構造化エラー）を fake で検証 |
 | L2（統合） | 実 `Agent` + `FakeModel` + `Runner` | 動的 instructions・循環ハンドオフ・サブエージェント委譲の実挙動を検証。workflow は経路C（`as_agent_spec` → `Runner.run` で決定論起動・handoff 流入）、経路A（`as_facade_spec` → context 透過・既定 input_filter）、`tool_choice` を extra に積むと `ValueError` / `model_settings` なら成功する回帰を検証。HITL は `FakeModel` が `needs_approval` ツールへ ToolCall を返して interruptions を生成し、複数 `call_id` を可変に与えるヘルパで段階解決を検証。承認前は実行記録が残らず approve 後に初めて残ること（NFR-7）を実行記録で検証する |
+
+Realtime ルート（`realtime/`）も同じ 2 層で検証する。L1 は `FakeRealtimeAgentBuilder` を注入して spec の
+フィールド排除・registry の遅延構築 / 循環解決 / 重複登録 / validate を `agents` 非依存で検証し、加えて
+`RealtimeHandoffGraph` のグラフ宣言 / `apply` の spec 反映 / 反映順序非依存の検証 / `mermaid` / 「グラフ apply ==
+spec 直接宣言」の等価性を `FakeRealtimeAgentBuilder` 注入で検証する。L2 は
+`RealtimeRunner` + `FakeRealtimeModel`（`RealtimeModel` 抽象実装）で handoff の実委譲を検証する。個別
+assert・テスト名は docstring を一次情報とする既存方針を踏襲する。加えて Realtime の隔離不変条件
+（コア `__all__` に Realtime シンボルを含まない・`import oai_agentspec` が `realtime` を連鎖 import しない・
+L1 テストダブルが `agents` に依存しない）は clean subprocess での import 検証と `__all__` の introspection
+テストで機械的に固定する。
+
+intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（frozen・`IntentPolicy` の categories
+検証等）と `render_prompt()` の出力・`intent_classifier_from_model` /
+`intent_classifier_from_generator` の組み立てを `agents` 非依存で pin する。L2 は `LLMCandidateGenerator` の post-hoc 3 段（allowlist / sort / truncate）・コードフェンス
+耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
+検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
+空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
+PEP 562 遅延再エクスポートと `__all__` 24 件の pin、履歴のみモード（`utterance=""` + history）の
+end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
+
+ML ベース分類器支援は同じ 2 層で検証する。L2 の `test_ml_l2.py` / `test_ml_training_l2.py` は
+`predict_proba` / `classes_` / `fit` を持つ duck-typed fake estimator（sklearn 非依存）で
+mapper・dedup・allowlist・sort・truncate・同期/非同期ブリッジ・fit 駆動・ラベルエンコード/復号を
+検証する。sklearn 自体はテストスイートで一切使用せず、examples 実行時のみの依存に留める。
 
 L2 には SDK バージョン耐性トリップワイヤ（NFR-7）を置く。openai-agents SDK との結合点で手組みしている
 前提（`Model` 抽象メソッド集合・手組みレスポンス型の必須フィールド集合・入口入力の正規化形式への依存・
