@@ -39,3 +39,15 @@ INTEGRITY_MANIFEST_RELATIVE_PATH: Final[str] = ".integrity/sha256.manifest"
 # runtime インテグリティ防御: libs detect で明示的に拒否する hash アルゴリズム名（小文字）。
 # 暗号学的に弱い md5 / sha1 は PEP 376 RECORD であっても受け入れない。
 INTEGRITY_REJECTED_HASH_ALGORITHMS: Final[frozenset[str]] = frozenset({"md5", "sha1"})
+
+# Tool Registry: `ToolSpec.failure_error_function` の「未指定」を表す module-level センチネル。
+# SDK private センチネル（`agents.tool._UNSET_FAILURE_ERROR_FUNCTION`）に依存せず 3 値
+# （未指定 / callable / None 明示）を Registry 側で区別する。`_adapters/tools.py` の kwargs
+# 組み立てで `is not TOOL_UNSET` の同一性判定に使うため、必ず単一インスタンスを共有する。
+# コア層に置くことで `_adapters -> tool_registry` の実行時上向き参照を解消する。
+TOOL_UNSET: Final[object] = object()
+
+# Resilience: `_BudgetHooks`（`_adapters.resilience`）が emit する構造化ログの logger 名（固定）。
+# 利用者は ``logging.getLogger(RESILIENCE_LOGGER_NAME)`` で観測性基盤に接続する。
+# ``INTEGRITY_LOGGER_NAME`` と同型の運用（ドット区切りの階層 logger 名）。
+RESILIENCE_LOGGER_NAME: Final[str] = "oai_agentspec.resilience"

@@ -11,11 +11,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from agents import (
-    RunContextWrapper,
-    Runner,
-)
+from agents import Runner
 
+from .run_context import unwrap_run_context
 from .runner import ApplyResult, RunOutcome, _outcome_from_result, _pending_agent_name
 
 if TYPE_CHECKING:
@@ -177,7 +175,7 @@ async def resume_outcome(
     Returns:
         再開後の中断 or 完了を表す `RunOutcome`。
     """
-    raw_context = context.context if isinstance(context, RunContextWrapper) else context
+    raw_context = unwrap_run_context(context)
     result = await Runner.run(agent, state, context=raw_context, **runner_kwargs)
     return _outcome_from_result(result)
 
@@ -207,6 +205,6 @@ async def resume_with_observation(
     """
     from .routing import observe_run_result
 
-    raw_context = context.context if isinstance(context, RunContextWrapper) else context
+    raw_context = unwrap_run_context(context)
     result = await Runner.run(agent, state, context=raw_context, **runner_kwargs)
     return _outcome_from_result(result), observe_run_result(result)
