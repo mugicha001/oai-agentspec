@@ -60,7 +60,7 @@ def _registry() -> AgentRegistry:
 
 def test_prompt_slot_reads_seed_with_placeholders(tmp_path: Path) -> None:
     """seed は `store.get(tune).body`（`${var}` プレースホルダ保持）から読み取る。"""
-    slot = prompt_slot(_store(tmp_path), _registry(), tune="bot")
+    slot = prompt_slot(_store(tmp_path), _registry(), agent="bot")
     assert isinstance(slot, Slot)
     assert slot.name == "bot"
     assert slot.seed == "You are ${role}. Be helpful."
@@ -68,7 +68,7 @@ def test_prompt_slot_reads_seed_with_placeholders(tmp_path: Path) -> None:
 
 def test_prompt_slot_keeps_vars_without_expanding_seed(tmp_path: Path) -> None:
     """vars は Slot.vars に保持され seed には展開しない（最適化対象外・rollout 再注入）。"""
-    slot = prompt_slot(_store(tmp_path), _registry(), tune="bot", vars={"role": "agent"})
+    slot = prompt_slot(_store(tmp_path), _registry(), agent="bot", vars={"role": "agent"})
     # seed は `${role}` のまま（展開しない）。
     assert "${role}" in slot.seed
     assert slot.vars == {"role": "agent"}
@@ -91,7 +91,7 @@ def test_default_build_replaces_instructions_only(tmp_path: Path) -> None:
     orig = AgentSpec(name="bot", instructions="orig", model=FakeModel(), tools=[_search])
     reg.register(orig)
 
-    slot = prompt_slot(_store(tmp_path), reg, tune="bot")
+    slot = prompt_slot(_store(tmp_path), reg, agent="bot")
     built = slot.build("NEW INSTRUCTIONS")
 
     assert isinstance(built, AgentSpec)
@@ -107,7 +107,7 @@ def test_default_build_prepends_fixed_part(tmp_path: Path) -> None:
     slot = prompt_slot(
         _store(tmp_path),
         _registry(),
-        tune="bot",
+        agent="bot",
         base="main",
         parts=["style"],
         vars={"org": "AgentSpec"},
@@ -119,36 +119,40 @@ def test_default_build_prepends_fixed_part(tmp_path: Path) -> None:
 
 def test_default_build_without_fixed_uses_candidate_only(tmp_path: Path) -> None:
     """固定部分なしのとき instructions は候補テキストのみ（前置の空連結を入れない）。"""
-    slot = prompt_slot(_store(tmp_path), _registry(), tune="bot")
+    slot = prompt_slot(_store(tmp_path), _registry(), agent="bot")
     built = slot.build("ONLY CANDIDATE")
     assert built.instructions == "ONLY CANDIDATE"
 
 
-def test_prompt_slot_populates_fixed_when_default_build(tmp_path: Path) -> None:
-    """既定 build 経路では `Slot.fixed` に base+parts の合成済み固定部分（`${var}` 保持）を持つ
-    （`OptimizeResult.seed` / `prompt` を rollout 時の合成済み full テキストで返すため）。"""
+def test_prompt_slot_segments_carry_fixed_content_in_new_shape(tmp_path: Path) -> None:
+    """新 shape では base+parts の固定内容は `Slot.segments` が SoT として保持する。
+
+    `_recompose_new_shape_results` / `_new_default_build` の双方が segments 経由で参照するため、
+    fixed 側の redundant な合成文字列は保持しない（compose_from_marked が二重合成しない）。"""
     slot = prompt_slot(
         _store(tmp_path),
         _registry(),
-        tune="bot",
+        agent="bot",
         base="main",
         parts=["style"],
         vars={"org": "AgentSpec"},
     )
-    # _store fixture: base/main.md = "BASE ${org}", parts/style.md = "STYLE part"。
-    # Slot.fixed 自体は `${var}` を保持（rollout 時 / run_apo の compose で再注入）。
-    assert slot.fixed == "BASE ${org}\n\nSTYLE part"
+    # 固定セグメントは `${var}` 保持のまま segments に格納される。
+    fixed_segments = [s for s in slot.segments if not s.tune]
+    assert [s.ref for s in fixed_segments] == ["base:main", "part:style"]
+    assert fixed_segments[0].text == "BASE ${org}"
+    assert fixed_segments[1].text == "STYLE part"
 
 
-def test_prompt_slot_fixed_empty_when_custom_build(tmp_path: Path) -> None:
-    """custom `build` 経路では `Slot.fixed` は空文字（custom build の組み立てが不明のため）。"""
+def test_prompt_slot_custom_build_leaves_segments_empty(tmp_path: Path) -> None:
+    """custom `build` 経路では `Slot.segments` が空（optimizer の再合成対象から外す）。"""
     sentinel = AgentSpec(name="custom", instructions="x", model=FakeModel())
 
     def _build(_candidate: str) -> AgentSpec:
         return sentinel
 
-    slot = prompt_slot(_store(tmp_path), tune="bot", base="main", parts=["style"], build=_build)
-    assert slot.fixed == ""
+    slot = prompt_slot(_store(tmp_path), agent="bot", base="main", parts=["style"], build=_build)
+    assert slot.segments == ()
 
 
 def test_default_build_substitutes_vars_into_fixed(tmp_path: Path) -> None:
@@ -160,7 +164,7 @@ def test_default_build_substitutes_vars_into_fixed(tmp_path: Path) -> None:
     slot = prompt_slot(
         _store(tmp_path),
         _registry(),
-        tune="bot",
+        agent="bot",
         base="main",
         parts=["style"],
         vars={"org": "AgentSpec"},
@@ -178,7 +182,7 @@ def test_default_build_substitutes_vars_into_fixed(tmp_path: Path) -> None:
 def test_default_build_without_registry_raises(tmp_path: Path) -> None:
     """build 省略かつ registry 未供給は即 fail-closed の ValueError（slot 生成時）。"""
     with pytest.raises(ValueError, match="registry"):
-        prompt_slot(_store(tmp_path), None, tune="bot")
+        prompt_slot(_store(tmp_path), None, agent="bot")
 
 
 def test_default_build_unregistered_spec_raises(tmp_path: Path) -> None:
@@ -186,7 +190,7 @@ def test_default_build_unregistered_spec_raises(tmp_path: Path) -> None:
     # store には bot.md があるが registry には bot を登録しない。
     reg = AgentRegistry()
     reg.register(AgentSpec(name="other", instructions="o", model=FakeModel()))
-    slot = prompt_slot(_store(tmp_path), reg, tune="bot")
+    slot = prompt_slot(_store(tmp_path), reg, agent="bot")
     with pytest.raises(ValueError, match="未登録"):
         slot.build("x")
 
@@ -198,7 +202,7 @@ def test_explicit_build_bypasses_registry(tmp_path: Path) -> None:
     def _build(candidate: str) -> AgentSpec:
         return sentinel
 
-    slot = prompt_slot(_store(tmp_path), tune="bot", build=_build)
+    slot = prompt_slot(_store(tmp_path), agent="bot", build=_build)
     assert slot.build is _build
     assert slot.build("anything") is sentinel
     # seed は依然 store から取得される。
@@ -208,7 +212,7 @@ def test_explicit_build_bypasses_registry(tmp_path: Path) -> None:
 def test_prompt_slot_missing_tune_segment_raises(tmp_path: Path) -> None:
     """tune セグメントが store で解決できなければ KeyError。"""
     with pytest.raises(KeyError):
-        prompt_slot(_store(tmp_path), _registry(), tune="nonexistent")
+        prompt_slot(_store(tmp_path), _registry(), agent="nonexistent")
 
 
 # ----------------------------------------------------------------------
@@ -229,7 +233,7 @@ def test_prompt_slot_resolves_seed_from_agents_layout(tmp_path: Path) -> None:
     reg = AgentRegistry()
     reg.register(AgentSpec(name="billing", instructions="orig", model=FakeModel()))
 
-    slot = prompt_slot(store, reg, tune="billing")
+    slot = prompt_slot(store, reg, agent="billing")
 
     assert slot.seed == "Billing agent ${tone}"
 
@@ -245,7 +249,7 @@ def test_prompt_slot_falls_back_to_flat_when_agents_dir_misses(tmp_path: Path) -
     reg = AgentRegistry()
     reg.register(AgentSpec(name="billing", instructions="orig", model=FakeModel()))
 
-    slot = prompt_slot(store, reg, tune="billing")
+    slot = prompt_slot(store, reg, agent="billing")
 
     assert slot.seed == "Flat billing prompt"
 
@@ -260,7 +264,7 @@ def test_prompt_slot_prefers_agents_layout_over_flat(tmp_path: Path) -> None:
     reg = AgentRegistry()
     reg.register(AgentSpec(name="billing", instructions="orig", model=FakeModel()))
 
-    slot = prompt_slot(store, reg, tune="billing")
+    slot = prompt_slot(store, reg, agent="billing")
 
     assert slot.seed == "LAYOUT BODY"
 
@@ -302,22 +306,22 @@ def test_prompt_slot_missing_fixed_var_raises_config_missing(tmp_path: Path) -> 
 
     # _store fixture: base/main.md = "BASE ${org}" だが vars に 'org' を渡さない。
     with pytest.raises(OptimizeError) as exc:
-        prompt_slot(_store(tmp_path), _registry(), tune="bot", base="main", parts=["style"])
+        prompt_slot(_store(tmp_path), _registry(), agent="bot", base="main", parts=["style"])
     assert exc.value.kind == FailureKind.CONFIG_MISSING
     assert "org" in str(exc.value)
 
 
 def test_prompt_slot_custom_build_skips_fixed_var_check(tmp_path: Path) -> None:
-    """custom build 経路は `Slot.fixed` を空にし、fixed の vars 不足を検査しない（custom build が
-    どう組み立てるかライブラリ側で保証できないため）。"""
+    """custom build 経路は fixed の vars 不足を検査しない（custom build がどう組み立てるかを
+    ライブラリ側で保証できないため）。"""
     sentinel = AgentSpec(name="custom", instructions="x", model=FakeModel())
 
     def _build(_candidate: str) -> AgentSpec:
         return sentinel
 
     # vars に 'org' を渡さないが custom build なので CONFIG_MISSING にならない。
-    slot = prompt_slot(_store(tmp_path), tune="bot", base="main", parts=["style"], build=_build)
-    assert slot.fixed == ""
+    slot = prompt_slot(_store(tmp_path), agent="bot", base="main", parts=["style"], build=_build)
+    assert slot.segments == ()
 
 
 def test_prompt_slots_unregistered_spec_raises_on_build(tmp_path: Path) -> None:
@@ -464,29 +468,27 @@ def _store_new_shape(tmp_path: Path) -> PromptStore:
     return PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
 
 
-# --- 旧経路の完全互換（agent=None・tune=単一 str） ---
+# --- 旧 shape 削除の regression guard（ADR 0007） ---
 
 
-def test_prompt_slot_legacy_shape_still_works(tmp_path: Path) -> None:
-    """`agent=None` + `tune` が単一 str の旧経路は既存挙動を完全互換で維持する。"""
-    slot = prompt_slot(_store(tmp_path), _registry(), tune="triage")
-    assert slot.name == "triage"
-    assert slot.seed == "Triage prompt ${tone}"
-    assert slot.segments == ()
+def test_prompt_slot_rejects_legacy_shape(tmp_path: Path) -> None:
+    """v0.3.x で旧 shape (`agent=None` + `layout=None` + `tune=<str>`) を削除した regression guard。
+
+    ADR 0007 で NFR-3 撤回・旧経路削除を決定。誤って旧 shape 呼び出しが復活しないよう、
+    `agent=` / `layout=` のいずれも指定しない呼び出しは `OptimizeError(CONFIG_MISSING)` で
+    fail-closed することを固定する。
+    """
+    with pytest.raises(OptimizeError) as exc:
+        prompt_slot(_store(tmp_path), _registry(), tune="bot")
+    assert exc.value.kind == FailureKind.CONFIG_MISSING
+    assert "agent=" in str(exc.value) or "layout=" in str(exc.value)
 
 
-def test_prompt_slot_legacy_with_base_and_parts(tmp_path: Path) -> None:
-    """旧経路で base/parts を渡した固定部分合成が新 shape 追加後も変わらない。"""
-    slot = prompt_slot(
-        _store(tmp_path),
-        _registry(),
-        tune="bot",
-        base="main",
-        parts=["style"],
-        vars={"org": "AgentSpec"},
-    )
-    assert slot.fixed == "BASE ${org}\n\nSTYLE part"
-    assert slot.segments == ()
+def test_prompt_slot_rejects_missing_agent_and_layout(tmp_path: Path) -> None:
+    """`agent=None` + `layout=None` + `tune=None` も同様に fail-closed（regression guard）。"""
+    with pytest.raises(OptimizeError) as exc:
+        prompt_slot(_store(tmp_path), _registry())
+    assert exc.value.kind == FailureKind.CONFIG_MISSING
 
 
 # --- 新 shape（agent= 指定） ---
@@ -894,44 +896,52 @@ def test_prompt_slot_new_shape_build_invalid_marker_raises(tmp_path: Path) -> No
 
 
 def test_prompt_slot_new_shape_custom_build_leaves_segments_empty(tmp_path: Path) -> None:
-    """FU（Codex P2 修正）: 新 shape でも `build=` が明示されたら `Slot.segments` は空に保つ。
+    """新 shape で `build=` が明示されたら `Slot.segments` は空に保つ（Codex P2 修正）。
 
-    segments が非空だと `optimizer._recompose_new_shape_results` が「既定 build による segments
-    合成が使われた」前提で `OptimizeResult.prompt/seed/diff` を full 再合成で上書きしてしまい、
-    custom build が実際に組み立てた rollout instructions と乖離する（"OptimizeResult.prompt ==
-    rollout instructions" 契約の drift）。custom build 経路は `Slot.segments = ()` にして
-    _recompose 対象外にし、旧 shape / 生 seed 経路と同じ「run_apo 返却をそのまま尊重する」
-    挙動に統一する。既定 build（build=None）のときは従来どおり segments を保持する。
+    segments が非空だと `optimizer._recompose_new_shape_results` が既定 build による segments
+    合成前提で `OptimizeResult.prompt/seed/diff` を full 再合成で上書きしてしまい、custom build
+    が実際に組み立てた rollout instructions と乖離する。custom build 経路は `Slot.segments = ()`
+    にして _recompose 対象外にし、「run_apo 返却をそのまま尊重する」挙動に統一する。
     """
 
     def _custom_build(candidate: str) -> AgentSpec:
         return AgentSpec(name="triage", instructions=candidate, model=FakeModel())
 
-    dir_custom = tmp_path / "custom"
-    dir_custom.mkdir()
-    dir_default = tmp_path / "default"
-    dir_default.mkdir()
-
     slot_custom = prompt_slot(
-        _store_new_shape(dir_custom),
+        _store_new_shape(tmp_path),
         _registry(),
         agent="triage",
         base="main",
-        tune=["main", "triage"],
         vars={"org": "AgentSpec"},
         build=_custom_build,
     )
     assert slot_custom.segments == ()
 
-    slot_default = prompt_slot(
-        _store_new_shape(dir_default),
-        _registry(),
-        agent="triage",
-        base="main",
-        tune=["main", "triage"],
-        vars={"org": "AgentSpec"},
-    )
-    assert len(slot_default.segments) > 0
+
+def test_prompt_slot_new_shape_custom_build_multi_tune_fail_closed(tmp_path: Path) -> None:
+    """新 shape で custom `build=` + multi-tune の併用は fail-closed（境界マーカー漏出防止）。
+
+    2 個以上の tune セグメントは境界マーカー `${oas_boundary_N}` 入り seed になり、custom build は
+    マーカーを解釈しないため `OptimizeResult.seed / prompt / diff` に literal で漏出する。
+    「予約接頭辞は成果物に一切現れない」契約を守るため slot 構築時に `OptimizeError` で拒否する。
+    """
+
+    def _custom_build(candidate: str) -> AgentSpec:
+        return AgentSpec(name="triage", instructions=candidate, model=FakeModel())
+
+    with pytest.raises(OptimizeError) as exc:
+        prompt_slot(
+            _store_new_shape(tmp_path),
+            _registry(),
+            agent="triage",
+            base="main",
+            tune=["main", "triage"],
+            vars={"org": "AgentSpec"},
+            build=_custom_build,
+        )
+    assert exc.value.kind == FailureKind.CONFIG_MISSING
+    assert "custom build" in str(exc.value)
+    assert "multi-tune" in str(exc.value)
 
 
 # ----------------------------------------------------------------------

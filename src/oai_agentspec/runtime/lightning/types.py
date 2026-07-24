@@ -153,20 +153,18 @@ class Slot:
     自動導出でき、利用者は手書き rebind を渡さなくてよい（FR-3 / FR-9）。`PromptStore` は
     `prompt_slot` が読み取り参照するのみで本型は SDK / `PromptStore` 型を保持しない。
 
-    `fixed` は base / parts を合成した固定部分テキスト（`${var}` プレースホルダ保持）。`prompt_slot`
-    が `_compose_fixed` の戻り値を保持し、(1) 既定 build が candidate と連結して agent の
-    instructions を組み立てる際、(2) `OptimizeResult.seed` / `OptimizeResult.prompt` を「合成済み
-    full テキスト」として返す際に参照する。利用者が custom `build` を明示する場合や生 seed +
-    rebind 経路では空文字（合成不要）。
+    構成情報は `segments`（構成順の `SlotSegment` 列）が SoT として保持し、`_new_default_build`
+    と optimizer の OptimizeResult 合成の双方が参照する。custom build 経路 / 手書き `Slot` /
+    生 seed + rebind 経路では空タプルで、その場合 optimizer は run_apo の返却をそのまま
+    `OptimizeResult` にする（再合成しない）。
 
     Attributes:
         name: スロット名（対象エージェント / セグメント名）。
         seed: vars 未展開の seed テキスト（`${var}` プレースホルダ保持・tune 部分のみ）。
         build: 候補テキストから `AgentSpec` を構築する関数。
         vars: `${var}` 置換値（最適化対象外・各 rollout で再注入）。
-        fixed: base / parts を合成した固定部分テキスト（`${var}` 保持・空なら合成なし）。
-        segments: 新 shape の構造情報 SoT（既定 build と OptimizeResult 合成の両方が参照する）。
-            空タプルなら従来経路（`fixed` / `seed` ベースの合成）を使う。
+        segments: 構成情報 SoT（既定 build と OptimizeResult 合成の両方が参照する）。空タプルは
+            custom build / 手書き Slot / 生 seed 経路（optimizer は run_apo 返却を素通し）。
         vars_fn: vars=callable を受けた場合の保持先（`vars` の dict 契約とは分離）。既定 build が
             これを見て動的 instructions を生成する。callable を受けない場合は None。
     """
@@ -175,7 +173,6 @@ class Slot:
     seed: str
     build: Callable[[str], Any]
     vars: dict[str, Any] = field(default_factory=dict)
-    fixed: str = ""
     segments: tuple[SlotSegment, ...] = ()
     vars_fn: Callable[[Any], dict[str, Any]] | None = None
 
@@ -190,10 +187,9 @@ class OptimizeResult:
 
     Attributes:
         prompt: 最適化済みプロンプトテキスト（単一は str・複数は `{名前: str}` mapping・`${var}`
-            保持）。**rollout 時に agent が実際に受け取る合成済み full テキスト**（`Slot.fixed`
-            と tune を `\\n\\n` 連結したもの）を返す。固定部分（base / parts）が無い場合は tune
-            そのものと一致する（生 seed + rebind 経路 / `prompt_slot` で base/parts 未指定 /
-            custom build 経路）。
+            保持）。**rollout 時に agent が実際に受け取る合成済み full テキスト**（構成順の
+            固定・tune セグメントを `\\n\\n` 連結したもの）を返す。custom build / 生 seed + rebind
+            経路では run_apo 返却をそのまま返す。
         seed: 最適化前のプロンプトテキスト（`prompt` と同じ shape・**合成済み full**）。利用者が
             「before / after」を比較表示する際のボイラープレートを不要にする。空文字
             （`""` / `{}`）は seed が解決できなかった例外的経路の既定値（通常は呼び出し側で

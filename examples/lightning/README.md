@@ -279,15 +279,14 @@ def composite_reward(r: RolloutResult) -> float:
 の公開メソッドを**読み取るのみ**で一切改変しない。
 
 - `prompt_slot(store, registry=None, agent=None, *, base=None, parts=(), layout=None, tune=None, vars=None, build=None)` -> `Slot`
-  - **旧経路（完全互換）**: `agent` を省略し `tune=<単一 str>` を渡す従来呼び出し
-    （`prompt_slot(store, registry, tune="triage")`）はそのまま動く。seed は `PromptLayout` を
-    尊重して解決する: `store.compose(agent=tune, vars=None)`（標準の `agents/<tune>.md`）を優先し、
-    見つからなければ `store.get(tune).body`（root 直下の flat 配置）にフォールバックする。
-  - **新 shape**: `agent`（または `layout`）を明示すると `PromptStore.compose` と同じ構成指定
-    （`base` / `parts` / `layout`）を受け付け、`tune`（`str | Sequence[str]`）で最適化対象
-    セグメントを選べる。複数セグメントを選ぶと構成順（base -> parts -> agent）に連結した 1 テキスト
-    として単一 APO ループで最適化される。`tune` を省略すると agent セグメントのみを最適化する
-    （従来と同じ既定挙動）。
+  - `agent`（または `layout`）を明示して `PromptStore.compose` と同じ構成指定
+    （`base` / `parts` / `layout`）でプロンプト全体を組み立て、`tune`（`str | Sequence[str]`）で
+    最適化対象セグメントを選ぶ。両方未指定は `OptimizeError(CONFIG_MISSING)`（詳細は ADR 0007）。
+  - seed は `PromptLayout` を尊重して解決する: `store.compose(agent=<agent>, vars=None)`（標準の
+    `agents/<agent>.md`）を優先し、見つからなければ `store.get(<agent>).body`（root 直下の flat
+    配置）にフォールバックする。
+  - 複数セグメントを選ぶと構成順（base -> parts -> agent）に連結した 1 テキストとして単一 APO
+    ループで最適化される。`tune` を省略すると agent セグメントのみを最適化する。
   - `vars` は `dict` のほか `Callable[[Any], dict]` も渡せる（`PromptStore.compose(vars=...)` と
     同一型）。callable のときは rollout ごとに評価され動的注入となり、成果物では `${var}` が保持
     される（静的注入との違いは受理型のみ）。
@@ -377,11 +376,11 @@ print("=== diff ===")
 print(result.diff)        # unified diff（base/parts は context 行・tune だけ ±）
 ```
 
-> **「合成済み full」の意味**: `prompt_slot(store, registry, tune=..., base=..., parts=...)` で base
-> / parts が指定された場合、APO は tune 部分だけを最適化するが、`result.seed` / `result.prompt` は
-> `base + parts + tune` を `\n\n` で連結した **rollout 時に agent が実際に instructions として
-> 受け取る形** で返る。base / parts が無い構成（生 seed や `prompt_slot(tune=..., base=None,
-> parts=())`）では tune そのものになる。
+> **「合成済み full」の意味**: `prompt_slot(store, registry, agent=..., base=..., parts=...)` で base
+> / parts が指定された場合、APO は tune 対象セグメントだけを最適化するが、`result.seed` /
+> `result.prompt` は構成順（base -> parts -> agent）を `\n\n` で連結した **rollout 時に agent が
+> 実際に instructions として受け取る形** で返る。base / parts が無い構成（`prompt_slot(agent=...)`
+> のみ）では agent セグメントそのものになる。
 
 `save` は `PromptStore` のテンプレートやライブラリ管理領域を一切書き換えない（利用者が渡したパスに
 のみ書く）。**出力フォルダに注意**: サンプルはリポジトリを汚さないよう一時ディレクトリ

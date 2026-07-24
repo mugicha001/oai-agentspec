@@ -1,9 +1,10 @@
 """`${var}` プレースホルダの抽出・置換・合成ヘルパ（Single Source of Truth）。
 
-本モジュールは APO 関連で 3 箇所に重複していた `${var}` regex / 合成規則を一本化する。
-`_default_build`（rollout 時 `agent.instructions` 生成）と `_compose_full`（OptimizeResult
-構築時）の双方が本ヘルパを呼ぶことで、合成規則 drift（公開契約 "OptimizeResult.prompt は
-rollout 実体と一致" の違反）を不可能にする。
+本モジュールは APO 関連で `${var}` regex / 合成規則を一本化する。`_new_default_build`
+（rollout 時 `agent.instructions` 生成）と optimizer の `_recompose_new_shape_results`
+（OptimizeResult 構築時）の双方が `split_marked` / `compose_segments` / `compose_from_marked`
+を呼ぶことで、合成規則 drift（公開契約 "OptimizeResult.prompt は rollout 実体と一致" の違反）
+を不可能にする。
 
 `Template.safe_substitute` は `${var}` と bare `$var` の両方にマッチするため、seed や APO
 候補に含まれる literal `$5` / `$PATH` を vars キーと衝突して silent rewrite するリスクが
@@ -96,39 +97,6 @@ def substitute_braced(text: str, vars_dict: dict[str, Any] | None) -> str:
     return PLACEHOLDER_RE.sub(_replace, text)
 
 
-def compose_with_vars(fixed: str, tune: str, vars_dict: dict[str, Any] | None = None) -> str:
-    """`Slot.fixed`（base + parts）と tune を rollout 時 `agent.instructions` と同じ形で合成。
-
-    `_default_build`（rollout 時）と `_compose_full`（OptimizeResult 構築時）の両方が本関数
-    を呼ぶことで、合成規則の drift を不可能にする（Single Source of Truth）。fixed 側にのみ
-    `vars_dict` を再注入する（`_default_build` の規則）。tune 側は APO 候補本体で `${var}`
-    温存契約のため substitute しない（rollout 直前の `_reinject_vars` で別途注入される）。
-
-    合成規則:
-        - `fixed` が空文字: `tune` をそのまま返す。
-        - `fixed` が非空: `f"{fixed_substituted}\\n\\n{tune}"` を返す
-          （`fixed_substituted` は `substitute_braced(fixed, vars_dict)`）。
-
-    `fixed` の空判定は **substitution 前** の `fixed` で行う（`fixed_substituted` ではなく）。
-    fixed が `"${role}"` のみで vars が `{"role": ""}` のとき、後者で判定すると "\\n\\n" 区切りが
-    silent に脱落して `tune` 単体に落ちるが、利用者が fixed を渡している以上は空 vars 値でも
-    "\\n\\n" 区切りを保つ方が rollout 実体（_default_build の合成結果）と整合する
-    （Codex 第4 round 指摘）。
-
-    Args:
-        fixed: 固定部分テキスト（base + parts の合成済み・`${var}` 保持・空文字可）。
-        tune: APO 最適化対象テキスト（候補プロンプト・`${var}` 温存）。
-        vars_dict: `${var}` 置換値（None / 空 dict は no-op）。
-
-    Returns:
-        合成済み full テキスト（`fixed` が空なら `tune` 単体）。
-    """
-    if not fixed:
-        return tune
-    fixed_substituted = substitute_braced(fixed, vars_dict)
-    return f"{fixed_substituted}\n\n{tune}"
-
-
 def split_marked(candidate: str, n_tune: int) -> list[str] | None:
     """境界マーカーで候補テキストを `n_tune` 個の tune セグメントへ分割する（exact-once 検査付き）。
 
@@ -201,7 +169,7 @@ def compose_segments(
     `tune=False` の固定セグメントは `text` をそのまま使い、その `text` にのみ `vars_dict` を
     `substitute_braced` で注入する（tune 側は `${var}` 温存契約のため注入しない・rollout 直前の
     `_reinject_vars` で別途注入される）。既定 build（rollout 時）と optimizer（OptimizeResult 合成）
-    の双方が本関数を呼ぶことで、合成規則の drift を不可能にする（`compose_with_vars` と同じ SSoT）。
+    の双方が本関数を呼ぶことで、合成規則の drift を不可能にする（本モジュール SSoT の一部）。
 
     Args:
         segments: 構成順の `SlotSegment` タプル（空なら空文字を返す）。

@@ -128,7 +128,6 @@ def _calling_run_apo() -> Any:
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> OptimizeResult:
         candidate = dict(seeds)
@@ -362,7 +361,6 @@ async def test_direct_tracer_kwarg_flows_into_effective_config(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> OptimizeResult:
         captured["config"] = config
@@ -553,7 +551,6 @@ async def test_rollout_config_missing_propagates_unchanged(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         # train 先頭ケースで rollout を呼ぶ（内部で _apply_candidate が走る）。
@@ -850,7 +847,6 @@ async def test_approve_without_tool_mock_raises_and_halts(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         await rollout(dict(seeds), list(train)[0])
@@ -1361,7 +1357,6 @@ async def test_var_loss_candidate_scores_zero(monkeypatch: pytest.MonkeyPatch) -
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         # var を落とした候補（${role} 無し）で rollout する。
@@ -1756,7 +1751,7 @@ def test_normalize_workflow_graph_agent_node_mocks_via_clone() -> None:
 
 
 # ----------------------------------------------------------------------
-# Issue #40 T7: 結果整形パス（新 shape slot の fixed="" 受け渡し・vars_per_slot={} 受け渡し・
+# Issue #40 T7: 結果整形パス（新 shape slot の vars_per_slot 受け渡し・
 # run_apo 返却後の full 再合成 + diff 再計算）
 # ----------------------------------------------------------------------
 
@@ -1777,25 +1772,11 @@ def _store_new_shape(tmp_path: Path) -> Any:
     return PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
 
 
-def _store_legacy(tmp_path: Path) -> Any:
-    """旧 shape（tune= 単一 str）テスト用ストア（root 直下 + base/parts）。"""
-    from oai_agentspec.prompts import PromptLayout, PromptStore
-
-    (tmp_path / "triage.md").write_text("Triage prompt ${tone}", encoding="utf-8")
-    base_dir = tmp_path / "base"
-    base_dir.mkdir()
-    (base_dir / "main.md").write_text("BASE ${org}", encoding="utf-8")
-    parts_dir = tmp_path / "parts"
-    parts_dir.mkdir()
-    (parts_dir / "style.md").write_text("STYLE part", encoding="utf-8")
-    return PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
-
-
-async def test_optimize_new_shape_slot_passes_empty_fixed_to_run_apo(
+async def test_optimize_new_shape_slot_passes_vars_per_slot_to_run_apo(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """新 shape（segments 非空）の slot は run_apo へ `fixed=""` を渡す（full 再合成は返却後に
-    optimizer が担うため run_apo 側の前置合成は不要・論点 G）。"""
+    """新 shape（segments 非空）の slot は run_apo へ `vars_per_slot` を渡し、固定セグメントの
+    full 再合成は optimizer の `_recompose_new_shape_results` が segments SoT から担う。"""
     from oai_agentspec.runtime.lightning import prompt_slot
 
     store = _store_new_shape(tmp_path)
@@ -1817,10 +1798,8 @@ async def test_optimize_new_shape_slot_passes_empty_fixed_to_run_apo(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
-        captured["fixed"] = fixed
         captured["vars_per_slot"] = vars_per_slot
         return OptimizeResult(prompt=seeds[next(iter(seeds))], train_score=0.0, val_score=0.0)
 
@@ -1834,28 +1813,35 @@ async def test_optimize_new_shape_slot_passes_empty_fixed_to_run_apo(
         slot=slot,
         config=_apo_config(),
     )
-    assert captured["fixed"]["triage"] == ""
     assert captured["vars_per_slot"]["triage"] == {"org": "AgentSpec"}
 
 
-async def test_optimize_legacy_slot_passes_slot_fixed_to_run_apo(
+async def test_optimize_custom_build_slot_result_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """旧 shape（segments 空）の slot は従来どおり `Slot.fixed` を run_apo へ渡す
-    （既存挙動維持）。"""
+    """custom build 経路（`Slot.segments = ()`）は run_apo の返却をそのまま `OptimizeResult` に
+    詰める（`_recompose_new_shape_results` の segments 空スキップ契約の regression guard）。
+
+    `_recompose_new_shape_results` の `if not slot.segments: continue` が silent regression した
+    場合、custom build 利用者の OptimizeResult.prompt が build 出力を無視して recompose された
+    文字列に書き換わるため、本テストが検知する。
+    """
     from oai_agentspec.runtime.lightning import prompt_slot
 
-    store = _store_legacy(tmp_path)
+    store = _store_new_shape(tmp_path)
+
+    def _custom_build(candidate: str) -> AgentSpec:
+        return _spec(name="triage", instructions=candidate)
+
     slot = prompt_slot(
         store,
         AgentRegistry(),
-        tune="triage",
+        agent="triage",
         base="main",
-        parts=["style"],
         vars={"org": "AgentSpec"},
+        build=_custom_build,
     )
-
-    captured: dict[str, Any] = {}
+    assert slot.segments == ()
 
     async def _fake(
         *,
@@ -1864,15 +1850,15 @@ async def test_optimize_legacy_slot_passes_slot_fixed_to_run_apo(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
-        captured["fixed"] = fixed
-        return OptimizeResult(prompt=seeds[next(iter(seeds))], train_score=0.0, val_score=0.0)
+        return OptimizeResult(
+            prompt="RAW PROMPT", train_score=1.0, val_score=1.0, seed="RAW SEED", diff="RAW DIFF"
+        )
 
     _patch_run_apo(monkeypatch, _fake)
 
-    await optimize(
+    result = await optimize(
         _spec(name="triage"),
         train=[{"input": "x"}],
         val=_DEFAULT_VAL,
@@ -1880,8 +1866,10 @@ async def test_optimize_legacy_slot_passes_slot_fixed_to_run_apo(
         slot=slot,
         config=_apo_config(),
     )
-    assert captured["fixed"]["triage"] == slot.fixed
-    assert captured["fixed"]["triage"] == "BASE ${org}\n\nSTYLE part"
+    # segments 空 slot は再合成対象外・run_apo 返却がそのまま OptimizeResult に載る。
+    assert result.prompt == "RAW PROMPT"
+    assert result.seed == "RAW SEED"
+    assert result.diff == "RAW DIFF"
 
 
 async def test_optimize_vars_callable_slot_passes_empty_vars_per_slot(
@@ -1903,7 +1891,6 @@ async def test_optimize_vars_callable_slot_passes_empty_vars_per_slot(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         captured["vars_per_slot"] = vars_per_slot
@@ -1946,7 +1933,6 @@ async def test_optimize_new_shape_result_prompt_is_full_composed(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         return OptimizeResult(
@@ -1994,7 +1980,6 @@ async def test_optimize_new_shape_result_seed_is_full_composed(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         return OptimizeResult(
@@ -2042,7 +2027,6 @@ async def test_optimize_new_shape_result_diff_is_recomputed(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         return OptimizeResult(
@@ -2105,7 +2089,6 @@ async def test_optimize_new_shape_result_prompt_matches_rollout_build(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         return OptimizeResult(
@@ -2124,52 +2107,6 @@ async def test_optimize_new_shape_result_prompt_matches_rollout_build(
     )
     # optimizer 経路の prompt が rollout build と一致（SSoT drift 検出）。
     assert result.prompt == rollout_instructions
-
-
-async def test_optimize_legacy_slot_result_unchanged(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """旧 shape（segments 空）の slot は run_apo の結果をそのまま返す
-    （optimizer で再合成しない）。"""
-    from oai_agentspec.runtime.lightning import prompt_slot
-
-    store = _store_legacy(tmp_path)
-    slot = prompt_slot(
-        store,
-        AgentRegistry(),
-        tune="triage",
-        base="main",
-        parts=["style"],
-        vars={"org": "AgentSpec"},
-    )
-
-    async def _fake(
-        *,
-        seeds: dict[str, str],
-        train: Any,
-        val: Any,
-        rollout: Any,
-        config: Any,
-        fixed: Any = None,
-        vars_per_slot: Any = None,
-    ) -> OptimizeResult:
-        return OptimizeResult(
-            prompt="RAW PROMPT", train_score=1.0, val_score=1.0, seed="RAW SEED", diff="RAW DIFF"
-        )
-
-    _patch_run_apo(monkeypatch, _fake)
-
-    result = await optimize(
-        _spec(name="triage"),
-        train=[{"input": "x"}],
-        val=_DEFAULT_VAL,
-        reward=contains("e"),
-        slot=slot,
-        config=_apo_config(),
-    )
-    assert result.prompt == "RAW PROMPT"
-    assert result.seed == "RAW SEED"
-    assert result.diff == "RAW DIFF"
 
 
 # ----------------------------------------------------------------------
@@ -2377,11 +2314,11 @@ async def test_optimize_context_factory_not_recreated_within_resume_loop(
 # ----------------------------------------------------------------------
 
 
-async def test_optimize_new_shape_multi_tune_matches_legacy_call_count(
+async def test_optimize_new_shape_single_vs_multi_tune_matches_call_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """NFR-4: 複数セグメント指定（新 shape・tune=[複数]）は単一セグメント指定（旧 shape）と
-    同じ `run_apo` 呼び出し回数（= APO ループ数）で完了する。
+    """NFR-4: 複数セグメント指定（新 shape・tune=[複数]）は単一セグメント指定（新 shape・
+    agent= のみ）と同じ `run_apo` 呼び出し回数（= APO ループ数）で完了する。
 
     複数セグメントは連結後の 1 候補テキスト（境界マーカー入り 1 本の seed）として `run_apo` へ
     渡るため、セグメント数が増えても `run_apo` の呼び出し自体は常に 1 回（optimize 1 回につき
@@ -2399,7 +2336,6 @@ async def test_optimize_new_shape_multi_tune_matches_legacy_call_count(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,
         vars_per_slot: Any = None,
     ) -> OptimizeResult:
         nonlocal call_count
@@ -2417,12 +2353,12 @@ async def test_optimize_new_shape_multi_tune_matches_legacy_call_count(
 
     same_config = _apo_config()
 
-    # 単一セグメント指定（旧 shape・tune=str・segments=()）。ストアごとに別ディレクトリを使う
-    # （legacy / new shape はどちらも tmp_path 直下に同名の base/ を作るため衝突を避ける）。
+    # 単一セグメント指定（新 shape・agent= のみ・segments=[agent:triage] の 1 tune）。
+    # ストアごとに別ディレクトリを使う（同一 tmp_path で複数 store を作ると衝突するため）。
     single_root = tmp_path / "single"
     single_root.mkdir()
-    store_single = _store_legacy(single_root)
-    slot_single = prompt_slot(store_single, AgentRegistry(), tune="triage")
+    store_single = _store_new_shape(single_root)
+    slot_single = prompt_slot(store_single, AgentRegistry(), agent="triage")
     await optimize(
         _spec(name="triage"),
         train=[{"input": "x"}],

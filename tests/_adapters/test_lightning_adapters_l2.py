@@ -224,88 +224,48 @@ async def test_run_apo_single_seed_trainer_wired_with_apo_algorithm(
     assert result.seed == "hi ${var}"
 
 
-async def test_run_apo_seed_prompt_compose_with_fixed_and_diff(
+async def test_run_apo_substitutes_vars_in_tune(
     fake_apo_factory: list[_FakeAPO],  # noqa: ARG001
     fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
     fake_prompt_template: None,  # noqa: ARG001
     captured_rewards: list[float],  # noqa: ARG001
 ) -> None:
-    """`fixed=` 経路: seed/prompt は base+parts を含む合成済み full テキストで、diff には tune の
-    変更行のみ ± で出る（base/parts は同一行・unified diff フォーマット）。"""
+    """`vars_per_slot=` 経路: `OptimizeResult.seed` / `prompt` は tune 側の `${var}` を
+    `substitute_braced`（braced のみ・bare `$var` 不変）で再注入する（rollout 実体一致）。"""
     result = await run_apo(
         seeds={"bot": "hi ${var}"},
         train=[{"input": "t"}],
         val=[{"input": "v"}],
         rollout=_const_rollout(0.5),
         config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
-        fixed={"bot": "BASE TEXT\n\nSTYLE TEXT"},
+        vars_per_slot={"bot": {"var": "WORLD"}},
     )
-    # seed = fixed + tune（合成済み full）。
-    assert result.seed == "BASE TEXT\n\nSTYLE TEXT\n\nhi ${var}"
-    # prompt = fixed + 最適化済み tune（合成済み full）。
-    assert result.prompt == "BASE TEXT\n\nSTYLE TEXT\n\n(optimized) hi ${var}"
-    # diff: unified diff 形式・base/parts 行は不変（- / + 無し）、tune 行だけ ±。
-    assert isinstance(result.diff, str)
-    assert result.diff.startswith("--- before")
-    assert "+++ after" in result.diff
-    assert "-hi ${var}" in result.diff
-    assert "+(optimized) hi ${var}" in result.diff
-    # context として変更行近傍の不変行（STYLE TEXT 等）は ± なしで含まれる
-    # （unified_diff の既定 context=3 で変更行の前後 3 行）。
-    assert " STYLE TEXT" in result.diff
+    assert result.seed == "hi WORLD"
+    assert result.prompt == "(optimized) hi WORLD"
 
 
-async def test_run_apo_compose_substitutes_vars_in_fixed(
+async def test_run_apo_does_not_touch_bare_dollar_vars(
     fake_apo_factory: list[_FakeAPO],  # noqa: ARG001
     fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
     fake_prompt_template: None,  # noqa: ARG001
     captured_rewards: list[float],  # noqa: ARG001
 ) -> None:
-    """`vars_per_slot=` 経路: rollout 時 `_default_build`（fixed 側 vars 再注入）+ `_reinject_vars`
-    （tune 側 vars 再注入）の両方が走るため、`OptimizeResult.seed` / `prompt` も rollout 実体と一致
-    させるため fixed と tune の両方を substitute 済みの full テキストで返す（Codex 第4 round 指摘・
-    "OptimizeResult.prompt は rollout 実体と一致" 公開契約）。"""
+    """braced `${var}` のみ置換し、bare `$var` には触らない（tune 側 seed の literal `$5` / `$PATH`
+    は vars に同名キーがあっても置換されない）。"""
     result = await run_apo(
-        seeds={"bot": "hi ${var}"},
+        seeds={"bot": "hi ${var} price=$5 shell=$name"},
         train=[{"input": "t"}],
         val=[{"input": "v"}],
         rollout=_const_rollout(0.5),
         config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
-        fixed={"bot": "company=${company}"},
-        vars_per_slot={"bot": {"company": "AgentSpec", "var": "WORLD"}},
+        # `"5": "FIVE"` は intentionally dead key（PLACEHOLDER_RE は数字始まり identifier に match
+        # しない）。`bare $name` も触らないことが load-bearing なアサーション対象。
+        vars_per_slot={"bot": {"var": "WORLD", "name": "NG", "5": "FIVE"}},
     )
-    # fixed 側 (`${company}` -> AgentSpec) と tune 側 (`${var}` -> WORLD) の両方に
-    # vars が注入される。
-    assert result.seed == "company=AgentSpec\n\nhi WORLD"
-    assert result.prompt == "company=AgentSpec\n\n(optimized) hi WORLD"
-
-
-async def test_run_apo_compose_does_not_touch_bare_dollar_vars(
-    fake_apo_factory: list[_FakeAPO],  # noqa: ARG001
-    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
-    fake_prompt_template: None,  # noqa: ARG001
-    captured_rewards: list[float],  # noqa: ARG001
-) -> None:
-    """braced `${var}` のみ置換し、bare `$var` には触らない（Template.safe_substitute の
-    bare `$var` 副作用回避・Codex 第3 round 指摘）。fixed 内の literal `$5` / `$PATH` は
-    vars に同名キーがあっても置換されないこと。"""
-    result = await run_apo(
-        seeds={"bot": "hi ${var}"},
-        train=[{"input": "t"}],
-        val=[{"input": "v"}],
-        rollout=_const_rollout(0.5),
-        config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
-        # fixed: braced ${company} は置換、bare $5 と $company（中括弧なし）は維持。
-        fixed={"bot": "company=${company}, price=$5, shell=$company"},
-        # `"5": "FIVE"` は **意図的に未使用な dead key**（substitute_braced は `${5}` のような
-        # 数字始まり identifier を PLACEHOLDER_RE が match しないため触らないことを確認する目的の
-        # negative case）。`bare $5` も触られないことが load-bearing なアサーション対象。
-        vars_per_slot={"bot": {"company": "AgentSpec", "5": "FIVE"}},
-    )
-    # ${company} → AgentSpec（braced・置換）。$5 と $company（bare）は触らない。
-    assert "company=AgentSpec" in str(result.seed)
+    # ${var} → WORLD（braced・置換）。$5 と $name（bare）は触らない。
+    assert "hi WORLD" in str(result.seed)
     assert "price=$5" in str(result.seed)
-    assert "shell=$company" in str(result.seed)
+    assert "shell=$name" in str(result.seed)
 
 
 async def test_run_apo_diff_empty_when_no_change(

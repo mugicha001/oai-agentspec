@@ -1403,8 +1403,8 @@ rollout の結線と reward 算出への plain データ供給に徹する。
   `parts`（または qualified 参照列 `layout`）でプロンプト全体を組み立て、最適化対象を `tune` セレクタで選ぶ。構成順は
   compose と同一の base -> parts -> agent（`layout` 指定時はその並び）。`tune` の照合はセグメント名と qualified 参照
   （`base:` / `part:` / `agent:`）の 2 形式で行い、plain 名の名前空間衝突・構成不在・重複・空は fail-closed
-  （`OptimizeError(CONFIG_MISSING)`）。`agent` が spec 解決名（`Slot.name`）を担い、`agent=None` + `tune` 単一 str の
-  旧経路は従来どおり（tune が seed 解決名かつ `Slot.name`）。
+  （`OptimizeError(CONFIG_MISSING)`）。`agent` が spec 解決名（`Slot.name`）を担い、`agent=` または `layout=` の
+  いずれかが必須（両方未指定は `OptimizeError(CONFIG_MISSING)`・詳細は ADR 0007）。
 - 複数 tune セグメント: 選択セグメントの seed を構成順に連結して `Slot.seed` とし、2 個以上のとき境界に予約 braced
   placeholder（`${oas_boundary_N}`）を挟む。連結 1 テキストとして単一 APO ループで最適化する（block-coordinate-ascent
   の slot 間逐次方式は不変・NFR-4 のループ回数不増）。構成情報は `Slot.segments`（`SlotSegment` の構成順列・内部構造で
@@ -1431,9 +1431,11 @@ callable のとき既定 build が SDK 規約 `(context, agent) -> str` の動�
 - 結果: 既定で plain な `OptimizeResult` を返すのみ（lib 自動書込なし・`PromptStore` 非書込）。`result.save(path)`
   は利用者指定パスへの opt-in 書込で、APO は `${var}` 保持テキストを書く。`OptimizeResult.prompt` / `seed` / `diff` は
   rollout 実体と一致する full 合成（固定セグメントを構成順どおり含む・境界マーカーは分割消費で成果物に現れない）とし、
-  segments 非空 slot は run_apo へ `fixed=""` を渡して前置合成を素通しさせ、optimizer が返却後に seed / best を
-  `split_marked` -> `compose_segments` で full 再合成し diff を再計算する（旧 shape slot は run_apo の既存合成が
-  そのまま成果物）。いずれも単一スロットは str・複数スロットは `{名前: str}` mapping。利用者は `print(result.diff)` で
+  segments 非空 slot は run_apo へ `vars_per_slot` のみ渡して tune 側 `${var}` を再注入させ、optimizer が返却後に
+  seed / best を `Slot.segments` を SoT に `split_marked` -> `compose_segments` で full 再合成し diff を再計算する
+  （`_recompose_new_shape_results`）。custom build / 生 seed の segments 空 slot は run_apo の返却をそのまま
+  成果物にする。いずれも単一スロットは str・複数スロットは `{名前: str}` mapping。
+  利用者は `print(result.diff)` で
   before/after を可視化できる。
 - 履歴: `OptimizeResult.history` は各スロット 1 件の `HistoryEntry`（TypedDict）の列で、`slot` / `best_score` /
   `best_version` / `placeholder_fallback` の 4 キーを持つ。APO 最良候補が seed の `${var}` プレースホルダ（境界マーカー

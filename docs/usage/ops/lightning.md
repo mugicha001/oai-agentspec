@@ -30,7 +30,7 @@ from oai_agentspec.runtime.lightning import (
     OptimizeCase, contains, optimize, prompt_slot, train_val_split,
 )
 
-slot = prompt_slot(store, registry, tune="triage")
+slot = prompt_slot(store, registry, agent="triage")
 cases = [OptimizeCase(input="請求書ください", expected_output="請求")]
 train, val = train_val_split(cases, val_ratio=0.2)
 
@@ -90,10 +90,6 @@ slot = prompt_slot(
 ```
 
 `agent` を省略した場合、layout 内に `agent:X` 参照がちょうど 1 つあれば X が spec 解決名（`Slot.name`）になる（0 個または複数は `OptimizeError(CONFIG_MISSING)`）。`prompt_slots` は `layout` 非対応で、layout が必要なエージェントは `prompt_slot` を個別に呼んで slot mapping を組み立てる。
-
-### 旧経路の互換
-
-`agent` を指定せず `tune` に単一文字列を渡す従来呼び出し（`prompt_slot(store, registry, tune="triage")`）は完全互換で、seed 解決・候補合成・`OptimizeResult` は従来と同一に振る舞う。
 
 ### 境界マーカーについて
 
@@ -156,7 +152,7 @@ slot = prompt_slot(
 
 - `vars` は静的注入用の dict（既存契約不変）。`prompt_slot(vars=<dict>)` はここに入る。
 - `vars_fn` は `prompt_slot(vars=<callable>)` を渡したときの保持先。callable のとき `vars` は空 dict になり、既定 build が生成する動的 instructions が rollout ごとに `vars_fn(context)` を評価して注入する。
-- `segments` は新 shape（`agent=` 指定 / `layout=` 指定）で `prompt_slot` / `prompt_slots` が自動設定する構成順の構造情報（`SlotSegment` 要素の列）で、rollout 合成と `OptimizeResult` の full 合成が同一 SSoT ヘルパで参照する。旧 shape・custom build・手書き `Slot` では空のまま従来経路を通る。
+- `segments` は `prompt_slot` / `prompt_slots` が自動設定する構成順の構造情報（`SlotSegment` 要素の列）で、rollout 合成と `OptimizeResult` の full 合成が同一 SSoT ヘルパで参照する。custom build・手書き `Slot` では空のまま「run_apo 返却をそのまま尊重する」経路を通る。
 - `SlotSegment`（frozen: `ref`（`base:main` 等の qualified 参照）/ `text`（`${var}` 保持の本文）/ `tune`（最適化対象フラグ））は内部構造で、公開契約（`__all__`）には含めない（利用者が手書きする対象ではない）。
 
 ### `OptimizeResult`（frozen）
@@ -179,7 +175,7 @@ slot = prompt_slot(
 
 ### `prompt_slot(store, registry=None, agent=None, *, base=None, parts=(), layout=None, tune=None, vars=None, build=None)`
 
-- `agent: str | None` — 最適化対象エージェント名（compose と同名同位置・`Slot.name` = registry の spec 解決名）。`agent` 指定 = 新 shape。`agent=None` かつ `tune` が単一 str のときは旧経路互換（`tune` が seed 解決名かつ `Slot.name`）。
+- `agent: str | None` — 最適化対象エージェント名（compose と同名同位置・`Slot.name` = registry の spec 解決名）。`agent` または `layout` のいずれかが必須。両方未指定は `OptimizeError(CONFIG_MISSING)`（詳細は ADR 0007）。
 - `base: str | None` / `parts: Sequence[str]` — compose と同じ構成指定。新 shape では `tune` の選択対象セグメントになる。
 - `layout: Sequence[str] | None` — compose と同一意味論の qualified 参照列。指定時は並びがそのまま構成順になり `agent` / `base` / `parts` の構成指定は無視され、`tune` の照合先は layout 列になる。
 - `tune: str | Sequence[str] | None` — 最適化対象セグメントのセレクタ。要素はセグメント名（base 名 / part 名 / agent 名）または qualified 参照（`base:main` / `part:style` / `agent:triage`）で照合する。`Sequence` は構成順（base -> parts -> agent）に連結し 1 候補テキストとして単一 APO ループで最適化する（列挙順は順序に使わない）。`agent` 指定時に省略すると agent セグメントのみを最適化する。
@@ -196,7 +192,7 @@ slot = prompt_slot(
 fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 
 - `tune` の `Sequence` が空 / 重複要素を含む（plain と qualified の表記違いで同一セグメントを指す場合を含む）/ 構成に存在しない名前を含む / plain 名が複数のセグメント名前空間に一致して一意に定まらない（FR-1）
-- `agent=None` かつ `layout` も未指定で `tune` に `Sequence` を渡す / `agent=None` かつ `tune=None`（spec 解決名が定まらない・FR-1）
+- `agent=None` かつ `layout=None`（`agent=` または `layout=` のいずれかが必須・詳細は ADR 0007・FR-1）
 - `vars` に callable を渡し、かつ `build=` を明示する（callable の評価は既定 build のみが担う・FR-3）
 - `oas_boundary_` 予約接頭辞が seed 本文・固定セグメント本文・dict vars のキーに現れる（境界マーカー予約・専用メッセージ）
 - `layout` が空 / 重複参照を含む / `agent=None` かつ layout 内の `agent:` 参照が 0 個または複数 / `layout` 指定 + `tune=None` かつ layout 内に agent セグメント不在（FR-4）

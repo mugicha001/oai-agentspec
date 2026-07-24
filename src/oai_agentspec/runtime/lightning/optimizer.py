@@ -233,12 +233,10 @@ async def optimize(
 
     from ..._adapters import run_apo
 
-    # `Slot.fixed`（base + parts の合成済み固定部分）と `Slot.vars` を `run_apo` に渡し、
-    # `OptimizeResult` の seed / prompt / diff を **rollout 時に agent が見るのと同じ合成済み
-    # full テキスト**で返す（vars は `_default_build` と同じ規則で fixed 側に再注入される）。
-    # 生 seed + rebind 経路（slots is None）や `Slot.fixed` 空のときは run_apo 側で tune そのものを
-    # 返す（後方互換）。
-    fixed_map = {name: s.fixed for name, s in slots.items()} if slots else None
+    # `Slot.vars` を `run_apo` に渡し、`OptimizeResult.seed` / `prompt` の tune 側 `${var}` を
+    # rollout 実体と同じ規則で再注入する（新 shape 再合成 `_recompose_new_shape_results` は
+    # `Slot.segments` 側の SoT で固定セグメントを扱う）。生 seed + rebind 経路（slots is None）や
+    # custom build 経路（segments 空）は run_apo 返却をそのまま OptimizeResult にする。
     vars_map = _build_vars_map(slots)
 
     # FR-8: 最適化実行（Trainer / rollout / reward）の失敗を構造化エラーへ倒す。extra 不在は
@@ -251,7 +249,6 @@ async def optimize(
             val=val,
             rollout=rollout,
             config=effective_config,
-            fixed=fixed_map,
             vars_per_slot=vars_map,
         )
     except OptimizeError:

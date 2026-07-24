@@ -29,7 +29,6 @@ from ...registry import _copy_spec
 from ._placeholders import (
     BOUNDARY_PREFIX,
     compose_from_marked,
-    compose_with_vars,
     extract_placeholders,
 )
 from .types import FailureKind, OptimizeError, Slot, SlotSegment, _CandidateInvalid
@@ -45,11 +44,11 @@ if TYPE_CHECKING:
 def _ensure_fixed_vars_present(name: str, fixed: str, vars_dict: dict[str, Any]) -> None:
     """`fixed`（base + parts）に含まれる `${var}` がすべて `vars_dict` に存在することを検査する。
 
-    `_default_build` は rollout 時 `compose_with_vars(fixed, candidate, vars_dict)` で fixed の
-    vars を再注入する（内部で `substitute_braced` が braced `${name}` のみを置換し、未知の
-    placeholder は `${name}` のまま残す・fail-open）。利用者が `vars` の指定を漏らすと `${role}`
-    等が literal なまま `agent.instructions` に残り、APO スコアが silent に劣化する。slot 構築
-    段階で fail-closed に倒し、利用者に即時通知する。
+    `_new_default_build` は rollout 時に全非 tune セグメント（base / parts / 非 tune の agent 含む）
+    へ `${var}` を注入する（`substitute_braced` が braced `${name}` のみを置換し、未知の placeholder
+    は `${name}` のまま残す・fail-open）。利用者が `vars` の指定を漏らすと `${role}` 等が literal
+    なまま `agent.instructions` に残り、APO スコアが silent に劣化する。slot 構築段階で fail-closed
+    に倒し、利用者に即時通知する。
 
     Args:
         name: slot 名（エラーメッセージ用）。
@@ -75,78 +74,6 @@ def _ensure_fixed_vars_present(name: str, fixed: str, vars_dict: dict[str, Any])
     )
 
 
-def _compose_fixed(store: PromptStore, *, base: str | None, parts: Sequence[str]) -> str:
-    """固定部分（base / parts）を vars 未展開（`${var}` 保持）で合成する。
-
-    `PromptStore.compose(vars=None)` は各セグメントを `${var}` プレースホルダ保持のまま `\\n\\n`
-    連結した静的 str を返す（読み取りのみ・`PromptStore` 非改変）。base / parts いずれも未指定の
-    場合は空文字を返す。
-
-    Args:
-        store: プロンプトストア（読み取り専用）。
-        base: base:<name> セグメント（共通ベース名）。None で base なし。
-        parts: part:<name> セグメント名の列。
-
-    Returns:
-        固定部分の合成済みテキスト（`${var}` 保持・base/parts 非指定なら空文字）。
-    """
-    if base is None and not parts:
-        return ""
-    composed = store.compose(base=base, parts=tuple(parts), vars=None)
-    return composed if isinstance(composed, str) else ""
-
-
-def _default_build(
-    registry: AgentRegistry | None,
-    name: str,
-    fixed: str,
-    vars: dict[str, Any] | None = None,  # noqa: A002 - PromptStore.compose の引数名に追従
-) -> Callable[[str], AgentSpec]:
-    """既定 build（registry 登録 spec を複製し instructions のみ候補で差し替え）を作る。
-
-    候補テキストは固定部分（`fixed`）と `\\n\\n` 連結して instructions にする（固定部分が空なら
-    候補テキストのみ）。registry から対象 spec を解決して `_copy_spec` で独立コピーし、
-    `instructions` だけ差し替えた新 `AgentSpec` を返す（tools / handoffs / model 等は複製で保持・
-    利用者 registry の登録 spec は不変）。registry 未供給 / 対象 spec 未登録は fail-closed エラー。
-
-    base/parts に `${var}` プレースホルダが含まれる場合、`vars` を再注入する（`_reinject_vars`
-    は候補テキストにのみ適用されるため、固定部分にも同じ vars 再注入を行わないと rollout 時に
-    literal な `${var}` が instructions に残ってしまう）。合成は `_placeholders.compose_with_vars`
-    に委譲（`_compose_full` と Single Source of Truth・braced のみ置換で bare `$var` 副作用なし）。
-    `vars` 未指定または空なら `fixed` はそのまま使う（既存挙動と互換）。
-
-    Args:
-        registry: 既定 build の spec 解決元。None なら fail-closed（呼び出し時に build できない）。
-        name: 対象エージェント名（registry から解決する spec 名）。
-        fixed: 固定部分の合成済みテキスト（`${var}` 保持・空文字可）。
-        vars: `${var}` 置換値（None / 空 dict なら fixed を素通し）。
-
-    Returns:
-        候補テキスト → `AgentSpec` の build 関数。
-
-    Raises:
-        ValueError: registry 未供給で既定 build が spec を解決できない場合（fail-closed）。
-    """
-    if registry is None:
-        raise ValueError(
-            f"prompt_slot の既定 build には registry が必須です（slot {name!r}）。"
-            "optimize / prompt_slots に registry を渡すか build= を明示してください"
-        )
-
-    vars_dict = dict(vars or {})
-
-    def build(candidate: str) -> AgentSpec:
-        spec = _resolve_spec(registry, name)
-        # 合成規則は `_compose_full` と共通（compose_with_vars は fixed 側にのみ braced `${var}`
-        # を再注入し、tune 側は APO 候補本体で温存・bare `$var` には触らない）。
-        instructions = compose_with_vars(fixed, candidate, vars_dict)
-        import dataclasses
-
-        return dataclasses.replace(_copy_spec(spec), instructions=instructions)
-
-    return build
-
-
 def _new_default_build(
     registry: AgentRegistry | None,
     name: str,
@@ -165,7 +92,6 @@ def _new_default_build(
     倒す（`_apply_candidate` が catch し reward 0.0 の per-candidate 無効化経路へ）。registry から
     対象 spec を解決して `_copy_spec` で独立コピーし、`instructions` だけ差し替えた新 `AgentSpec`
     を返す（tools / handoffs / model 等は複製で保持）。
-    旧 shape 用の `_default_build`（前置合成）はそのまま残し、本関数は新 shape 経路のみで使う。
 
     Args:
         registry: 既定 build の spec 解決元。None なら fail-closed（呼び出し時に build できない）。
@@ -328,30 +254,24 @@ def prompt_slot(
     | None = None,
     build: Callable[[str], AgentSpec] | None = None,
 ) -> Slot:
-    """合成プロンプト最適化の定型を畳む `Slot` を生成する（FR-9・compose 一致の新 shape 対応）。
+    """合成プロンプト最適化の定型を畳む `Slot` を生成する（FR-9・compose 一致の新 shape）。
 
     `PromptStore.compose` と同じ使い方で構成を組み立て、最適化対象セグメントを `tune` セレクタで
-    選ぶ（`agent=` 指定 or `layout=` 指定で新 shape に入る）。`agent=None` かつ `layout=None` かつ
-    `tune` が単一 str のときは旧経路と完全互換に縮退する（既存呼び出し・既存テストは無修正で通過）。
+    選ぶ。`agent=` または `layout=` のいずれかが必須（詳細は ADR 0007）。
 
-    ディスパッチ規則（論点 E）:
-        - `agent=None` + `layout=None` + `tune` が str: 旧経路（`_resolve_seed` / `_default_build` /
-          `_compose_fixed` の従来合成・`Slot.segments = ()`）。
-        - `agent=None` + `layout=None` + `tune` が None または Sequence: spec 解決名が定まらないため
-          `OptimizeError(CONFIG_MISSING)`（fail-closed）。
-        - `agent` 指定 or `layout` 指定: 新 shape（構成順のセグメント列を確定し `tune` セレクタで
-          最適化対象を選ぶ・`Slot.segments` を設定する）。
+    ディスパッチ規則:
+        - `agent=None` + `layout=None`: `OptimizeError(CONFIG_MISSING)`（fail-closed）。
+        - `agent` 指定 or `layout` 指定: 構成順のセグメント列を確定し `tune` セレクタで最適化対象を
+          選ぶ（`Slot.segments` を設定する）。
 
     Args:
         store: プロンプトストア（読み取り専用・`get` / `compose` のみ参照）。
         registry: 既定 build の spec 解決元（build= 省略時に使用）。build= 明示時は不要。
-        agent: 新 shape の agent:<name> セグメント（spec 解決名を兼ねる・compose と同名同位置）。
-        base: 固定部分（旧経路）/ 構成セグメント（新 shape）の base:<name> セグメント。
-        parts: 固定部分（旧経路）/ 構成セグメント（新 shape）の part:<name> セグメント名の列。
-        layout: セグメント参照の明示列（compose と同一意味論・指定時は agent/base/parts の構成指定を
-            無視する・論点 A2）。
-        tune: 旧経路では単一セグメント名（seed 解決名）。新 shape では最適化対象セレクタ（plain 名
-            または qualified 参照・None は agent セグメントのみ最適化）。
+        agent: agent:<name> セグメント（spec 解決名を兼ねる・compose と同名同位置）。
+        base: 構成セグメントの base:<name>。
+        parts: 構成セグメントの part:<name> の列。
+        layout: セグメント参照の明示列（compose と同一意味論・指定時は agent/base/parts を無視）。
+        tune: 最適化対象セレクタ（plain 名または qualified 参照・None は agent セグメントのみ）。
         vars: `${var}` 置換値（最適化対象外・rollout 再注入）。dict / None のほか
             `Callable[[context], dict]` を渡すと動的 vars 生成となり、既定 build が rollout 時に
             `(context, agent) -> str` の動的 instructions を組み立てる（`vars_fn` に保持・
@@ -359,24 +279,20 @@ def prompt_slot(
         build: 候補テキスト → `AgentSpec` の build 関数（明示時は registry 不要）。
 
     Returns:
-        seed / build / vars（新 shape では加えて segments）を保持した `Slot`。
+        seed / build / vars / segments を保持した `Slot`。
 
     Raises:
-        OptimizeError: 新 shape のディスパッチ・fail-closed 検証に違反した場合
+        OptimizeError: `agent=` / `layout=` のいずれも未指定、または fail-closed 検証違反
             （`FailureKind.CONFIG_MISSING`）。
         KeyError: セグメントが store で解決できない場合（`PromptResolutionError` の伝搬を含む）。
         ValueError: build 省略かつ registry 未供給の場合（既定 build が spec を解決できない）。
     """
     if agent is None and layout is None:
-        if isinstance(tune, str):
-            return _legacy_prompt_slot(
-                store, registry, tune=tune, base=base, parts=parts, vars=vars, build=build
-            )
         raise OptimizeError(
             FailureKind.CONFIG_MISSING,
-            "prompt_slot は agent= か layout= か tune=<単一 str> のいずれかが必要です"
-            "（agent=None + layout=None のとき tune=None / Sequence は spec 解決名が"
-            "定まらないため fail-closed）",
+            "prompt_slot は agent= または layout= のいずれかが必須です（詳細は ADR 0007）。"
+            "旧: prompt_slot(store, reg, tune='bot')  "
+            "新: prompt_slot(store, reg, agent='bot')",
         )
     return _new_shape_slot(
         store,
@@ -388,62 +304,6 @@ def prompt_slot(
         tune=tune,
         vars=vars,
         build=build,
-    )
-
-
-def _legacy_prompt_slot(
-    store: PromptStore,
-    registry: AgentRegistry | None,
-    *,
-    tune: str,
-    base: str | None,
-    parts: Sequence[str],
-    vars: dict[str, Any] | None,  # noqa: A002 - PromptStore.compose の引数名に追従
-    build: Callable[[str], AgentSpec] | None,
-) -> Slot:
-    """旧経路の `prompt_slot`（`agent=None` + `tune=str` の縮退形・完全互換）。
-
-    `store` から `tune` の seed（`${var}` 保持）と固定部分（base / parts）を読み取り、既定 build
-    （registry 登録 spec 複製で instructions 差し替え）を内包した `Slot` を返す（`segments` は空）。
-
-    Args:
-        store: プロンプトストア（読み取り専用）。
-        registry: 既定 build の spec 解決元（build= 省略時に使用）。
-        tune: チューニング対象セグメント名（seed 解決名 = `Slot.name`）。
-        base: 固定部分の base:<name> セグメント。
-        parts: 固定部分の part:<name> セグメント名の列。
-        vars: `${var}` 置換値（最適化対象外・rollout 再注入）。
-        build: 候補テキスト → `AgentSpec` の build 関数（明示時は registry 不要）。
-
-    Returns:
-        seed / build / vars を保持した `Slot`（`segments` は空タプル）。
-
-    Raises:
-        KeyError: `tune` セグメントが store で解決できない場合。
-        ValueError: build 省略かつ registry 未供給の場合。
-    """
-    seed = _resolve_seed(store, tune)
-    fixed = _compose_fixed(store, base=base, parts=parts)
-    effective_build = build
-    # 既定 build のときだけ `Slot.fixed` を埋める（その build が `fixed + candidate` を agent の
-    # instructions として組み立てるため、合成済み full テキストの concept が成立する）。利用者が
-    # custom `build` を渡した場合は build がどう組み立てるかライブラリ側で保証できないので
-    # `fixed` は空のままにし、`OptimizeResult.seed` / `prompt` も tune そのものを返す
-    # （誤った合成済みテキストを見せない）。
-    slot_fixed = ""
-    if effective_build is None:
-        # base/parts に含まれる `${var}` プレースホルダがすべて vars に存在することを slot 構築時
-        # に検証する（不足を許すと rollout 時に literal `${role}` が agent.instructions に残り
-        # APO スコアが silent に劣化する）。fail-closed で構築段階で利用者へ通知する。
-        _ensure_fixed_vars_present(tune, fixed, dict(vars or {}))
-        effective_build = _default_build(registry, tune, fixed, vars=vars)
-        slot_fixed = fixed
-    return Slot(
-        name=tune,
-        seed=seed,
-        build=effective_build,
-        vars=dict(vars or {}),
-        fixed=slot_fixed,
     )
 
 
@@ -737,32 +597,42 @@ def _new_shape_slot(
     segments = tuple(
         SlotSegment(ref=ref, text=texts[ref], tune=(ref in tuned_refs)) for ref in refs
     )
+
+    # custom build + multi-tune の組み合わせは fail-closed で拒否する。境界マーカー入り seed の
+    # 再分解は既定 build (`_new_default_build`) の compose_from_marked が担う契約で、custom build
+    # はマーカーを解釈しないため OptimizeResult.seed / prompt / diff に literal で漏出する
+    # （"予約接頭辞は成果物に一切現れない" 契約の違反）。
+    n_tune = sum(1 for s in segments if s.tune)
+    if build is not None and n_tune > 1:
+        raise OptimizeError(
+            FailureKind.CONFIG_MISSING,
+            f"prompt_slot: custom build と multi-tune（tune=[...] で 2 個以上）は併用不可"
+            f"（slot {name!r}・境界マーカー再合成は既定 build が担うため）",
+        )
+
     # seed は tune セグメント本文の構成順連結（n_tune >= 2 なら境界マーカーを挟む）。build は
-    # 候補を `split_marked` -> `compose_segments` で構成順に再インターリーブする。新 shape では
-    # 構造情報を `segments` が保持するため `Slot.fixed` は常に空に統一する。
+    # 候補を `split_marked` -> `compose_segments` で構成順に再インターリーブする。
     seed = _build_marked_seed(segments)
-    # 固定セグメント（tune=False）の本文は `_ensure_fixed_vars_present` の検査対象として組み立てる
-    # （`\n\n` 連結・`Slot.fixed` には積まない）。
+    # 固定セグメント（tune=False）の本文は `_ensure_fixed_vars_present` の検査対象として組み立てる。
     fixed_text = "\n\n".join(texts[ref] for ref in refs if ref not in tuned_refs)
 
     effective_build = build
     if effective_build is None:
-        # fixed セグメント（tune=False）に含まれる `${var}` がすべて vars に存在することを検証する
-        # （旧経路 `_legacy_prompt_slot` と対称・不足を許すと既定 build 経由で rollout 時に literal
-        # な `${org}` が agent.instructions に残り APO スコアが silent 劣化する）。custom build
-        # 経路はライブラリ側で組み立てを保証できないため検査しない（旧経路と同じ扱い）。
+        # 全非 tune セグメント（base / parts / 非 tune の agent 含む）の `${var}` がすべて vars に
+        # 存在することを検証する（不足を許すと既定 build 経由で rollout 時に literal な `${org}` が
+        # agent.instructions に残り APO スコアが silent 劣化する）。custom build 経路は組み立てを
+        # ライブラリ側で保証できないため検査しない。
         # vars=callable のときは検査を免除する（compose(vars=callable) と同じ fail-open 意味論・
         # callable が返す辞書キーは実行時まで不明のため構築段階では検査できない）。
         if not vars_is_callable:
             _ensure_fixed_vars_present(name, fixed_text, vars_dict)
         effective_build = _new_default_build(registry, name, segments, vars_dict, vars_fn=vars_fn)
-    # custom build 経路では `Slot.segments` を空に保つ（Codex P2 修正）。segments が非空だと
-    # `optimizer._recompose_new_shape_results` が「既定 build による segments 合成が使われた」
-    # 前提で `OptimizeResult.prompt/seed/diff` を full 再合成で上書きしてしまい、custom build が
-    # 実際に組み立てた rollout instructions と乖離する（"OptimizeResult.prompt == rollout
-    # instructions" 契約の drift）。custom build は候補テキストをどう扱うか自由なため、segments
-    # ベースの再合成対象から外し、旧 shape / 生 seed 経路と同じ「run_apo 返却をそのまま尊重する」
-    # 挙動に統一する
+    # custom build 経路では `Slot.segments` を空に保つ。segments が非空だと
+    # `optimizer._recompose_new_shape_results` が既定 build による segments 合成前提で
+    # `OptimizeResult.prompt/seed/diff` を full 再合成で上書きしてしまい、custom build が実際に
+    # 組み立てた rollout instructions と乖離する（"OptimizeResult.prompt == rollout instructions"
+    # 契約の drift）。custom build は候補テキストをどう扱うか自由なため、segments ベースの再合成
+    # 対象から外し、生 seed 経路と同じ「run_apo 返却をそのまま尊重する」挙動に統一する
     # （`_new_default_build` を使うときのみ segments を保持し contract を成立させる）。
     slot_segments = segments if build is None else ()
     return Slot(
@@ -770,7 +640,6 @@ def _new_shape_slot(
         seed=seed,
         build=effective_build,
         vars=vars_dict,
-        fixed="",
         segments=slot_segments,
         vars_fn=vars_fn,
     )
