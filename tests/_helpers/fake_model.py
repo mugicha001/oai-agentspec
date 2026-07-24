@@ -14,7 +14,7 @@ from typing import Any
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
-from .responses import text_response, tool_call_response
+from .responses import text_response, text_response_with_usage, tool_call_response
 
 
 @dataclass
@@ -40,6 +40,25 @@ class FakeModel(Model):
     def queue_text(self, text: str) -> FakeModel:
         """テキスト応答をキューに積む（自身を返す）。"""
         self.responses.append(text_response(text))
+        return self
+
+    def queue_text_with_usage(
+        self, text: str, *, total_tokens: int, requests: int = 1
+    ) -> FakeModel:
+        """usage（トークン数）付きテキスト応答をキューに積む（自身を返す）。
+
+        run 予算超過（`RunBudgetExceeded`）を Runner 経由で実測するために使う。SDK run loop
+        は `on_llm_end` 直前に `context.usage.add(response.usage)` を行うため、usage を載せた
+        応答が累積判定の入力になる。
+
+        Args:
+            text: アシスタントテキスト。
+            total_tokens: この応答の累積対象トークン数。
+            requests: この応答の requests 数（既定 1）。
+        """
+        self.responses.append(
+            text_response_with_usage(text, total_tokens=total_tokens, requests=requests)
+        )
         return self
 
     def queue_tool_call(self, name: str, arguments: str) -> FakeModel:

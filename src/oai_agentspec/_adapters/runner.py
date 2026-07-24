@@ -11,10 +11,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from agents import (
-    RunContextWrapper,
-    Runner,
-)
+from agents import Runner
+
+from .run_context import unwrap_run_context
 
 if TYPE_CHECKING:
     from ..runtime.llmops.types import ObservedRun
@@ -180,7 +179,7 @@ class DefaultRunnerAdapter:
             SDK RunResult（`final_output` を持つ）。
         """
         resolved = self._registry.get(agent) if self._registry is not None else agent
-        raw_context = context.context if isinstance(context, RunContextWrapper) else context
+        raw_context = unwrap_run_context(context)
         return await Runner.run(resolved, input, context=raw_context, **runner_kwargs)
 
     async def run_outcome(
