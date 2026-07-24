@@ -1,0 +1,126 @@
+"""L1: `runtime.resilience.__init__` の公開窓口契約（直 import + PEP 562 遅延）。
+
+intent 窓口（`tests/runtime/intent/test_init_pep562_l1.py`）を直接の踏襲元とする。
+resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存
+ゼロのため module import 時点で直 import 済みであり、`build_*` ヘルパと SDK 生型 10 種
+のみ `__getattr__` で `_adapters.resilience` 経由の遅延取得になる。lib 独自例外
+`RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`（本窓口からは撤去済み）。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytestmark = pytest.mark.unit
+
+
+# lib 独自 4 種。うち直 import は宣言型 2、遅延は build_* 2。
+_DIRECT_SYMBOLS = {
+    "ModelRetryPolicy",
+    "RunBudgetPolicy",
+}
+_LAZY_BUILD_SYMBOLS = {
+    "build_model_retry",
+    "build_run_budget_hooks",
+}
+# SDK 生型 10 種（すべて `_adapters.resilience` 経由の遅延取得）。
+_LAZY_SDK_SYMBOLS = {
+    "ModelRetrySettings",
+    "ModelRetryBackoffSettings",
+    "retry_policies",
+    "RetryDecision",
+    "RetryPolicyContext",
+    "ModelRetryNormalizedError",
+    "RunErrorHandlers",
+    "RunErrorHandlerResult",
+    "RunErrorHandlerInput",
+    "RunErrorData",
+}
+_LAZY_SYMBOLS = _LAZY_BUILD_SYMBOLS | _LAZY_SDK_SYMBOLS
+_EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
+
+
+def test_all_membership_pinned() -> None:
+    """`__all__` は 14 件で設計仕様通りのメンバ集合と一致する。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    assert set(mod.__all__) == _EXPECTED_ALL
+    assert len(mod.__all__) == 14
+
+
+def test_declaration_symbols_are_directly_imported() -> None:
+    """宣言型は外部依存ゼロのため module import 時点で `__dict__` に載る（直 import）。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    for name in _DIRECT_SYMBOLS:
+        assert name in mod.__dict__, f"'{name}' は直 import されているべき"
+
+
+def test_lazy_build_symbol_resolves_and_caches() -> None:
+    """`build_model_retry` は遅延取得され、再取得で同一オブジェクトを返す（キャッシュ）。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    mod.__dict__.pop("build_model_retry", None)
+    assert "build_model_retry" not in mod.__dict__
+    first = mod.build_model_retry
+    assert first is not None
+    assert "build_model_retry" in mod.__dict__
+    second = mod.build_model_retry
+    assert first is second
+
+
+def test_lazy_build_symbol_matches_adapter_source() -> None:
+    """遅延取得の `build_run_budget_hooks` は `_adapters.resilience` の実体と同一。"""
+    from oai_agentspec._adapters import resilience as adapter
+    from oai_agentspec.runtime import resilience as mod
+
+    mod.__dict__.pop("build_run_budget_hooks", None)
+    resolved = mod.build_run_budget_hooks
+    assert resolved is adapter.build_run_budget_hooks
+
+
+def test_lazy_sdk_raw_types_resolve_and_cache() -> None:
+    """SDK 生型 10 種はいずれも遅延取得でき、再取得で同一オブジェクトを返す。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    for name in _LAZY_SDK_SYMBOLS:
+        mod.__dict__.pop(name, None)
+        first = getattr(mod, name)
+        assert first is not None, f"'{name}' が遅延取得できない"
+        assert name in mod.__dict__
+        second = getattr(mod, name)
+        assert first is second, f"'{name}' がキャッシュされていない"
+
+
+def test_all_symbols_are_resolvable_via_getattr() -> None:
+    """`__all__` の全 14 シンボルが `getattr` で解決可能（漏れがない）。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    for name in mod.__all__:
+        mod.__dict__.pop(name, None)
+        value = getattr(mod, name)
+        assert value is not None, f"'{name}' が解決できない"
+
+
+def test_getattr_unknown_attribute_raises() -> None:
+    """未定義属性は AttributeError を送出する。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    with pytest.raises(AttributeError):
+        mod.__getattr__("nonexistent")
+
+
+def test_dir_includes_all_symbols_even_before_access() -> None:
+    """`dir()` は未 import 状態でも `__all__` の全 14 シンボルを含む。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    listing = set(mod.__dir__())
+    assert _EXPECTED_ALL.issubset(listing)
+
+
+def test_run_budget_exceeded_is_removed_from_window() -> None:
+    """`RunBudgetExceeded` は窓口から撤去済み。正規経路は `oai_agentspec.exceptions`。"""
+    from oai_agentspec.runtime import resilience as mod
+
+    with pytest.raises(AttributeError):
+        mod.__getattr__("RunBudgetExceeded")

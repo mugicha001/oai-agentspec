@@ -60,6 +60,19 @@ def test_callable_instructions_arity() -> None:
     reg.register(AgentSpec(name="b", instructions=lambda ctx, agent: "x"))
 
 
+def test_callable_instructions_accepts_two_arg_callable_variants() -> None:
+    """2 引数で呼び出せる callable（デフォルト引数付き / 可変長）は register を通過する。"""
+    reg, _ = make_registry()
+    reg.register(AgentSpec(name="a", instructions=lambda ctx, agent, cfg=None: "x"))
+    reg.register(AgentSpec(name="b", instructions=lambda *args: "x"))
+
+
+def test_callable_instructions_skips_unintrospectable_callable() -> None:
+    """シグネチャ取得不能な callable（builtin 等）は検証をスキップし register を通過する。"""
+    reg, _ = make_registry()
+    reg.register(AgentSpec(name="a", instructions=zip))
+
+
 def test_registration_order_independent() -> None:
     reg, _ = make_registry()
     reg.register(AgentSpec(name="parent", instructions="p", handoffs=["child"]))

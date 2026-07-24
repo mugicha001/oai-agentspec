@@ -89,6 +89,7 @@ from .models import (
     WorkflowModel,
     workflow_as_tool,
 )
+from .resilience import build_model_retry, build_run_budget_hooks
 from .responses import (
     _completed_event as _completed_event,
 )
@@ -125,6 +126,7 @@ from .session import (
     close_session,
     make_session,
 )
+from .tools import build_function_tool
 from .tracing import (  # noqa: F401 - workflow 層への内部窓口（公開 __all__ には積まない）
     WorkflowTracer,
     make_workflow_tracer,
@@ -146,6 +148,9 @@ __all__ = [
     "ToolContext",
     "Usage",
     "build_agent",
+    "build_function_tool",
+    "build_model_retry",
+    "build_run_budget_hooks",
     "mock_spec_tools",
     "DefaultAgentBuilder",
     "DefaultRunnerAdapter",
