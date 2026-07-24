@@ -5,6 +5,10 @@
 [![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#プロジェクトステータス)
 [![Ruff](https://img.shields.io/badge/lint-ruff-261230.svg)](https://docs.astral.sh/ruff/)
 
+> **Disclaimer**: `oai-agentspec` is an **unofficial, community-maintained** library built on top of [openai-agents](https://github.com/openai/openai-agents-python). **Not affiliated with, endorsed by, or sponsored by OpenAI.** OpenAI, the OpenAI logo, GPT, and ChatGPT are trademarks of OpenAI, Inc.
+>
+> 本ライブラリは [openai-agents](https://github.com/openai/openai-agents-python) を基盤としたコミュニティの非公式ライブラリで、**OpenAI 社による公式・推奨・スポンサー関係はありません**。OpenAI / GPT / ChatGPT 等は OpenAI, Inc. の商標です。
+
 **OpenAI Agents SDK を、より宣言的に・ミスを防ぎながら扱うための薄いラッパーライブラリ。**
 
 `oai-agentspec` は [openai-agents](https://github.com/openai/openai-agents-python) の `Agent` を置き換えません。
@@ -19,7 +23,7 @@
 - [特徴](#特徴)
 - [インストール](#インストール)
 - [クイックスタート](#クイックスタート)
-- [コアコンセプト](#コアコンセプト)（AgentSpec / Registry / プロンプト合成 / ハンドオフ / ワークフロー / 会話 Helper / HITL / compaction）
+- [コアコンセプト](#コアコンセプト)（AgentSpec / Registry / プロンプト合成 / ハンドオフ / Realtime / ワークフロー / 会話 Helper / HITL / compaction）
 - [プロンプトレイアウト](#プロンプトレイアウト)
 - [サンプル](#サンプル)
 - [開発](#開発)
@@ -32,25 +36,38 @@
 |---|---|
 | **Agent 宣言・編集** | `AgentSpec`（`Agent` の薄いラッパー）/ `AgentRegistry` で生成・`update`・`unregister`・差し替え / プロンプト合成（`base + parts + agent`・利用側 root）/ `RunContextWrapper` 経由の動的 instructions / サブエージェント（`sub_agents` で agent as tool） |
 | **ハンドオフ** | 名前ベース宣言 + `validate()` で実行前タイポ検出 / 型付き設定（`on_handoff` / `input_type` / `input_filter` / `is_enabled`）/ 動的転送（`dynamic_edge`）/ 循環解決（`A⇄B`）/ `mermaid()` 可視化 |
+| **Realtime（音声）** | `RealtimeAgentSpec` / 専用 `RealtimeAgentRegistry` による専用宣言ルート / 非対応フィールドの型レベル排除 / 名前ベース handoff の遅延構築・循環解決 / グラフ DSL（`RealtimeHandoffGraph`・`mermaid()` 可視化）/ `oai_agentspec.realtime` 窓口 |
 | **ワークフロー（実験的）** | `WorkflowGraph` でノード（AGENT/FUNCTION）+ エッジ（通常 / 条件 / fan-in）を宣言、順次 / 並列 / 条件分岐 / 合流 / ループを表現 / build-time `validate()` / SDK tracing 自動配線（`workflow.*` span + AGENT 内側 `Runner.run` の親子接続・`set_tracing_disabled(True)` 時オーバーヘッド 0） |
 | **会話 Helper** | `ConversationService`（in-process または `[serve]` + `[cli]` のクライアント・サーバ型）/ SDK `Session` で永続化・途中再開 / HITL 承認（`function_tool(needs_approval=True)` を call_id 単位で approve / reject）/ compaction（`CompactionConfig.enabled=True` で履歴圧縮を明示有効化） |
 | **LLMOps（extras）** | `[llmops]` で観点別採点 + 統合 verdict（DeepEval ベース・任意で `[llmops-langfuse]` で Langfuse 観測）/ `[lightning]` で `AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning へ委譲して自動改善（textual gradient + beam search） |
+| **意図予測（extras）** | `[intent]` で発話 / 会話履歴からの意図分類基盤（`runtime/intent`）/ 信頼度 5 段階の候補列（`IntentPrediction`）/ `IntentPolicy` で意図集合・返却制約を宣言 / Protocol DI で全体・内部段を差し替え / `intent_classifier_from_model` / `intent_classifier_from_generator`（自作 generator 用）の 1 行ヘルパ |
+| **Tool Registry** | `ToolRegistry` + `ToolSpec` で Tool メタデータ（`enabled` / `needs_approval` / `timeout` / `failure_error_function` / `name_override` / `description_override` / `strict_mode` / `extra`）を宣言的に一元管理 / 属性アクセス（`registry.<name>`）で `agents.function_tool()` を遅延構築・キャッシュ / `enabled` は closure で動的トグル（再構築なし） |
+| **Resilience（extras）** | `[resilience]` で Model 呼び出し retry と run 全体の予算超過制御を宣言 / `ModelRetryPolicy` はセマンティックフラグ既定 True で SDK `ModelRetrySettings` の silent no-op を排除 / `RunBudgetPolicy` は `on_llm_end` ターン境界で累積時間 / トークン判定し `RunBudgetExceeded` を送出（SDK `error_handlers` を素通しで伝播）/ SDK 生型 10 種を窓口経由で再エクスポート |
 
 詳細・サンプルは [コアコンセプト](#コアコンセプト) / [サンプル](#サンプル) を参照。
 
+> 全機能の使い方ガイド（判断軸 + 最小コード + examples 誘導・トピック別）: [docs/usage/](docs/usage/index.md)
+
 ## インストール
 
+現在 Alpha 段階のため PyPI には未公開です。GitHub から直接インストールしてください。
+
 ```bash
-uv add oai-agentspec
-# ローカルサーバ / CLI クライアントも使う場合は extra を指定
-uv add "oai-agentspec[serve,cli]"
-# LLMOps 評価（DeepEval 採点・任意で Langfuse 観測）
-uv add "oai-agentspec[llmops]"
-uv add "oai-agentspec[llmops,llmops-langfuse]"
-# Agent Lightning APO（プロンプト自動改善）
-uv add "oai-agentspec[lightning]"
-# または開発リポジトリで:
-uv sync
+# 本体
+uv add "oai-agentspec @ git+https://github.com/mugicha001/oai-agentspec.git"
+
+# extras 付き
+uv add "oai-agentspec[serve,cli] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[llmops] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[llmops,llmops-langfuse] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[lightning] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[intent] @ git+https://github.com/mugicha001/oai-agentspec.git"
+uv add "oai-agentspec[resilience] @ git+https://github.com/mugicha001/oai-agentspec.git"
+
+# ローカルクローンで開発する場合
+git clone https://github.com/mugicha001/oai-agentspec.git
+cd oai-agentspec
+uv sync --all-extras
 ```
 
 要件: Python 3.12+ / `openai-agents>=0.17.4`
@@ -59,7 +76,8 @@ extra は実行寄り層でのみ必要。コアの宣言 API（`AgentSpec` / `A
 `WorkflowGraph` / `ConversationService` の in-process 利用）は extra なしで動く。`serve` = FastAPI
 サーバ入口、`cli` = 接続 CLI（`oai-agentspec chat`）、`llmops` = 評価採点コア（DeepEval）、
 `llmops-langfuse` = Langfuse 観測（`llmops` 前提・任意）、`lightning` = Agent Lightning APO
-（プロンプト最適化）。
+（プロンプト最適化）、`intent` = 意図予測（pydantic のみ）、`resilience` = 宣言的 Model retry と
+run 予算（追加外部依存なし）。Tool Registry（`ToolRegistry` / `ToolSpec`）はコアのため extra 不要。
 
 ## クイックスタート
 
@@ -242,6 +260,49 @@ graph.dynamic_edge(
 )
 ```
 
+### Realtime エージェント（専用宣言ルート）
+
+音声（Realtime）エージェントは `agents.realtime.RealtimeAgent` を対象とする専用宣言ルートで扱う。
+`RealtimeAgentSpec` は RealtimeAgent が対応するフィールドのみを持ち、非対応フィールド（`model` /
+`model_settings` / `input_guardrails` 等の実行時 Config）を型レベルで排除する。専用の
+`RealtimeAgentRegistry` が名前ベース handoff を遅延構築（循環も解決）する。シンボルはコア
+`__all__` に載せず `oai_agentspec.realtime` 窓口から取得する。
+
+```python
+from agents.realtime import RealtimeRunner
+from oai_agentspec.realtime import RealtimeAgentRegistry, RealtimeAgentSpec
+
+registry = RealtimeAgentRegistry()
+registry.register(RealtimeAgentSpec(
+    name="triage",
+    instructions="受付担当。技術的な問い合わせはサポート担当へ引き継ぐ。",
+    handoff_description="最初の受付・振り分け担当。",
+    handoffs=["support"],  # 名前ベース handoff（registry が遅延構築で結線）
+))
+registry.register(RealtimeAgentSpec(name="support", instructions="技術サポート担当。"))
+registry.validate()  # 未解決の handoff 参照を run 前に検出
+
+entry = registry.get("triage")
+# model_settings（model_name / voice / modalities 等）は宣言側が持たない実行時 Config。
+# セッション開始時に利用者が RealtimeRunner へ渡す。
+runner = RealtimeRunner(entry, config={"model_settings": {"model_name": "gpt-4o-realtime-preview"}})
+```
+
+ハンドオフのトポロジは `RealtimeHandoffGraph` によるノード・エッジ宣言でも構築できる
+（`spec.handoffs` 直接宣言と同一の結線・`mermaid()` で可視化可能）:
+
+```python
+from oai_agentspec.realtime import RealtimeHandoffGraph
+
+graph = RealtimeHandoffGraph(entry="triage")
+graph.edge("triage", "support", tool_description="技術的な問い合わせを引き継ぐ")
+graph.edge("support", "triage")  # 相互参照（循環）も可
+graph.apply(specs)               # 検証付きで spec 群へ一括反映（build 前に行う）
+print(graph.mermaid())           # flowchart TD ...
+```
+
+音声 I/O 込みの実行例は `examples/realtime/`（`handoff_session.py` / `voice_chat.py`）を参照。
+
 ### ワークフロー（WorkflowGraph）
 
 > 実験的機能（experimental）。インターフェース・挙動は今後変わる可能性がある。
@@ -372,7 +433,8 @@ PromptLayout(base="base", parts="parts", agents="agents")
 `examples/` に実行可能なサンプルを用意している（AGENT を含む例は Azure OpenAI の Responses API を
 利用。環境変数は `examples/_shared/_azure.py` 参照）。「offline」と記した例は API キー不要で動く。
 カテゴリ別に `basic/`（基本・ハンドオフ）・`workflow/`（ワークフロー）・`conversation/`（会話 Helper）・
-`llmops/`（LLMOps 評価）・`lightning/`（Agent Lightning APO）に整理し、共有ヘルパーは `_shared/`、
+`tool_registry/`（Tool Registry）・`resilience/`（Model retry と run 予算）・
+`llmops/`（LLMOps 評価）・`lightning/`（Agent Lightning APO）・`intent/`（意図予測）に整理し、共有ヘルパーは `_shared/`、
 プロンプト素材は `prompts/` に置く。`examples/prompts/` はプロンプト記法のサンプル（`PromptStore`
 レイアウト base/parts/agents・フロントマター・`${var}`・合成）で、詳細は `examples/prompts/README.md`
 を参照。
@@ -417,6 +479,15 @@ PromptLayout(base="base", parts="parts", agents="agents")
 | `examples/lightning/06_approval_match_apo.py` | `approval_match` で承認ゲート発火を APO 学習 |
 | `examples/lightning/07_composite_reward_apo.py` | `OptimizeCase` 全観点 + 複合 reward + 系全体最適化 |
 | `examples/lightning/README.md` | Agent Lightning APO の使い方（reward ファクトリ・`OptimizeResult`・`HistoryEntry` schema） |
+| `examples/intent/01_basic_classification.py` | `intent_classifier_from_model` 1 行ヘルパの最小分類例 |
+| `examples/intent/07_custom_candidate_generator.py` | 自作 `CandidateGenerator`（キーワードマッチ・LLM 不使用）を `intent_classifier_from_generator` で束ねる（offline） |
+| `examples/intent/README.md` | 意図予測の使い方（例 01-07 一覧・信頼境界・レイテンシチューニング） |
+| `examples/tool_registry/01_bootstrap_registration.py` | bootstrap で Tool を一元登録し `AgentSpec` に渡す最小例 |
+| `examples/tool_registry/02_leaf_module_shared.py` | 分散した葉モジュールの Tool を共有 `ToolRegistry` に登録 |
+| `examples/tool_registry/03_metadata_showcase.py` | 全メタデータフィールド（`needs_approval` / `timeout` / `failure_error_function` 等）の SDK 反映（offline） |
+| `examples/tool_registry/04_error_handling.py` | 登録・照会エラー 5 種の挙動（offline） |
+| `examples/tool_registry/05_runtime_feature_flag.py` | `enabled` の動的トグルで tool を実行時に切替（feature flag 用途） |
+| `examples/resilience/01_retry_and_budget.py` | `ModelRetryPolicy` + `RunBudgetPolicy` の併用 + streaming 経路での例外観測 + `asyncio.wait_for` によるハード timeout パターン |
 
 ```bash
 uv run python examples/basic/basic.py
@@ -425,6 +496,7 @@ uv run python examples/conversation/01_inprocess.py
 uv run python examples/llmops/01_agent_quality_eval.py
 uv run python examples/lightning/01_single_agent_apo.py
 uv run python examples/lightning/05_failure_handling.py     # offline（API キー不要）
+uv run python examples/intent/07_custom_candidate_generator.py  # offline（API キー不要）
 ```
 
 会話 Helper（`ConversationService` / serve / CLI）・HITL・compaction の使い方は

@@ -12,6 +12,8 @@ import inspect
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from ._registry_core import build_two_pass, collect_reachable
+from ._validation import validate_instructions_callable
 from .spec import AgentSpec
 
 if TYPE_CHECKING:
@@ -165,48 +167,11 @@ class AgentRegistry:
         if name not in self._specs:
             raise KeyError(f"unknown agent: {name}")
 
-        reachable = self._collect_reachable(name)
-        # パス 1/2 はトランザクショナルに実行する。途中で例外が出たら本呼び出しで
-        # 新規キャッシュした bare agent を巻き戻し、不完全なインスタンスを残さない。
-        newly_built: list[str] = []
-        try:
-            # パス 1: handoffs 空・サブツール未注入でビルドして登録
-            for target in reachable:
-                if target not in self._built:
-                    self._built[target] = self._build_bare(self._specs[target])
-                    newly_built.append(target)
-            # パス 2: handoffs / sub_agents を後付け結線
-            for target in reachable:
-                self._wire(self._specs[target], self._built[target])
-        except Exception:
-            for target in newly_built:
-                self._built.pop(target, None)
-            raise
+        # 到達可能収集とトランザクショナルな 2 パス build/wire + 巻き戻しは共有 leaf
+        # `_registry_core` に委譲する（差分点＝依存辺・bare ビルド・結線はコールバックで注入）。
+        reachable = collect_reachable(name, self._specs, self._built, self._dependencies)
+        build_two_pass(reachable, self._specs, self._built, self._build_bare, self._wire)
         return self._built[name]
-
-    def _collect_reachable(self, name: str) -> list[str]:
-        """name から依存辺（handoffs ∪ sub_agents）を辿り未ビルドの spec 名を集める。
-
-        visited 集合で循環を打ち切る。到達不能 spec は含めない。spec でない依存名
-        （factory / 未登録）は収集対象外（factory は get() 時に自前構築、未登録は
-        結線フェーズでエラーになる）。
-        """
-        collected: list[str] = []
-        visited: set[str] = set()
-        stack = [name]
-        while stack:
-            current = stack.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            if current not in self._specs:
-                continue
-            if current not in self._built:
-                collected.append(current)
-            for dep in self._dependencies(self._specs[current]):
-                if dep not in visited:
-                    stack.append(dep)
-        return collected
 
     def _build_bare(self, spec: AgentSpec) -> Agent:
         return self._builder().build(spec)
@@ -383,8 +348,8 @@ class AgentRegistry:
         if self._frozen:
             return
         # 外部からの spec mutation を遮断するため独立コピーに置き換える（_copy_spec は
-        # tools / handoffs / handoff_options / sub_agents / sub_agent_tools / dynamic_handoffs
-        # / input_guardrails / output_guardrails / extra を新 list/dict にコピーする）。
+        # spec の全 dataclass フィールドを走査し list/dict 値を新コンテナにコピーする。
+        # サブクラスの可変フィールド（SandboxAgentSpec.capabilities 等）も対象）。
         self._specs = {name: _copy_spec(spec) for name, spec in self._specs.items()}
         # コピー前の spec から組まれた Agent は無効化（次回 get() で snapshot から再構築）。
         self._built.clear()
@@ -472,42 +437,35 @@ class AgentRegistry:
 
     @staticmethod
     def _validate_spec(spec: AgentSpec) -> None:
-        """callable instructions の引数数（(context, agent) の 2 引数）を検証する。"""
-        if callable(spec.instructions):
-            params = list(inspect.signature(spec.instructions).parameters.values())
-            if len(params) != 2:
-                raise ValueError(
-                    f"agent {spec.name!r}: instructions callable は (context, agent) の "
-                    f"2 引数が必須ですが {len(params)} 引数です"
-                )
+        """callable instructions が (context, agent) の 2 引数で呼び出せることを検証する。"""
+        validate_instructions_callable(spec.name, spec.instructions)
 
 
 def _copy_spec(spec: AgentSpec) -> AgentSpec:
     """`AgentSpec` を独立コピーする（新オブジェクト + 可変コンテナを新 list/dict に複製）。
 
-    `clone` が登録する spec を元 registry と identity / 可変コンテナ共有しないようにするための
-    ヘルパ。`AgentSpec` のミュータブル list/dict フィールド（`tools` / `input_guardrails` /
-    `output_guardrails` / `handoffs` / `handoff_options` / `sub_agents` / `sub_agent_tools` /
-    `dynamic_handoffs` / `extra`）を全て新インスタンスに浅くコピーする（中身の要素 = FunctionTool /
-    guardrail / handoff 名 / DynamicHandoff 等は共有でよい。`apply` 等が触るのはコンテナと spec
+    `clone` / `freeze` が保持する spec を元 registry と identity / 可変コンテナ共有しない
+    ようにするためのヘルパ。spec の全 dataclass フィールドを走査し、値が list / dict の
+    フィールドを全て新インスタンスに浅くコピーする（中身の要素 = FunctionTool / guardrail /
+    handoff 名 / DynamicHandoff 等は共有でよい。`apply` 等が触るのはコンテナと spec
     オブジェクト自体のため）。スカラー / 不変フィールド（`name` / `instructions` / `model` 等）は
-    そのまま引き継ぐ。
+    そのまま引き継ぐ。フィールド列挙を宣言（`dataclasses.fields`）から導出するため、
+    `AgentSpec` のサブクラス（`SandboxAgentSpec` の `capabilities` 等）の可変コンテナも
+    列挙の手動同期なしで複製対象になる。
 
     Args:
-        spec: コピー元の `AgentSpec`。
+        spec: コピー元の `AgentSpec`（サブクラス可。戻り値は同一クラス）。
 
     Returns:
         可変コンテナを共有しない独立した `AgentSpec`。
     """
-    return dataclasses.replace(
-        spec,
-        tools=list(spec.tools),
-        input_guardrails=list(spec.input_guardrails),
-        output_guardrails=list(spec.output_guardrails),
-        handoffs=list(spec.handoffs),
-        handoff_options=dict(spec.handoff_options),
-        sub_agents=list(spec.sub_agents),
-        sub_agent_tools=dict(spec.sub_agent_tools),
-        dynamic_handoffs=list(spec.dynamic_handoffs),
-        extra=dict(spec.extra),
-    )
+    copies: dict[str, Any] = {}
+    for f in dataclasses.fields(spec):
+        if not f.init:
+            continue
+        value = getattr(spec, f.name)
+        if isinstance(value, list):
+            copies[f.name] = list(value)
+        elif isinstance(value, dict):
+            copies[f.name] = dict(value)
+    return dataclasses.replace(spec, **copies)

@@ -45,11 +45,24 @@ def _load_dotenv() -> None:
             os.environ[key] = value
 
 
+def azure_api_version() -> str:
+    """Azure OpenAI の API バージョンポリシーを解決する（examples 共通の単一ソース）。
+
+    既定は "preview"（Microsoft v1 preview エンドポイント系統）。Responses クライアント
+    （本モジュール）と Realtime WebSocket URL（examples/realtime/_connection.py）の両方が
+    本関数を参照し、既定値・分岐条件のドリフトを防ぐ。
+
+    Returns:
+        環境変数 AZURE_OPENAI_API_VERSION の値（未設定なら "preview"）。
+    """
+    return os.environ.get("AZURE_OPENAI_API_VERSION", "preview")
+
+
 def _azure_client() -> AsyncOpenAI:
     """Azure OpenAI 互換クライアントを生成する（preview は v1 エンドポイント）。"""
     endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
     api_key = os.environ["AZURE_OPENAI_API_KEY"]
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "preview")
+    api_version = azure_api_version()
 
     if api_version == "preview":
         # api-version=preview は legacy /openai/ パスでは 404 になるため、

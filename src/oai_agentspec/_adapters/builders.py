@@ -20,11 +20,19 @@ from agents import (
     Handoff,
     handoff,
 )
+from agents.sandbox import SandboxAgent
+
+from .._validation import validate_extra_kwargs, validate_instructions_callable
+
+# isinstance 分岐・フィールド集合の導出に使うため実行時 import（spec.py は最下層で
+# 他モジュールを import しないため循環しない）。型ヒント専用の HandoffConfig は
+# TYPE_CHECKING に留める。
+from ..spec import AgentSpec, SandboxAgentSpec
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from ..spec import AgentSpec, HandoffConfig
+    from ..spec import HandoffConfig
 
 # 専用フィールド名（AgentSpec 側で別扱いするため extra から除外する Agent kwarg）。
 _DEDICATED_AGENT_KWARGS = frozenset(
@@ -78,8 +86,23 @@ _DYNAMIC_HANDOFF_RESERVED_KEYS = frozenset(
     }
 )
 
-# Agent が受け付ける有効な kwarg 名（extra の早期検証に使う）。
-_AGENT_FIELD_NAMES = frozenset(f.name for f in _dataclass_fields(Agent))
+# Agent が受け付ける有効な kwarg 名（extra の早期検証に使う）。init=False の内部フィールドは
+# コンストラクタ kwarg ではないため `f.init` で除外する（sandbox 側の導出式と対称に保つ）。
+_AGENT_FIELD_NAMES = frozenset(f.name for f in _dataclass_fields(Agent) if f.init)
+
+# SandboxAgentSpec 側で別扱いするサンドボックス固有フィールド（extra から除外する対象）。
+# 宣言（AgentSpec との fields() 差分）から導出し、spec.py へのフィールド追加に自動追従する。
+_SANDBOX_FIELD_KWARGS = frozenset(f.name for f in _dataclass_fields(SandboxAgentSpec)) - frozenset(
+    f.name for f in _dataclass_fields(AgentSpec)
+)
+
+# Agent 共通の専用 kwargs + sandbox 固有 4 フィールドの和集合（sandbox 経路の extra 検証用）。
+_DEDICATED_SANDBOX_AGENT_KWARGS = _DEDICATED_AGENT_KWARGS | _SANDBOX_FIELD_KWARGS
+
+# SandboxAgent が受け付ける有効な kwarg 名（extra の早期検証に使う）。
+# `_sandbox_concurrency_guard`（init=False の内部フィールド）はコンストラクタ kwarg では
+# ないため `f.init` で除外する（含めると extra 検証をすり抜けて生 TypeError になる）。
+_SANDBOX_AGENT_FIELD_NAMES = frozenset(f.name for f in _dataclass_fields(SandboxAgent) if f.init)
 
 
 def build_agent(spec: AgentSpec) -> Agent:
@@ -87,31 +110,32 @@ def build_agent(spec: AgentSpec) -> Agent:
 
     `instructions` / `prompt` / `tools` / `model` / `model_settings` / `hooks` /
     `input_guardrails` / `output_guardrails` を `Agent` にそのまま渡す。handoffs は空
-    （registry が後付け結線）。
+    （registry が後付け結線）。spec が `SandboxAgentSpec` の場合は
+    `agents.sandbox.SandboxAgent` を構築し、サンドボックス固有 4 フィールド
+    （`default_manifest` / `capabilities` / `run_as` / `base_instructions`）を
+    None-omission（未指定なら SDK 既定に委ねる）で渡す。
 
     Args:
-        spec: 構築対象の AgentSpec。
+        spec: 構築対象の AgentSpec（`SandboxAgentSpec` 可）。
 
     Returns:
-        agents.Agent（handoffs は空。サブツール未注入）。
+        agents.Agent（handoffs は空。サブツール未注入）。`SandboxAgentSpec` の場合は
+        agents.sandbox.SandboxAgent。
 
     Raises:
-        ValueError: extra に専用フィールド名と同名のキー、または Agent が受け付けない
-            未知のキーが含まれる場合。
+        ValueError: extra に専用フィールド名と同名のキー、または対象 Agent が受け付けない
+            未知のキーが含まれる場合。または `base_instructions` の callable が
+            (context, agent) の 2 引数で呼び出せない場合。
     """
+    is_sandbox = isinstance(spec, SandboxAgentSpec)
     extra = dict(spec.extra)
-    collisions = _DEDICATED_AGENT_KWARGS & extra.keys()
-    if collisions:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に専用フィールドと同名のキーが含まれます: "
-            f"{sorted(collisions)}"
-        )
-    unknown = extra.keys() - _AGENT_FIELD_NAMES
-    if unknown:
-        raise ValueError(
-            f"agent {spec.name!r}: extra に agents.Agent が受け付けないキーが含まれます: "
-            f"{sorted(unknown)}"
-        )
+    validate_extra_kwargs(
+        spec.name,
+        extra,
+        dedicated=_DEDICATED_SANDBOX_AGENT_KWARGS if is_sandbox else _DEDICATED_AGENT_KWARGS,
+        field_names=_SANDBOX_AGENT_FIELD_NAMES if is_sandbox else _AGENT_FIELD_NAMES,
+        agent_label="agents.sandbox.SandboxAgent" if is_sandbox else "agents.Agent",
+    )
 
     kwargs: dict[str, Any] = {
         "name": spec.name,
@@ -130,6 +154,19 @@ def build_agent(spec: AgentSpec) -> Agent:
         kwargs["model_settings"] = spec.model_settings
     if spec.hooks is not None:
         kwargs["hooks"] = spec.hooks
+    if is_sandbox:
+        validate_instructions_callable(
+            spec.name, spec.base_instructions, field_label="base_instructions"
+        )
+        # None-omission: 宣言から導出した固有フィールド集合を走査する（if 連鎖の手動同期を
+        # なくす）。list 値（capabilities 等）は tools と同様にコピーし、構築済み Agent への
+        # 事後 mutation 伝播を遮断する。
+        for name in _SANDBOX_FIELD_KWARGS:
+            value = getattr(spec, name)
+            if value is None:
+                continue
+            kwargs[name] = list(value) if isinstance(value, list) else value
+        return SandboxAgent(**kwargs)
     return Agent(**kwargs)
 
 
