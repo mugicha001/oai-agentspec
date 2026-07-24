@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 # 後方互換: 既存テストの `from .optimizer import _build_decisions` 等の import を維持するため、
 # 内部 helper を本モジュールから再エクスポートする（`_rollout` / `_slots_norm` への移動は内部実装の
 # 再編であって公開契約ではない）。
+from ._placeholders import compose_from_marked, unified_diff_labeled
 from ._rollout import _apply_candidate, _build_decisions, _make_rollout, _run_one  # noqa: F401
 from ._slots_norm import (
     _extract_case_input,  # noqa: F401
@@ -72,6 +73,7 @@ async def optimize(
     rebind: Callable[[Any], Any] | None = None,
     tool_mocks: dict[str, dict[str, Any]] | None = None,
     approvals: Callable[[dict], bool] | None = None,
+    context_factory: Callable[[], Any] | None = None,
     config: OptimizeConfig | None = None,
     apo_client: Any = None,
     rounds: int | None = None,
@@ -117,6 +119,12 @@ async def optimize(
             のため不要）。
         tool_mocks: agent スコープのモック dict（rollout 副作用の安全化・llmops 経路を再利用）。
         approvals: 承認自動解決ポリシー（mock-approve 相当・llmops 経路を再利用）。
+        context_factory: rollout ごとに呼び出し新鮮な context を生成する引数なし callable（FR-2）。
+            戻り値は各 rollout の初回 `run_with_observation` の `context=` へ素通しされ、SDK
+            `Runner.run(context=...)` から動的 Instructions / ツールへ届く（`vars=callable` の
+            動的 instructions も本 context を受ける）。承認 resume ループ内は SDK `RunState` 内包の
+            context が再利用されるため再生成しない（1 rollout = 1 context）。None で従来どおり
+            `context=None`。
         config: 実行制御設定（並列度 / ラウンド数 / タイムアウト / Store の passthrough・パワー
             ユーザー経路）。直接 kwargs と同時指定はエラー。
         apo_client: APO の textual gradient / edit 用 `AsyncOpenAI` 互換クライアント（直接渡し・
@@ -220,6 +228,7 @@ async def optimize(
         reward=reward,
         tool_mocks=tool_mocks,
         approvals=approvals,
+        context_factory=context_factory,
     )
 
     from ..._adapters import run_apo
@@ -230,13 +239,13 @@ async def optimize(
     # 生 seed + rebind 経路（slots is None）や `Slot.fixed` 空のときは run_apo 側で tune そのものを
     # 返す（後方互換）。
     fixed_map = {name: s.fixed for name, s in slots.items()} if slots else None
-    vars_map = {name: dict(s.vars) for name, s in slots.items() if s.vars} if slots else None
+    vars_map = _build_vars_map(slots)
 
     # FR-8: 最適化実行（Trainer / rollout / reward）の失敗を構造化エラーへ倒す。extra 不在は
     # EXTRA_MISSING、設定不在（rollout 内で遅延検知される registry 不在等の OptimizeError）は
     # その kind を保ち、その他の実行時例外は TRAINER_FAILED へ変換して未捕捉例外で止めない。
     try:
-        return await run_apo(
+        result = await run_apo(
             seeds=seeds,
             train=train,
             val=val,
@@ -253,6 +262,83 @@ async def optimize(
         raise OptimizeError(
             FailureKind.TRAINER_FAILED, f"最適化の実行に失敗しました: {exc}"
         ) from exc
+
+    # 新 shape slot（`Slot.segments` 非空）は run_apo が tune-only テキストを返すため、返却後に
+    # `compose_from_marked` で固定セグメントを含む full テキストへ再合成して prompt / seed / diff を
+    # 上書きする（"OptimizeResult.prompt == rollout instructions" 契約・論点 G）。旧 shape は不変。
+    return _recompose_new_shape_results(result, slots) if slots else result
+
+
+def _build_vars_map(slots: dict[str, Slot] | None) -> dict[str, dict[str, Any]] | None:
+    """`run_apo` へ渡す `vars_per_slot` を構築する（静的 dict は値渡し・callable は空 dict 明示）。
+
+    旧 shape の空 vars を除外する既存契約（`if s.vars`）は維持しつつ、`vars=callable`（`vars_fn`
+    を持つ）slot は静的 vars を持たない（`Slot.vars` は空 dict）ため上の filter で漏れる。当該 slot
+    は最適化ループへ vars を非伝搬（rollout 時に context から動的生成）とする意味論なので、`run_apo`
+    へは空 dict を明示的に渡す（論点 G）。
+
+    Args:
+        slots: 正規化済みスロット mapping（生 seed + rebind 経路では None）。
+
+    Returns:
+        `{名前: vars dict}` の mapping。`slots` が None のときは None。
+    """
+    if slots is None:
+        return None
+    vars_map = {name: dict(s.vars) for name, s in slots.items() if s.vars}
+    for name, s in slots.items():
+        if s.vars_fn is not None:
+            vars_map[name] = {}
+    return vars_map
+
+
+def _recompose_new_shape_results(result: OptimizeResult, slots: dict[str, Slot]) -> OptimizeResult:
+    """新 shape slot の prompt / seed / diff を full 再合成した `OptimizeResult` を返す（論点 G）。
+
+    `Slot.segments` が非空の slot について、`run_apo` が返した tune-only の prompt / seed を
+    `compose_from_marked` で固定セグメントを含む full テキストへ再合成し、diff は full 合成後の
+    seed / prompt から `difflib.unified_diff` で再計算する。`vars=callable` の slot は `Slot.vars`
+    が空 dict のため値を注入せず `${var}` プレースホルダを保持する（静的注入なし）。旧 shape
+    （`Slot.segments` 空）の slot はそのまま維持する。`OptimizeResult` の shape（単一 str /
+    複数 dict）も維持する。
+
+    Args:
+        result: `run_apo` の返却値（tune-only テキストを含む）。
+        slots: 正規化済みスロット mapping。
+
+    Returns:
+        新 shape slot を full 再合成した `OptimizeResult`（frozen のため `replace` で再構築）。
+    """
+    for name, slot in slots.items():
+        if not slot.segments:
+            continue  # 旧 shape は run_apo 返却をそのまま使う。
+        vars_dict = dict(slot.vars)
+        if isinstance(result.prompt, dict):
+            seed_map = result.seed if isinstance(result.seed, dict) else {}
+            full_prompt = compose_from_marked(slot.segments, result.prompt[name], vars_dict)
+            full_seed = compose_from_marked(slot.segments, seed_map.get(name, ""), vars_dict)
+            if full_prompt is None or full_seed is None:
+                continue  # マーカー崩れは防御的に無視（通常起きない）。
+            new_prompt = dict(result.prompt)
+            new_prompt[name] = full_prompt
+            new_seed = dict(seed_map)
+            new_seed[name] = full_seed
+            new_diff = dict(result.diff) if isinstance(result.diff, dict) else {}
+            new_diff[name] = unified_diff_labeled(full_seed, full_prompt)
+            result = dataclasses.replace(result, prompt=new_prompt, seed=new_seed, diff=new_diff)
+        else:
+            seed_text = result.seed if isinstance(result.seed, str) else ""
+            full_prompt = compose_from_marked(slot.segments, result.prompt, vars_dict)
+            full_seed = compose_from_marked(slot.segments, seed_text, vars_dict)
+            if full_prompt is None or full_seed is None:
+                continue
+            result = dataclasses.replace(
+                result,
+                prompt=full_prompt,
+                seed=full_seed,
+                diff=unified_diff_labeled(full_seed, full_prompt),
+            )
+    return result
 
 
 def _resolve_config(config: OptimizeConfig | None, direct_kwargs: dict[str, Any]) -> OptimizeConfig:

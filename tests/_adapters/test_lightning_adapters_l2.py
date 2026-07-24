@@ -936,6 +936,200 @@ async def test_run_apo_falls_back_to_seed_when_best_drops_placeholder(
     assert entry["best_version"] is None
 
 
+async def test_run_apo_single_slot_normal_placeholder_missing_falls_back_to_seed(
+    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
+    fake_prompt_template: None,  # noqa: ARG001
+    captured_rewards: list[float],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回帰確認: 通常 placeholder（`oas_boundary_` 接頭辞なし）が best から欠落したら seed
+    フォールバックする（post-fit フォールバック判定の既存挙動・T8 の拡張前提が壊れていない）。"""
+
+    @dataclass
+    class _DropOtherVarAPO:
+        kwargs: dict[str, Any] = field(default_factory=dict)
+        _history_best_score: float = 0.5
+        _history_best_version: str = "v1"
+
+        def get_best_prompt(self) -> _FakePromptTemplate:
+            # seed には `${other_var}` があるが best 候補は喪失。
+            return _FakePromptTemplate(template="(optimized) hi", engine="jinja")
+
+    monkeypatch.setattr(
+        "agentlightning.APO", lambda **kwargs: _DropOtherVarAPO(kwargs=dict(kwargs)), raising=True
+    )
+
+    with pytest.warns(RuntimeWarning, match="`\\${var}` を喪失"):
+        result = await run_apo(
+            seeds={"bot": "hi ${other_var}"},
+            train=[{"input": "t"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+    assert result.prompt == "hi ${other_var}"
+    assert result.history[0]["placeholder_fallback"] is True
+
+
+async def test_run_apo_single_slot_boundary_marker_missing_falls_back(
+    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
+    fake_prompt_template: None,  # noqa: ARG001
+    captured_rewards: list[float],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """予約境界マーカー `${oas_boundary_1}`（exact-once 検査対象）が best から完全に欠落した
+    場合も seed フォールバックする（既存の存在検査で既にカバーされる経路・回帰確認）。"""
+
+    @dataclass
+    class _DropBoundaryAPO:
+        kwargs: dict[str, Any] = field(default_factory=dict)
+        _history_best_score: float = 0.5
+        _history_best_version: str = "v1"
+
+        def get_best_prompt(self) -> _FakePromptTemplate:
+            # seed には `${oas_boundary_1}` があるが best 候補では欠落。
+            return _FakePromptTemplate(template="(optimized) start end", engine="jinja")
+
+    monkeypatch.setattr(
+        "agentlightning.APO", lambda **kwargs: _DropBoundaryAPO(kwargs=dict(kwargs)), raising=True
+    )
+
+    with pytest.warns(RuntimeWarning, match="`\\${var}` を喪失"):
+        result = await run_apo(
+            seeds={"bot": "start ${oas_boundary_1} end"},
+            train=[{"input": "t"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+    assert result.prompt == "start ${oas_boundary_1} end"
+    assert result.history[0]["placeholder_fallback"] is True
+
+
+async def test_run_apo_single_slot_boundary_marker_duplicated_falls_back(
+    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
+    fake_prompt_template: None,  # noqa: ARG001
+    captured_rewards: list[float],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新規契約（T8）: 予約境界マーカー `${oas_boundary_1}` は seed と同じ回数（exact-once）で
+    best にも存在すべき。best で重複（2 回以上）していたら、存在はしていても seed フォールバック
+    対象に含める（現状は set ベースの存在検査のみのため未検出＝RED）。"""
+
+    @dataclass
+    class _DuplicateBoundaryAPO:
+        kwargs: dict[str, Any] = field(default_factory=dict)
+        _history_best_score: float = 0.5
+        _history_best_version: str = "v1"
+
+        def get_best_prompt(self) -> _FakePromptTemplate:
+            # seed には `${oas_boundary_1}` が 1 回のみだが best では 2 回重複している。
+            return _FakePromptTemplate(
+                template="(optimized) start {{ oas_boundary_1 }} mid {{ oas_boundary_1 }} end",
+                engine="jinja",
+            )
+
+    monkeypatch.setattr(
+        "agentlightning.APO",
+        lambda **kwargs: _DuplicateBoundaryAPO(kwargs=dict(kwargs)),
+        raising=True,
+    )
+
+    with pytest.warns(RuntimeWarning, match="`\\${var}` を喪失"):
+        result = await run_apo(
+            seeds={"bot": "start ${oas_boundary_1} end"},
+            train=[{"input": "t"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+    # 重複していた best は破棄され seed にフォールバックする（境界マーカーの exact-once 契約）。
+    assert result.prompt == "start ${oas_boundary_1} end"
+    assert result.history[0]["placeholder_fallback"] is True
+
+
+async def test_run_apo_single_slot_boundary_marker_order_swap_falls_back(
+    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
+    fake_prompt_template: None,  # noqa: ARG001
+    captured_rewards: list[float],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FU C2 fix: seed と best のマーカー出現順が入れ替わっている場合も fallback を発火させる。
+
+    従来の count 一致検査（`str.count`）は order-agnostic のため、seed の
+    `${oas_boundary_1}...${oas_boundary_2}` に対し best 側で 2 が先・1 が後の swap が
+    count 一致で素通ししていた。post-fit fallback を `boundary_intact`（連番列の順序込み比較）
+    に一本化することで、silent に literal マーカーが `OptimizeResult` に漏れるのを防ぐ。"""
+
+    @dataclass
+    class _OrderSwapBoundaryAPO:
+        kwargs: dict[str, Any] = field(default_factory=dict)
+        _history_best_score: float = 0.5
+        _history_best_version: str = "v1"
+
+        def get_best_prompt(self) -> _FakePromptTemplate:
+            # seed は 1 -> 2 の順・best は 2 -> 1 の順で swap。count 一致・order 不整合。
+            return _FakePromptTemplate(
+                template="A {{ oas_boundary_2 }} B {{ oas_boundary_1 }} C",
+                engine="jinja",
+            )
+
+    monkeypatch.setattr(
+        "agentlightning.APO",
+        lambda **kwargs: _OrderSwapBoundaryAPO(kwargs=dict(kwargs)),
+        raising=True,
+    )
+
+    with pytest.warns(RuntimeWarning, match="`\\${var}` を喪失"):
+        result = await run_apo(
+            seeds={"bot": "A ${oas_boundary_1} B ${oas_boundary_2} C"},
+            train=[{"input": "t"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+    assert result.prompt == "A ${oas_boundary_1} B ${oas_boundary_2} C"
+    assert result.history[0]["placeholder_fallback"] is True
+
+
+async def test_run_apo_single_slot_boundary_marker_exact_once_passes(
+    fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
+    fake_prompt_template: None,  # noqa: ARG001
+    captured_rewards: list[float],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """seed / best とも `${oas_boundary_1}` がちょうど 1 回ずつであれば exact-once を満たすため
+    フォールバックせず best 候補をそのまま採用する。"""
+
+    @dataclass
+    class _ExactOnceBoundaryAPO:
+        kwargs: dict[str, Any] = field(default_factory=dict)
+        _history_best_score: float = 0.5
+        _history_best_version: str = "v1"
+
+        def get_best_prompt(self) -> _FakePromptTemplate:
+            return _FakePromptTemplate(
+                template="(optimized) start {{ oas_boundary_1 }} end", engine="jinja"
+            )
+
+    monkeypatch.setattr(
+        "agentlightning.APO",
+        lambda **kwargs: _ExactOnceBoundaryAPO(kwargs=dict(kwargs)),
+        raising=True,
+    )
+
+    result = await run_apo(
+        seeds={"bot": "start ${oas_boundary_1} end"},
+        train=[{"input": "t"}],
+        val=[{"input": "v"}],
+        rollout=_const_rollout(0.5),
+        config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+    )
+    # フォールバックせず best 候補（optimized 済みテキスト）が採用される。
+    assert result.prompt == "(optimized) start ${oas_boundary_1} end"
+    assert result.history[0]["placeholder_fallback"] is False
+
+
 async def test_run_apo_warns_when_history_attr_missing(
     fake_trainer_factory: list[_FakeTrainer],  # noqa: ARG001
     fake_prompt_template: None,  # noqa: ARG001

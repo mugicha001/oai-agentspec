@@ -15,7 +15,7 @@ import inspect
 from typing import TYPE_CHECKING, Any
 
 from ._slots_norm import _extract_case_input, _reinject_vars
-from .types import FailureKind, OptimizeError, RolloutResult, Slot
+from .types import FailureKind, OptimizeError, RolloutResult, Slot, _CandidateInvalid
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -71,6 +71,7 @@ def _make_rollout(
     reward: Callable[[RolloutResult], float | Awaitable[float]],
     tool_mocks: dict[str, dict[str, Any]] | None,
     approvals: Callable[[dict], bool] | None,
+    context_factory: Callable[[], Any] | None = None,
 ) -> Callable[[dict[str, str], Any], Awaitable[float]]:
     """候補スロット mapping + 1 ケースから報酬を返す rollout callable を組む。
 
@@ -87,6 +88,8 @@ def _make_rollout(
         reward: rollout の `RolloutResult` から報酬を返す callable（同期 / async）。
         tool_mocks: rollout 安全化のモック dict（llmops 経路を再利用）。
         approvals: 承認自動解決ポリシー（llmops 経路を再利用）。
+        context_factory: rollout ごとに新鮮な context を生成する引数なし callable（None で
+            context=None）。戻り値は初回 `run_with_observation` の `context=` へ素通しする（FR-2）。
 
     Returns:
         `(候補スロット mapping, ケース) -> 報酬`（non-blocking）。
@@ -104,14 +107,26 @@ def _make_rollout(
         from ..._adapters import DefaultRunnerAdapter
         from . import _target as target_mod
 
+        # rollout ごとに新鮮な context を生成する（1 rollout = 1 context・承認 resume ループ内は
+        # SDK RunState 内包 context を再利用するため `_run_one` へは初回分のみ渡す）。
+        context = context_factory() if context_factory is not None else None
         agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
-        outcome, observation, fired_approvals = await _run_one(
-            agent=agent,
-            case=case,
-            replaced=replaced,
-            approvals=approvals,
-            runner=DefaultRunnerAdapter(),
-        )
+        try:
+            outcome, observation, fired_approvals = await _run_one(
+                agent=agent,
+                case=case,
+                replaced=replaced,
+                approvals=approvals,
+                runner=DefaultRunnerAdapter(),
+                context=context,
+            )
+        except _CandidateInvalid:
+            # vars=callable 経路: dynamic instructions closure が SDK Runner.run 実行時に
+            # `_CandidateInvalid` を投げるケース（境界マーカー崩れ or vars_fn 非 dict 戻り値）。
+            # C1 対応: build 時ではなく rollout 時に発火する例外を per-candidate 無効化経路
+            # （reward 0.0）で吸収する。他の例外（TypeError / RuntimeError 等）は
+            # 暴走防止のため伝搬させる。
+            return 0.0
         result = RolloutResult(
             case=case,
             output=outcome.final_output or "",
@@ -172,7 +187,16 @@ def _apply_candidate(
     if isinstance(target, AgentSpec):
         # 単一スロット = target 自身の build で AgentSpec を組み直す。
         slot = next(iter(slots.values()))
-        return slot.build(reinjected[slot.name]), registry
+        try:
+            built = slot.build(reinjected[slot.name])
+        except _CandidateInvalid:
+            # per-candidate 無効化経路（reward 0.0・`_reinject_vars` の None と同一扱い）。
+            # C3 対応: 内部の `_CandidateInvalid` sentinel のみを catch する。旧 shape の
+            # 利用者 `build=` が raise する generic な `ValueError` は silent 化せず伝搬させる
+            # （fail-closed 診断性の維持）。境界マーカー崩れは `_new_default_build` が
+            # `_CandidateInvalid` で signal する。
+            return None
+        return built, registry
 
     # 横断（グラフ）: registry をクローンし各スロットの名前の spec を build 済み spec へ差し替える。
     if registry is None:
@@ -187,7 +211,15 @@ def _apply_candidate(
             return spec
         return slot.build(reinjected[spec.name])
 
-    return target, registry.clone(transform_spec=_transform)
+    try:
+        cloned = registry.clone(transform_spec=_transform)
+    except _CandidateInvalid:
+        # per-candidate 無効化経路（reward 0.0・`_reinject_vars` の None と同一扱い）。
+        # C3 対応: 内部の `_CandidateInvalid` sentinel のみを catch する。旧 shape の
+        # 利用者 `build=` が raise する generic な `ValueError` や `_resolve_spec` の
+        # config 不整合 `ValueError` は silent 化せず伝搬させる（fail-closed 診断性の維持）。
+        return None
+    return target, cloned
 
 
 async def _run_one(
@@ -197,6 +229,7 @@ async def _run_one(
     replaced: frozenset[tuple[str, str]],
     approvals: Callable[[dict], bool] | None,
     runner: Any,
+    context: Any = None,
 ) -> tuple[Any, Any, list[str]]:
     """1 rollout を実行し `(RunOutcome, ObservedRun, fired_approvals)` を返す（承認自動解決対応）。
 
@@ -215,6 +248,8 @@ async def _run_one(
         replaced: 実差し替えした `(agent, tool)` ペア集合（approve 認可の安全不変条件）。
         approvals: 承認自動解決ポリシー（None で自動解決しない）。
         runner: `DefaultRunnerAdapter` インスタンス。
+        context: 初回実行へ素通しする共有 context（FR-2・None で従来どおり）。承認 resume は
+            SDK `RunState` 内包の context を再利用するため `resume_with_observation` へは渡さない。
 
     Returns:
         `(RunOutcome, マージ済み ObservedRun, fired_approvals ツール名列)` の plain タプル。
@@ -222,7 +257,7 @@ async def _run_one(
     from ..._adapters import apply_approvals, resume_with_observation
 
     case_input = _extract_case_input(case)
-    outcome, observation = await runner.run_with_observation(agent, case_input)
+    outcome, observation = await runner.run_with_observation(agent, case_input, context=context)
 
     # 初回中断時の pending を fired に積む（approvals 有無に関わらず承認ゲート発火を観測する）。
     fired_approvals: list[str] = []

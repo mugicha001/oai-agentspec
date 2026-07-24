@@ -80,6 +80,21 @@ class OptimizeError(Exception):
         self.message = message
 
 
+class _CandidateInvalid(Exception):
+    """rollout 候補を無効化するための内部シグナル例外（reward 0.0 経路へ倒す）。
+
+    lightning ライブラリ内部で「この候補は破棄・reward 0.0」を伝えるための sentinel。
+    利用者 `build=` 関数や利用者 `vars=callable` 関数が投げる無関係な `ValueError` を
+    候補無効化に silent 吸収してしまわないよう、意味を明示した専用型で signal する
+    （C1/C3 フォローアップ: 旧 shape custom build の ValueError の silent 化 regression と
+    dynamic instructions closure から raise される例外の rollout 全体 abort を解消する）。
+
+    catch は `_rollout._apply_candidate` と `_rollout._make_rollout` の rollout closure でのみ
+    行い、それ以外の例外（TypeError / RuntimeError / OptimizeError / 利用者 ValueError 等）は
+    従来どおり伝搬させる（暴走防止・診断性維持）。
+    """
+
+
 @dataclass(frozen=True)
 class RolloutResult:
     """1 rollout の plain な観測（reward へ渡す・SDK 型に非依存・NFR-1）。
@@ -111,6 +126,25 @@ class RolloutResult:
 
 
 @dataclass(frozen=True)
+class SlotSegment:
+    """スロットを構成する 1 セグメント（qualified 参照付き・新 shape の構造情報）。
+
+    `ref` は `"base:main"` / `"part:style"` / `"agent:triage"` のような qualified 参照文字列で、
+    セグメントの由来（base / part / agent 等の種別と名前）を示す。`tune=True` のセグメントのみ
+    APO の最適化対象になり、`tune=False` は固定セグメントとして候補テキストへそのまま連結される。
+
+    Attributes:
+        ref: qualified 参照文字列（例: `"base:main"` / `"part:style"` / `"agent:triage"`）。
+        text: セグメント本文（`${var}` プレースホルダ保持）。
+        tune: 最適化対象かを示すフラグ（True = APO 対象・False = 固定セグメント）。
+    """
+
+    ref: str
+    text: str
+    tune: bool
+
+
+@dataclass(frozen=True)
 class Slot:
     """APO の最適化対象スロット 1 件（`prompt_slot` の戻り値・plain）。
 
@@ -131,6 +165,10 @@ class Slot:
         build: 候補テキストから `AgentSpec` を構築する関数。
         vars: `${var}` 置換値（最適化対象外・各 rollout で再注入）。
         fixed: base / parts を合成した固定部分テキスト（`${var}` 保持・空なら合成なし）。
+        segments: 新 shape の構造情報 SoT（既定 build と OptimizeResult 合成の両方が参照する）。
+            空タプルなら従来経路（`fixed` / `seed` ベースの合成）を使う。
+        vars_fn: vars=callable を受けた場合の保持先（`vars` の dict 契約とは分離）。既定 build が
+            これを見て動的 instructions を生成する。callable を受けない場合は None。
     """
 
     name: str
@@ -138,6 +176,8 @@ class Slot:
     build: Callable[[str], Any]
     vars: dict[str, Any] = field(default_factory=dict)
     fixed: str = ""
+    segments: tuple[SlotSegment, ...] = ()
+    vars_fn: Callable[[Any], dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)

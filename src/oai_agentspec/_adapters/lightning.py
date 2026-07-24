@@ -31,7 +31,6 @@ agentlightning 未導入時は明示 ImportError + 案内（`_LIGHTNING_INSTALL_
 from __future__ import annotations
 
 import asyncio
-import difflib
 import logging
 import math
 import os
@@ -552,13 +551,29 @@ async def _run_apo_single_slot(
     # （契約: 「最適化済みテキストは `${var}` を保持する」）。ここで seed と同じ placeholder 集合
     # を満たさない最良候補は seed にフォールバックし、warnings で利用者へ知らせる（silent failure
     # を避ける）。
-    from ..runtime.lightning._placeholders import extract_placeholders
+    from ..runtime.lightning._placeholders import BOUNDARY_PREFIX, extract_placeholders
 
     placeholder_fallback = False
     seed_placeholders = extract_placeholders(seed_text)
     if seed_placeholders:
         best_placeholders = extract_placeholders(best_text)
-        missing = sorted(seed_placeholders - best_placeholders)
+        # 通常 placeholder は存在検査（set 差分）で欠落を検出する。予約接頭辞
+        # `oas_boundary_` を持つ境界マーカーは、slot 境界の再構成に出現順まで一致する
+        # 必要があるため、`boundary_intact`（順序込みの連番列比較）で判定する。存在検査
+        # のみでは best 側で count 一致・順序不整合の swap ケースを取りこぼし
+        # （`_recompose_new_shape_results` が silent continue して literal マーカーが
+        # OptimizeResult に漏出する契約穴）。C2 対応で `boundary_intact` に一本化する。
+        from ..runtime.lightning._placeholders import boundary_intact
+
+        if any(name.startswith(BOUNDARY_PREFIX) for name in seed_placeholders) and not (
+            boundary_intact(seed_text, best_text)
+        ):
+            boundary_mismatched = {
+                name for name in seed_placeholders if name.startswith(BOUNDARY_PREFIX)
+            }
+        else:
+            boundary_mismatched = set()
+        missing = sorted((seed_placeholders - best_placeholders) | boundary_mismatched)
         if missing:
             names = ", ".join(repr(n) for n in missing)
             warnings.warn(
@@ -628,33 +643,6 @@ def _compose_full(fixed: str, tune: str, vars_dict: dict[str, str] | None = None
 
     tune_substituted = substitute_braced(tune, vars_dict)
     return compose_with_vars(fixed, tune_substituted, vars_dict)
-
-
-def _unified_diff(before: str, after: str) -> str:
-    """`before` / `after` の unified diff を 1 つの文字列として返す（差分なしは空文字）。
-
-    `OptimizeResult.diff` に詰める「どこが変わったか」のテキスト表現。stdlib `difflib.unified_diff`
-    を使い、`fromfile`/`tofile` を `before`/`after` に固定する。`splitlines()` で改行で分割し、
-    `lineterm=""` で連結時の余計な改行を防ぐ。
-
-    Args:
-        before: 最適化前テキスト（合成済み full）。
-        after: 最適化後テキスト（合成済み full）。
-
-    Returns:
-        unified diff 文字列（差分なしは空文字）。
-    """
-    if before == after:
-        return ""
-    return "\n".join(
-        difflib.unified_diff(
-            before.splitlines(),
-            after.splitlines(),
-            fromfile="before",
-            tofile="after",
-            lineterm="",
-        )
-    )
 
 
 async def run_apo(
@@ -737,7 +725,13 @@ async def run_apo(
         name: _compose_full(fixed_map.get(name, ""), current[name], vars_map.get(name))
         for name in current
     }
-    diffs = {name: _unified_diff(composed_seeds[name], composed_prompts[name]) for name in current}
+    # SSoT: diff 生成は `_placeholders.unified_diff_labeled` に一本化する（`_compose_full` と
+    # 同じく runtime を module top で import しない単方向依存のため関数内遅延 import で参照）。
+    from ..runtime.lightning._placeholders import unified_diff_labeled
+
+    diffs = {
+        name: unified_diff_labeled(composed_seeds[name], composed_prompts[name]) for name in current
+    }
 
     prompt: str | dict[str, str]
     seed_out: str | dict[str, str]
