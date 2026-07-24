@@ -21,6 +21,7 @@ reward → Trainer へフィードバック → `${var}` 保持の最適化済�
 from __future__ import annotations
 
 import dataclasses
+import warnings
 from typing import TYPE_CHECKING, Any
 
 # 後方互換: 既存テストの `from .optimizer import _build_decisions` 等の import を維持するため、
@@ -315,7 +316,18 @@ def _recompose_new_shape_results(result: OptimizeResult, slots: dict[str, Slot])
             full_prompt = compose_from_marked(slot.segments, result.prompt[name], vars_dict)
             full_seed = compose_from_marked(slot.segments, seed_map.get(name, ""), vars_dict)
             if full_prompt is None or full_seed is None:
-                continue  # マーカー崩れは防御的に無視（通常起きない）。
+                # SSoT 契約違反（予約接頭辞が成果物に漏出しうる）を silent 化しない。上流
+                # `_adapters/lightning::_run_apo_single_slot` の post-fit fallback が seed に倒す
+                # のが正常経路で、ここに到達するのは fallback すり抜けを意味する。
+                warnings.warn(
+                    f"[_recompose_new_shape_results] slot {name!r}: 境界マーカー再合成に失敗"
+                    "（compose_from_marked が None を返却）。run_apo の返却をそのまま維持しますが、"
+                    "OptimizeResult に literal `${oas_boundary_N}` が漏出する可能性があります。"
+                    "_adapters の post-fit fallback を確認してください",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
             new_prompt = dict(result.prompt)
             new_prompt[name] = full_prompt
             new_seed = dict(seed_map)
@@ -324,10 +336,22 @@ def _recompose_new_shape_results(result: OptimizeResult, slots: dict[str, Slot])
             new_diff[name] = unified_diff_labeled(full_seed, full_prompt)
             result = dataclasses.replace(result, prompt=new_prompt, seed=new_seed, diff=new_diff)
         else:
-            seed_text = result.seed if isinstance(result.seed, str) else ""
+            # 単一 slot 経路。run_apo の shape 契約により seed も str のはず・非 str は契約違反。
+            if not isinstance(result.seed, str):
+                raise OptimizeError(
+                    FailureKind.TRAINER_FAILED,
+                    f"run_apo 返却の shape 契約違反（slot {name!r}: prompt は str だが seed が "
+                    f"{type(result.seed).__name__}）。upstream の返却実装を確認してください",
+                )
             full_prompt = compose_from_marked(slot.segments, result.prompt, vars_dict)
-            full_seed = compose_from_marked(slot.segments, seed_text, vars_dict)
+            full_seed = compose_from_marked(slot.segments, result.seed, vars_dict)
             if full_prompt is None or full_seed is None:
+                warnings.warn(
+                    f"[_recompose_new_shape_results] slot {name!r}: 境界マーカー再合成に失敗。"
+                    "run_apo 返却をそのまま維持しますが literal marker 漏出可能性あり",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 continue
             result = dataclasses.replace(
                 result,

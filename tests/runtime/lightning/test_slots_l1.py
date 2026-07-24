@@ -1026,6 +1026,94 @@ def test_prompt_slot_vars_callable_multi_tune_still_reinterleaves(tmp_path: Path
     assert result == "OPTIMIZED_MAIN\n\nOPTIMIZED_TRIAGE"
 
 
+def test_prompt_slot_vars_callable_substitutes_tune_side_var(tmp_path: Path) -> None:
+    """`vars=callable` は rollout 時に tune 側の `${var}` も substitute する（ADR 0005 契約）。
+
+    ADR 0005 は「callable の中身は substitute_braced(合成済みテキスト, vars_fn(context))」
+    と規定。旧実装は `compose_from_marked` だけを呼び tune セグメントを raw のまま返していたため
+    tune 側 `${var}` が literal で SDK に渡っていた（context 由来値注入の主用途が機能せず）。
+    修正: 動的 instructions closure は full 合成後に `substitute_braced(full, dynamic_vars)` を
+    追加適用する。
+    """
+    slot = prompt_slot(
+        _store_new_shape(tmp_path),
+        _registry(),
+        agent="triage",  # agent セグメント 1 本を tune 対象（既定）
+        vars=lambda ctx: {"tone": ctx.tone},
+    )
+    # candidate は tune 側の `${tone}` を保持したまま（`_reinject_vars` は Slot.vars={} で no-op）。
+    agent_spec = slot.build("${tone} で応答してください")
+    assert callable(agent_spec.instructions)
+
+    class FakeCtx:
+        tone = "polite"
+
+    result = agent_spec.instructions(FakeCtx(), agent_spec)
+    # 旧実装: "${tone} で応答してください" (literal 残り・BUG)
+    # 修正後: "polite で応答してください" (dynamic_vars で substitute される)
+    assert result == "polite で応答してください"
+    assert "${tone}" not in result
+
+
+def test_prompt_slot_vars_callable_no_double_substitute_on_fixed_side(tmp_path: Path) -> None:
+    """`vars=callable` の rollout closure は fixed 側の値内 `${...}` を二重 substitute しない
+    （Codex P2 regression guard・compose(vars=callable) と同じ 1-pass セマンティクス）。
+
+    シナリオ: 固定 base の `${org}` に対して callable が値 `"${tone}"` を返す。二重 pass だと
+    fixed の `${org}` → `"${tone}"` → `"polite"` と再解釈されるが、正しい 1-pass 動作では
+    fixed に `${tone}` が literal で残る（tune 側 callable と compose の意味論を保つ）。
+    """
+    from pathlib import Path as _P
+
+    # base に `${org}` 固定・tune=agent 単独の store を組む。
+    root = tmp_path
+    _P(root / "agents").mkdir()
+    _P(root / "agents" / "triage.md").write_text("TUNE ${tone}", encoding="utf-8")
+    _P(root / "base").mkdir()
+    _P(root / "base" / "main.md").write_text("org=${org}", encoding="utf-8")
+    from oai_agentspec.prompts import PromptLayout, PromptStore
+
+    store = PromptStore(root, PromptLayout(base="base", parts="parts", agents="agents"))
+
+    slot = prompt_slot(
+        store,
+        _registry(),
+        agent="triage",
+        base="main",
+        vars=lambda ctx: {"org": "${tone}", "tone": "polite"},
+    )
+    agent_spec = slot.build("TUNE ${tone}")
+
+    class FakeCtx:
+        pass
+
+    result = agent_spec.instructions(FakeCtx(), agent_spec)
+    # 固定側: ${org} → "${tone}" (1-pass で literal 保持・二重 pass だと "polite" になる)
+    # tune 側: ${tone} → "polite" (rollout 時 substitute される)
+    assert result == "org=${tone}\n\nTUNE polite"
+
+
+def test_prompt_slot_vars_callable_optimize_result_keeps_placeholder(tmp_path: Path) -> None:
+    """`vars=callable` の slot は `OptimizeResult` 側では tune 側 `${var}` を literal で保持する
+    （具体値をベイクしない・compose(vars=callable) と同一契約）。
+
+    `_recompose_new_shape_results` は Slot.vars = {} を使うため tune / 固定いずれの `${var}` も
+    substitute されない。context 由来値の実行時注入は rollout closure だけが担い、成果物では
+    placeholder を温存する（rollout 実体と OptimizeResult の意味的分離）。
+    """
+    from oai_agentspec.runtime.lightning._placeholders import compose_from_marked
+
+    slot = prompt_slot(
+        _store_new_shape(tmp_path),
+        _registry(),
+        agent="triage",
+        vars=lambda ctx: {"tone": ctx.tone},
+    )
+    # OptimizeResult 合成側は Slot.vars（空 dict）で compose_from_marked を呼ぶ。
+    optimize_result_prompt = compose_from_marked(slot.segments, "${tone} で応答", dict(slot.vars))
+    assert optimize_result_prompt == "${tone} で応答"  # literal 保持（ベイクなし）
+
+
 def test_prompt_slot_vars_callable_returns_non_dict_raises_candidate_invalid(
     tmp_path: Path,
 ) -> None:

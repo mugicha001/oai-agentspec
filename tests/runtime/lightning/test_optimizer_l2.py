@@ -2053,6 +2053,85 @@ async def test_optimize_new_shape_result_diff_is_recomputed(
     assert "+++ after" in result.diff
 
 
+async def test_optimize_new_shape_multi_slot_dict_recompose_per_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """複数 slot（HandoffGraph + `prompt_slots`）で run_apo が dict 型 `OptimizeResult` を返す
+    経路の per-slot 再合成を検証する（`_recompose_new_shape_results` の isinstance(prompt, dict)
+    分岐の regression guard）。
+
+    全 slot について `result.prompt[name]` / `result.seed[name]` が固定セグメント込みの full
+    合成テキストになり、`result.diff[name]` が `unified_diff_labeled` の統一ラベルで再計算される
+    ことを固定する。将来 dict 分岐で 1 slot 分の合成しか反映されず他 slot が tune-only のまま
+    silent 通過する regression を検出する。
+    """
+    from oai_agentspec.prompts import PromptLayout, PromptStore
+    from oai_agentspec.runtime.lightning import prompt_slots
+
+    # 2 agent 用のローカルストア（_store_new_shape は triage のみのため）。
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "triage.md").write_text("Triage seed", encoding="utf-8")
+    (agents_dir / "second.md").write_text("Second seed", encoding="utf-8")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "main.md").write_text("BASE ${org}", encoding="utf-8")
+    store = PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
+
+    registry = AgentRegistry()
+    registry.register(_spec(name="triage"))
+    registry.register(_spec(name="second"))
+    graph = HandoffGraph(entry="triage")
+    graph.edge("triage", "second", description="次のエージェント")
+    graph.apply(registry)
+    registry.validate()
+
+    slots = prompt_slots(
+        store, registry, agents=["triage", "second"], base="main", vars={"org": "AgentSpec"}
+    )
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        # dict 型で複数 slot 分の tune-only テキストを返す（run_apo の複数 slot 契約）。
+        return OptimizeResult(
+            prompt={"triage": "TUNED_TRIAGE", "second": "TUNED_SECOND"},
+            seed={"triage": seeds["triage"], "second": seeds["second"]},
+            diff={"triage": "OLD_TRIAGE_DIFF", "second": "OLD_SECOND_DIFF"},
+            train_score=1.0,
+            val_score=1.0,
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        graph,
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slots,
+        registry=registry,
+        config=_apo_config(),
+    )
+    # dict 型が保持され、全 slot について base が prepend された full 合成になっている。
+    assert isinstance(result.prompt, dict)
+    assert isinstance(result.seed, dict)
+    assert isinstance(result.diff, dict)
+    for name, tuned in [("triage", "TUNED_TRIAGE"), ("second", "TUNED_SECOND")]:
+        assert result.prompt[name] == f"BASE AgentSpec\n\n{tuned}"
+        assert result.seed[name].startswith("BASE AgentSpec\n\n")
+        # 古い diff は破棄され、unified_diff_labeled の統一ラベルで再計算されている。
+        assert f"OLD_{name.upper()}_DIFF" not in result.diff[name]
+        assert "--- before" in result.diff[name]
+        assert "+++ after" in result.diff[name]
+
+
 async def test_optimize_new_shape_result_prompt_matches_rollout_build(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

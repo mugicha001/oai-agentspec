@@ -134,7 +134,12 @@ def _new_default_build(
                         "compose(vars=callable) と同一の契約で `Callable[[Any], dict[str, Any]]` を"
                         "返すよう修正してください"
                     )
-                full = compose_from_marked(segments, candidate, dynamic_vars)
+                # ADR 0005 契約: rollout 時に tune 側の `${var}` も dynamic_vars で
+                # substitute する。`substitute_tune=True` を渡し compose_from_marked 内で
+                # tune テキストにも `substitute_braced` を適用させる（固定側は既に substitute
+                # 済み・二重 pass すると fixed vars の値内 `${...}` が意図せず再解釈される
+                # ため full 文字列に対する post-substitute は使わない）。
+                full = compose_from_marked(segments, candidate, dynamic_vars, substitute_tune=True)
                 if full is None:
                     raise _CandidateInvalid(
                         f"slot {name!r}: 境界マーカー `${{oas_boundary_N}}` の欠落・重複・"

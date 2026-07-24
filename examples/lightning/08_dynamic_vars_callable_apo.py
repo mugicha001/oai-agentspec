@@ -2,16 +2,16 @@
 
 Issue #40 FR-2 (`context_factory`) / FR-3 (`vars=callable`) の end-to-end 動作例。
 本番の HandoffGraph は triage が context を確定して後段エージェントに引き継ぐ動線
-（例: triage の routing 決定 / ID 抽出）を持つ。本例は最小構成でこれを再現し、`billing` の
+（例: triage の routing 決定 / ID 抽出）を持つ。本例は最小構成でこれを再現し、`planner` の
 プロンプト内 `${routed_from}` / `${tone}` が「rollout ごとに新鮮な context」から動的注入
 されつつ、**APO の成果物（`OptimizeResult.prompt`）には `${var}` のまま保持** されることを
 示す（具体値がベイクされない・compose(vars=callable) と同一契約）。
 
 構成:
-- `HandoffGraph`: triage -> billing / sales
+- `HandoffGraph`: triage -> planner / advisor
 - `context_factory=lambda: ConversationContext(...)`: rollout 開始時に新鮮な context を生成
 - triage: 通常 build（vars=None）
-- billing / sales: `vars=lambda ctx: {"tone": ..., "routed_from": ...}` の callable を渡す。
+- planner / advisor: `vars=lambda ctx: {"tone": ..., "routed_from": ...}` の callable を渡す。
   既定 build が SDK 動的 Instructions 規約 `(context, agent) -> str` の instructions を据え、
   rollout 時に `vars_fn(context)` を評価して `${tone}` / `${routed_from}` へ注入する
 
@@ -20,9 +20,9 @@ Issue #40 FR-2 (`context_factory`) / FR-3 (`vars=callable`) の end-to-end 動�
   のパイプ配線のみを示す最小例**。「triage の tool 呼び出しで context を確定 -> 後段が読む」
   というエンドツーエンドの動線までは示していない。実運用では triage 側で
   `@function_tool` の中で `ctx.context.routed_from = ...` を書き込む形になる（本例では
-  factory が固定値をセットしているため `routed_from='triage'` の初期値がそのまま billing で
+  factory が固定値をセットしているため `routed_from='triage'` の初期値がそのまま planner で
   読まれる）
-- APO は billing / sales のプロンプトのみ最適化する（triage 側は登録 spec のまま固定）
+- APO は planner / advisor のプロンプトのみ最適化する（triage 側は登録 spec のまま固定）
 - Slot は per-agent 構成（個別 `prompt_slot`）で組み立てる。共通 base/parts がないため
   `prompt_slots` の一括生成は使わない
 - **`OptimizeResult.diff` は本例では通常空**（単一 slot・短い期待出力・capable LLM の組み合わせで
@@ -65,7 +65,7 @@ class ConversationContext:
         tone: 応対トーン（会話全体で共通・callable が `${tone}` に注入する）。
         routed_from: 直前のハンドオフ元 agent 名（triage 起点なので初期値は "triage"）。
             実運用では triage 側の tool 呼び出しで動的に書き換わる想定だが、本例では初期値
-            そのままを billing / sales が読む形で最小構成を示す。
+            そのままを planner / advisor が読む形で最小構成を示す。
     """
 
     tone: str = "polite"
@@ -75,19 +75,19 @@ class ConversationContext:
 # 意図的に弱い seed（07 と同じ規範）。`${var}` プレースホルダは APO 中も保持され rollout 時に
 # 注入される。APO は routing 指示・応答方針を textual gradient で追加する余地を持つ。
 TRIAGE_SEED = (
-    "あなたはトリアージ担当です。ユーザーの依頼を読み、請求関連なら billing に、"
-    "それ以外のプラン相談なら sales にハンドオフしてください。"
+    "あなたはトリアージ担当です。ユーザーの依頼を読み、手続き系なら planner に、"
+    "案内・情報提供系なら advisor にハンドオフしてください。"
 )
-BILLING_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
-SALES_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
+PLANNER_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
+ADVISOR_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
 
 
 def _make_store(root: Path) -> PromptStore:
     """本例専用の一時 `PromptStore` を組む（agents/ 配下に 3 テンプレート）。"""
     (root / "agents").mkdir()
     (root / "agents" / "triage.md").write_text(TRIAGE_SEED, encoding="utf-8")
-    (root / "agents" / "billing.md").write_text(BILLING_SEED, encoding="utf-8")
-    (root / "agents" / "sales.md").write_text(SALES_SEED, encoding="utf-8")
+    (root / "agents" / "planner.md").write_text(PLANNER_SEED, encoding="utf-8")
+    (root / "agents" / "advisor.md").write_text(ADVISOR_SEED, encoding="utf-8")
     return PromptStore(root, PromptLayout(base="base", parts="parts", agents="agents"))
 
 
@@ -95,19 +95,19 @@ async def main() -> None:
     model = azure_model()
     registry = AgentRegistry()
     registry.register(AgentSpec(name="triage", instructions="(seed)", model=model))
-    registry.register(AgentSpec(name="billing", instructions="(seed)", model=model))
-    registry.register(AgentSpec(name="sales", instructions="(seed)", model=model))
+    registry.register(AgentSpec(name="planner", instructions="(seed)", model=model))
+    registry.register(AgentSpec(name="advisor", instructions="(seed)", model=model))
 
     graph = HandoffGraph(entry="triage")
-    graph.edge("triage", "billing", description="請求関連")
-    graph.edge("triage", "sales", description="プラン相談")
+    graph.edge("triage", "planner", description="手続き系")
+    graph.edge("triage", "advisor", description="案内・情報提供系")
     graph.apply(registry)
     registry.validate()
 
     with tempfile.TemporaryDirectory() as td:
         store = _make_store(Path(td))
 
-        # billing / sales に vars=callable を渡す（rollout ごとに context から動的注入される）。
+        # planner / advisor に vars=callable を渡す（rollout ごとに context から動的注入される）。
         # 既定 build は SDK 規約 `(context, agent) -> str` の動的 instructions を据え、rollout 時に
         # `vars_fn(context)` を評価して `${tone}` / `${routed_from}` へ注入する。APO 候補は
         # 内部で `${var}` 保持のまま扱われ、`OptimizeResult.prompt` にも保持される。
@@ -119,8 +119,8 @@ async def main() -> None:
             }
 
         slots = {
-            "billing": prompt_slot(store, registry, agent="billing", vars=_dyn_vars),
-            "sales": prompt_slot(store, registry, agent="sales", vars=_dyn_vars),
+            "planner": prompt_slot(store, registry, agent="planner", vars=_dyn_vars),
+            "advisor": prompt_slot(store, registry, agent="advisor", vars=_dyn_vars),
         }
 
         data = [
@@ -131,8 +131,8 @@ async def main() -> None:
         ]
         train, val = train_val_split(data, val_ratio=0.5, seed=0)
 
-        # contains() で expected_output の語（日本語）を含むか判定する（S/N が高い＝seed が
-        # 「英語のみ」と指示している間は必ず reward=0・APO は言語指示を反転する gradient を得る）。
+        # contains() で expected_output の語を判定する（seed に指示が薄いため APO が routing 指示や
+        # 応答方針を textual gradient で追加する余地を持つ・07 の設計と同じ規範）。
         reward = contains()
 
         result = await optimize(
@@ -153,7 +153,7 @@ async def main() -> None:
         )
 
         print(f"train_score={result.train_score:.3f}")
-        for slot_name in ("billing", "sales"):
+        for slot_name in ("planner", "advisor"):
             print()
             print(f"=== [{slot_name}] ===")
             print("--- BEFORE (seed・${var} 保持) ---")

@@ -162,19 +162,25 @@ def compose_segments(
     segments: tuple[SlotSegment, ...],
     tune_texts: list[str],
     vars_dict: dict[str, Any],
+    *,
+    substitute_tune: bool = False,
 ) -> str:
     """`segments` を構成順に走査し、tune テキストを再インターリーブして full テキストへ合成する。
 
     `tune=True` のセグメントは `tune_texts` を先頭から順に消費する（構成順とテキスト順が対応）。
     `tune=False` の固定セグメントは `text` をそのまま使い、その `text` にのみ `vars_dict` を
-    `substitute_braced` で注入する（tune 側は `${var}` 温存契約のため注入しない・rollout 直前の
-    `_reinject_vars` で別途注入される）。既定 build（rollout 時）と optimizer（OptimizeResult 合成）
-    の双方が本関数を呼ぶことで、合成規則の drift を不可能にする（本モジュール SSoT の一部）。
+    `substitute_braced` で注入する（既定では tune 側は `${var}` 温存契約のため注入しない・
+    rollout 直前の `_reinject_vars` で別途注入される）。`substitute_tune=True` のときのみ
+    tune 側にも `substitute_braced` を適用する（`vars=callable` の rollout 経路専用・ADR 0005
+    契約）。既定 build（rollout 時）と optimizer（OptimizeResult 合成）の双方が本関数を呼ぶ
+    ことで、合成規則の drift を不可能にする（本モジュール SSoT の一部）。
 
     Args:
         segments: 構成順の `SlotSegment` タプル（空なら空文字を返す）。
         tune_texts: `tune=True` セグメントへ順に割り当てるテキスト列。
-        vars_dict: 固定セグメントへ注入する `${var}` 置換値（未指定キーは `${name}` 保持）。
+        vars_dict: セグメントへ注入する `${var}` 置換値（未指定キーは `${name}` 保持）。
+        substitute_tune: True のとき tune セグメントにも `substitute_braced` を適用する
+            （既定は False で tune 側 raw）。
 
     Returns:
         各セグメントを `"\\n\\n"` で連結した合成済み full テキスト（`segments` が空なら空文字）。
@@ -194,7 +200,10 @@ def compose_segments(
     tune_index = 0
     for segment in segments:
         if segment.tune:
-            rendered.append(tune_texts[tune_index])
+            text = tune_texts[tune_index]
+            if substitute_tune:
+                text = substitute_braced(text, vars_dict)
+            rendered.append(text)
             tune_index += 1
         else:
             rendered.append(substitute_braced(segment.text, vars_dict))
@@ -205,6 +214,8 @@ def compose_from_marked(
     segments: tuple[SlotSegment, ...],
     candidate: str,
     vars_dict: dict[str, Any],
+    *,
+    substitute_tune: bool = False,
 ) -> str | None:
     """境界マーカー入り候補を分割・再インターリーブして full テキストへ合成する（SSoT）。
 
@@ -216,7 +227,11 @@ def compose_from_marked(
     Args:
         segments: 構成順の `SlotSegment` タプル（tune / 固定の別を保持）。
         candidate: 境界マーカーを含みうる候補テキスト。
-        vars_dict: 固定セグメントへ注入する `${var}` 置換値（未指定キーは `${name}` 保持）。
+        vars_dict: セグメントへ注入する `${var}` 置換値（未指定キーは `${name}` 保持）。
+        substitute_tune: True のとき tune セグメントにも `substitute_braced` を適用する
+            （`vars=callable` の rollout 経路専用・ADR 0005 契約: rollout 時に tune 側の
+            `${var}` も context 由来値で substitute する）。False（既定）は tune 側 raw で
+            `${var}` を温存する（静的経路 + OptimizeResult 合成の既存契約）。
 
     Returns:
         合成済み full テキスト。`split_marked` がマーカー崩れ（欠落・重複・順序不整合）で
@@ -230,7 +245,7 @@ def compose_from_marked(
     if tune_texts is None:
         return None
     stripped = [text.strip() for text in tune_texts]
-    return compose_segments(segments, stripped, vars_dict)
+    return compose_segments(segments, stripped, vars_dict, substitute_tune=substitute_tune)
 
 
 def unified_diff_labeled(seed: str, prompt: str) -> str:
