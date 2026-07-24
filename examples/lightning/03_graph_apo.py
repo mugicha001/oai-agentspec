@@ -58,7 +58,10 @@ async def main() -> None:
     registry, graph = build_registry(model)
     store = PromptStore(PROMPTS_AGENTS, LAYOUT)
 
-    # triage と billing のプロンプトのみ系全体で同時最適化する（support は固定）。
+    # triage と billing のプロンプトのみ系全体で同時最適化する（support は固定）。tune 省略時は
+    # 各 slot で agent セグメントのみ最適化される（従来動作と同一）。エージェントごとに異なる
+    # セレクタを使いたい場合は `tune={"billing": ["main", "billing"]}` のように agent 名をキーと
+    # する dict を渡す（未指定 agent は tune=None に縮退・agents に無いキーは fail-closed）。
     slots = prompt_slots(
         store, registry, agents=["triage", "billing"], vars={"company": "AgentSpec Inc."}
     )

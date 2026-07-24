@@ -278,20 +278,37 @@ def composite_reward(r: RolloutResult) -> float:
 合成プロンプトの seed 取得・固定部分との再合成・候補適用 rebind・build 宣言を畳む。`PromptStore`
 の公開メソッドを**読み取るのみ**で一切改変しない。
 
-- `prompt_slot(store, registry, *, tune, base=None, parts=(), vars=None, build=None)` -> `Slot`
-  - seed は `PromptLayout` を尊重して解決する: `store.compose(agent=tune, vars=None)`（標準の
-    `agents/<tune>.md`）を優先し、見つからなければ `store.get(tune).body`（root 直下の flat 配置）に
-    フォールバックする。`${var}` プレースホルダは保持されたまま seed として保存される。
+- `prompt_slot(store, registry=None, agent=None, *, base=None, parts=(), layout=None, tune=None, vars=None, build=None)` -> `Slot`
+  - **旧経路（完全互換）**: `agent` を省略し `tune=<単一 str>` を渡す従来呼び出し
+    （`prompt_slot(store, registry, tune="triage")`）はそのまま動く。seed は `PromptLayout` を
+    尊重して解決する: `store.compose(agent=tune, vars=None)`（標準の `agents/<tune>.md`）を優先し、
+    見つからなければ `store.get(tune).body`（root 直下の flat 配置）にフォールバックする。
+  - **新 shape**: `agent`（または `layout`）を明示すると `PromptStore.compose` と同じ構成指定
+    （`base` / `parts` / `layout`）を受け付け、`tune`（`str | Sequence[str]`）で最適化対象
+    セグメントを選べる。複数セグメントを選ぶと構成順（base -> parts -> agent）に連結した 1 テキスト
+    として単一 APO ループで最適化される。`tune` を省略すると agent セグメントのみを最適化する
+    （従来と同じ既定挙動）。
+  - `vars` は `dict` のほか `Callable[[Any], dict]` も渡せる（`PromptStore.compose(vars=...)` と
+    同一型）。callable のときは rollout ごとに評価され動的注入となり、成果物では `${var}` が保持
+    される（静的注入との違いは受理型のみ）。
   - `build` 省略時の既定 build は registry 登録 `AgentSpec` を複製し `instructions` だけ候補で
     差し替える（registry 必須・未解決は fail-closed）。tools / handoffs / model 等は登録 spec から
     複製され、利用者は再宣言不要。
-  - `vars` は最適化対象外で seed に保持し、rollout 時に内部で再注入する。
-- `prompt_slots(store, registry, agents=[...], *, base=None, parts=(), vars=None)` -> `{名前: Slot}`
-  - 列挙したエージェント分を一括生成。`optimize(graph, slot=slots, registry=registry)` に渡すと
-    rebind 自動導出と合わせてグラフ全体 APO が実質 2 行で書ける。**未掲載のエージェントは固定**。
+- `prompt_slots(store, registry, agents=[...], *, base=None, parts=(), tune=None, vars=None)` -> `{名前: Slot}`
+  - 列挙したエージェント分を一括生成（各 agent 名で新 shape の `agent=` slot を生成）。
+    `optimize(graph, slot=slots, registry=registry)` に渡すと rebind 自動導出と合わせてグラフ全体
+    APO が実質 2 行で書ける。**未掲載のエージェントは固定**。
+  - `tune` は agent 名ごとのセレクタ mapping（`{"billing": ["main", "billing"]}` 等）。`None`
+    のときは全 slot で agent セグメントのみ最適化（従来動作）。`layout` は非対応（必要なら
+    `prompt_slot` を個別に呼ぶ）。
 
 `Slot`（`prompt_slot` / `prompt_slots` の戻り値）は `build` を内包するため、フレームワークが各
 スロットの `build` から rebind を自動導出する（手書き rebind は生 seed 経路のときだけ必要）。
+
+`optimize(..., context_factory=lambda: MyContext())` を渡すと rollout ごとに新鮮な実行時 context
+を生成できる（`vars=callable` の動的 instructions が参照する context を含め、SDK
+`Runner.run(context=...)` へ素通しされる）。詳細は `docs/usage/ops/lightning.md` の
+「compose 一致 shape」節を参照。
 
 ### 置換変数（`${var}`）の扱い
 
