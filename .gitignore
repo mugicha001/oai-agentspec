@@ -12,6 +12,8 @@ wheels/
 # development environment files
 .claude/
 CLAUDE.md
+docs/CODING_RULES.md
+docs/REVIEW.md
 
 # environment variables
 .env

@@ -1392,18 +1392,55 @@ rollout の結線と reward 算出への plain データ供給に徹する。
 - rollout: `_adapters` の `DefaultRunnerAdapter.run_with_observation` で 1 回実行し、`observe_run_result` で plain な
   実行経路 / ツール呼び出し列へ変換して利用者供給の reward へ渡す（生 `RunResult` は `_adapters` 外へ出さない・
   実行トレース捕捉の流儀は「LLMOps 評価」節の実行トレース捕捉を再利用する）。
+- context 配線: `optimize(context_factory=...)` を渡すと `_make_rollout` の rollout 冒頭で factory を 1 回呼び、
+  新鮮な context を `run_with_observation(context=...)` 経由で SDK `Runner.run(context=...)` まで素通しする。粒度は
+  「1 rollout = 1 context」（rollout 間は共有しない = 状態汚染防止）。承認 resume ループ内は同一 context を維持する
+  （`resume_with_observation` へ `context=` を渡さず、SDK `RunState` 内包 context を再利用する）。lightning 層に
+  `from agents` は増えず、既存 `context=` パラメータの配線のみで完結する（SDK 隔離維持）。
 - APO 候補適用: 各 rollout で `registry.clone(transform_spec=候補で instructions 差し替え)` により候補適用済みの
   独立 registry を構築し、vars を rollout 直前に再注入する（利用者 registry / 登録 spec は不変）。
+- セグメント構成と tune セレクタ: `prompt_slot` の構成規則は `PromptStore.compose` と一致し、`agent` / `base` /
+  `parts`（または qualified 参照列 `layout`）でプロンプト全体を組み立て、最適化対象を `tune` セレクタで選ぶ。構成順は
+  compose と同一の base -> parts -> agent（`layout` 指定時はその並び）。`tune` の照合はセグメント名と qualified 参照
+  （`base:` / `part:` / `agent:`）の 2 形式で行い、plain 名の名前空間衝突・構成不在・重複・空は fail-closed
+  （`OptimizeError(CONFIG_MISSING)`）。`agent` が spec 解決名（`Slot.name`）を担い、`agent=` または `layout=` の
+  いずれかが必須（両方未指定は `OptimizeError(CONFIG_MISSING)`・詳細は ADR 0007）。
+- 複数 tune セグメント: 選択セグメントの seed を構成順に連結して `Slot.seed` とし、2 個以上のとき境界に予約 braced
+  placeholder（`${oas_boundary_N}`）を挟む。連結 1 テキストとして単一 APO ループで最適化する（block-coordinate-ascent
+  の slot 間逐次方式は不変・NFR-4 のループ回数不増）。構成情報は `Slot.segments`（`SlotSegment` の構成順列・内部構造で
+  `__all__` 非登録）に持ち、rollout 合成と `OptimizeResult` 合成の双方が `_placeholders` の SSoT ヘルパ
+  （`split_marked`: マーカー exact-once 検査 + 分割 / `compose_segments`: 構成順再インターリーブ + 固定側 vars 注入）を
+  共用して drift を排除する。rollout では build 経路で `split_marked` が候補を検査し、違反は内部 sentinel
+  `_CandidateInvalid` で signal されて `_apply_candidate` が候補単位で無効化する（reward 0.0 経路・最適化全体は継続）。
+- 境界保全: マーカーは braced placeholder なので既存 `_reinject_vars`（seed 内全 placeholder 検査）が喪失を無変更で
+  検出し、`substitute_braced` の未知キー保持で全注入点を素通りする。`_adapters/lightning` の post-fit フォールバック
+  判定は `oas_boundary_` 接頭辞の出現順序・回数の完全一致（exact-once・順序込み）まで拡張し、違反 best は既存 placeholder
+  フォールバックと同一の seed フォールバック経路に倒す（seed は構築時に必ず split 可能で optimizer の再合成が常に成功する）。
+
+`${var}` 保持と実行時注入（vars=callable）: `prompt_slot(vars=...)` は `PromptStore.compose(vars=...)` と同一型
+（`dict | Callable[[Any], dict] | None`）を受理する。dict は静的注入で従来経路（`vars_per_slot` 伝搬）を通り、callable は
+`Slot.vars_fn`（新設・`Slot.vars` の dict 契約とは分離）に保持され最適化ループへ一切伝搬しない（`vars_per_slot` は空 dict）。
+callable のとき既定 build が SDK 規約 `(context, agent) -> str` の動的 instructions を据え、rollout ごとに
+`vars_fn(context)` を評価して `substitute_braced` で `${var}` 位置へ注入する（compose と同一の評価タイミング・引数・
+未解決キーの温存）。保持は「vars_map に名前を含めない」ことで `substitute_braced` の未知キー保持により候補ループ・
+`OptimizeResult` 構築の全注入点で成立し、特定 rollout の具体値はベイクされない。`vars=callable` のとき
+`_ensure_fixed_vars_present` は免除し（キー集合が実行時まで不明）、`build=` 併用は fail-closed（既定 build のみが
+`vars_fn` を評価する）。判断の rationale と却下案は
+`docs/adr/0005-lightning-vars-callable-runtime-injection.md`・`docs/adr/0006-lightning-tune-selector-boundary-markers.md`
+を参照。
 - 結果: 既定で plain な `OptimizeResult` を返すのみ（lib 自動書込なし・`PromptStore` 非書込）。`result.save(path)`
-  は利用者指定パスへの opt-in 書込で、APO は `${var}` 保持テキストを書く。`OptimizeResult` は最適化済み
-  `prompt`（after・rollout 時の合成済み full テキスト・`Slot.fixed` と tune を `\n\n` 連結し vars 再注入済み）に
-  加え、`seed`（before・同じ shape の合成済み full）と `diff`（before / after の unified diff）を併せて返す
-  （いずれも単一スロットは str・複数スロットは `{名前: str}` mapping）。利用者は `print(result.diff)` で 1 行
-  記述で「どこが変わったか」を可視化でき、APO 結果の before/after 比較ボイラープレートが不要になる。
+  は利用者指定パスへの opt-in 書込で、APO は `${var}` 保持テキストを書く。`OptimizeResult.prompt` / `seed` / `diff` は
+  rollout 実体と一致する full 合成（固定セグメントを構成順どおり含む・境界マーカーは分割消費で成果物に現れない）とし、
+  segments 非空 slot は run_apo へ `vars_per_slot` のみ渡して tune 側 `${var}` を再注入させ、optimizer が返却後に
+  seed / best を `Slot.segments` を SoT に `split_marked` -> `compose_segments` で full 再合成し diff を再計算する
+  （`_recompose_new_shape_results`）。custom build / 生 seed の segments 空 slot は run_apo の返却をそのまま
+  成果物にする。いずれも単一スロットは str・複数スロットは `{名前: str}` mapping。
+  利用者は `print(result.diff)` で
+  before/after を可視化できる。
 - 履歴: `OptimizeResult.history` は各スロット 1 件の `HistoryEntry`（TypedDict）の列で、`slot` / `best_score` /
-  `best_version` / `placeholder_fallback` の 4 キーを持つ。APO 最良候補が seed の `${var}` プレースホルダを
-  喪失した場合は seed にフォールバックして `placeholder_fallback=True` をマークし、`best_score` / `best_version`
-  は破棄候補の値を指さないよう None に上書きする（公開契約「最適化済みテキストは `${var}` を保持する」を
+  `best_version` / `placeholder_fallback` の 4 キーを持つ。APO 最良候補が seed の `${var}` プレースホルダ（境界マーカー
+  を含む）を喪失した場合は seed にフォールバックして `placeholder_fallback=True` をマークし、`best_score` /
+  `best_version` は破棄候補の値を指さないよう None に上書きする（公開契約「最適化済みテキストは `${var}` を保持する」を
   fail-closed で守り、利用者は warning 受信に依存せず history flag で programmatic に検出できる）。
 
 ### rollout 安全性

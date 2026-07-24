@@ -25,7 +25,7 @@ AND（または重み付き平均）で合成すれば、「正しい担当へ h
   - PromptStore は本例では使わない（02 / 03 で十分示している）。`Slot` を手書きすることで「seed /
     build / vars」のミニマル構成を見せる。
 
-`OptimizeResult` の出力（`Slot.fixed` 未使用 = 合成なし）:
+`OptimizeResult` の出力（手書き `Slot` は `segments` 空 = 合成なし・run_apo 返却を素通し）:
   - `result.seed`  : 各 slot の seed テキスト（before・rollout 実体と一致・`${company}` は vars
                      展開済み・APO 候補生成は内部で `${var}` 保持のまま扱う）
   - `result.prompt`: 各 slot の最適化済みテキスト（after・rollout 実体と一致・vars 展開済み）

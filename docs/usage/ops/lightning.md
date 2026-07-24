@@ -30,7 +30,7 @@ from oai_agentspec.runtime.lightning import (
     OptimizeCase, contains, optimize, prompt_slot, train_val_split,
 )
 
-slot = prompt_slot(store, registry, tune="triage")
+slot = prompt_slot(store, registry, agent="triage")
 cases = [OptimizeCase(input="請求書ください", expected_output="請求")]
 train, val = train_val_split(cases, val_ratio=0.2)
 
@@ -46,6 +46,54 @@ result = await optimize(
 print(result.prompt)                   # 最適化済みテキスト（${var} 保持）
 print(result.diff)                     # seed vs prompt の unified diff
 ```
+
+### compose 一致 shape（tune セレクタ + vars=callable + context_factory）
+
+`prompt_slot` の使い方は `PromptStore.compose` と一致する。`agent` / `base` / `parts`（または `layout`）でプロンプト全体を組み立て、最適化対象セグメントを `tune` セレクタで選ぶ。`tune` に含まれないセグメント（base を含む）は固定される。複数セグメントは構成順（base -> parts -> agent）に連結した 1 テキストとして単一 APO ループで最適化され、rollout 時は固定セグメントと構成順どおり再合成される。実行時 context 由来の値は `vars` に callable を渡して注入し、成果物では `${var}` のまま保持する。
+
+```python
+slot = prompt_slot(
+    store, registry,
+    agent="triage",                       # compose と同名同位置・spec 解決名を兼ねる
+    base="main",
+    parts=["style", "safety"],
+    tune=["main", "triage"],              # base も選択対象・非選択（style/safety）は固定
+    vars=lambda ctx: {                    # compose(vars=callable) と同一型
+        "tone": "丁寧語",                  # 静的値も callable の返す dict に含めてよい
+        "triage_result": ctx.context.triage_result,
+    },
+)
+result = await optimize(
+    graph,
+    slot={"triage": slot},
+    registry=registry,
+    train=train, val=val,
+    reward=reward,
+    apo_client=AsyncOpenAI(),
+    context_factory=lambda: TriageContext(),   # rollout ごとに新鮮な context
+)
+print(result.prompt)   # "<最適化後 main>\n\n<style>\n\n<safety>\n\n... ${triage_result} ..."
+```
+
+`vars` に callable を渡すと、値は最適化ループへ一切伝搬せず、既定 build が SDK 動的 Instructions 規約 `(context, agent) -> str` の instructions を据え、rollout ごとに `vars_fn(context)` を評価して `${var}` 位置へ注入する（`compose(vars=callable)` と同一の評価タイミング・引数・未解決キーの `${var}` 温存）。最適化成果物では `${tone}` / `${triage_result}` は具体値がベイクされず保持される。`vars` に dict を渡した場合は従来どおり静的注入（未知キーのみ `${var}` 保持）で、callable 経路との差は受理型のみで二分される。承認 resume ループ内は同一 context（SDK `RunState` 内包 context の再利用）で継続する。この判断の詳細は `docs/adr/0005-lightning-vars-callable-runtime-injection.md`・`docs/adr/0006-lightning-tune-selector-boundary-markers.md` を参照。
+
+### layout で構成順を明示指定する
+
+compose と同じく `layout` に qualified 参照列を渡すと、その並びがそのまま構成順になり `agent` / `base` / `parts` の構成指定は無視される（compose と完全一致の意味論）。`tune` の照合先は layout 列になる。
+
+```python
+slot = prompt_slot(
+    store, registry,
+    layout=["base:main", "part:style", "agent:triage"],  # 並びが構成順
+    tune=["base:main", "agent:triage"],                   # 照合先は layout 列
+)
+```
+
+`agent` を省略した場合、layout 内に `agent:X` 参照がちょうど 1 つあれば X が spec 解決名（`Slot.name`）になる（0 個または複数は `OptimizeError(CONFIG_MISSING)`）。`prompt_slots` は `layout` 非対応で、layout が必要なエージェントは `prompt_slot` を個別に呼んで slot mapping を組み立てる。
+
+### 境界マーカーについて
+
+複数セグメントを連結するとき、内部的に境界へ予約 braced placeholder（`${oas_boundary_N}`）を挟んで固定・最適化セグメントの再インターリーブ位置を保全する。マーカーは rollout 合成・`OptimizeResult` の full 合成で分割消費され、成果物（`prompt` / `seed` / `diff`）には一切現れない。`oas_boundary_` 接頭辞は境界マーカー予約のため、seed 本文・固定セグメント本文・dict vars のキーで使用できない（使用すると slot 構築時に専用メッセージで `OptimizeError(CONFIG_MISSING)`）。
 
 ## パラメータ一覧
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
@@ -66,6 +114,7 @@ print(result.diff)                     # seed vs prompt の unified diff
 | `tool_mocks` | `dict[str, dict[str, Any]] \| None` | `None` | rollout 副作用の安全化 |
 | `approvals` | `Callable[[dict], bool] \| None` | `None` | 承認自動解決 |
 | `apo_client` | `Any` | `None`（**APO 必須**） | `AsyncOpenAI` 互換クライアント |
+| `context_factory` | `Callable[[], Any] \| None` | `None` | rollout ごとに新鮮な実行時 context を生成する factory。`run_with_observation(context=...)` 経由で SDK `Runner.run(context=...)` へ素通しする（rollout 間で context を共有しない） |
 
 省略した追加 kwarg（`config` / `rounds` / `concurrency` / `timeout_seconds` / `store` / `apo_gradient_model` / `apo_apply_edit_model` / `apo_beam_width` / `apo_branch_factor` / `tracer`）は `OptimizeConfig` の各フィールドと同じ意味で、直接 kwargs か `config=OptimizeConfig(...)` の一方で渡す（同時指定は `CONFIG_MISSING`）。
 
@@ -99,7 +148,12 @@ print(result.diff)                     # seed vs prompt の unified diff
 
 ### `Slot`（frozen）
 
-`name` / `seed` / `build: Callable[[str], Any]` / `vars: dict[str, Any] = {}` / `fixed: str = ""`。
+`name` / `seed` / `build: Callable[[str], Any]` / `vars: dict[str, Any] = {}` / `fixed: str = ""` / `segments: tuple[SlotSegment, ...] = ()` / `vars_fn: Callable[[Any], dict[str, Any]] | None = None`。
+
+- `vars` は静的注入用の dict（既存契約不変）。`prompt_slot(vars=<dict>)` はここに入る。
+- `vars_fn` は `prompt_slot(vars=<callable>)` を渡したときの保持先。callable のとき `vars` は空 dict になり、既定 build が生成する動的 instructions が rollout ごとに `vars_fn(context)` を評価して注入する。
+- `segments` は `prompt_slot` / `prompt_slots` が自動設定する構成順の構造情報（`SlotSegment` 要素の列）で、rollout 合成と `OptimizeResult` の full 合成が同一 SSoT ヘルパで参照する。custom build・手書き `Slot` では空のまま「run_apo 返却をそのまま尊重する」経路を通る。
+- `SlotSegment`（frozen: `ref`（`base:main` 等の qualified 参照）/ `text`（`${var}` 保持の本文）/ `tune`（最適化対象フラグ））は内部構造で、公開契約（`__all__`）には含めない（利用者が手書きする対象ではない）。
 
 ### `OptimizeResult`（frozen）
 
@@ -119,9 +173,31 @@ print(result.diff)                     # seed vs prompt の unified diff
 - `approval_match(field="expected_approvals")`
 - `judge(rubric, model)` — 2 引数（rubric: str / model: Any）
 
-### `prompt_slot(store, registry=None, *, tune, base=None, parts=(), vars=None, build=None)`
+### `prompt_slot(store, registry=None, agent=None, *, base=None, parts=(), layout=None, tune=None, vars=None, build=None)`
 
-### `prompt_slots(store, registry, agents, *, base=None, parts=(), vars=None)`
+- `agent: str | None` — 最適化対象エージェント名（compose と同名同位置・`Slot.name` = registry の spec 解決名）。`agent` または `layout` のいずれかが必須。両方未指定は `OptimizeError(CONFIG_MISSING)`（詳細は ADR 0007）。
+- `base: str | None` / `parts: Sequence[str]` — compose と同じ構成指定。新 shape では `tune` の選択対象セグメントになる。
+- `layout: Sequence[str] | None` — compose と同一意味論の qualified 参照列。指定時は並びがそのまま構成順になり `agent` / `base` / `parts` の構成指定は無視され、`tune` の照合先は layout 列になる。
+- `tune: str | Sequence[str] | None` — 最適化対象セグメントのセレクタ。要素はセグメント名（base 名 / part 名 / agent 名）または qualified 参照（`base:main` / `part:style` / `agent:triage`）で照合する。`Sequence` は構成順（base -> parts -> agent）に連結し 1 候補テキストとして単一 APO ループで最適化する（列挙順は順序に使わない）。`agent` 指定時に省略すると agent セグメントのみを最適化する。
+- `vars: dict | Callable[[Any], dict] | None` — compose と同一型。dict は静的注入、callable は `Slot.vars_fn` に保持され rollout ごとに評価注入される（成果物は `${var}` 保持）。
+- `build: Callable[[str], AgentSpec] | None` — 候補テキストから `AgentSpec` を組む関数。省略時は既定 build（registry 登録 spec を複製し instructions を差し替え・vars=callable のとき動的 instructions 生成）。
+
+### `prompt_slots(store, registry, agents, *, base=None, parts=(), tune=None, vars=None)`
+
+- `agents: Sequence[str]` — 各名前を新 shape の `agent=` として slot を生成する（base / parts / vars は全 slot 共通）。
+- `tune: dict[str, str | Sequence[str]] | None` — agent 名ごとのセレクタ。`None` のときは各 slot で agent セグメントのみ最適化（従来動作）。`mapping` のキーが `agents` に含まれない場合は fail-closed。
+- `vars: dict | Callable[[Any], dict] | None` — 全 slot 共通（`prompt_slot` と同一型）。
+- `layout` は非対応（layout が必要なら `prompt_slot` を個別に呼ぶ）。
+
+fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
+
+- `tune` の `Sequence` が空 / 重複要素を含む（plain と qualified の表記違いで同一セグメントを指す場合を含む）/ 構成に存在しない名前を含む / plain 名が複数のセグメント名前空間に一致して一意に定まらない（FR-1）
+- `agent=None` かつ `layout=None`（`agent=` または `layout=` のいずれかが必須・詳細は ADR 0007・FR-1）
+- `vars` に callable を渡し、かつ `build=` を明示する（callable の評価は既定 build のみが担う・FR-3）
+- `oas_boundary_` 予約接頭辞が seed 本文・固定セグメント本文・dict vars のキーに現れる（境界マーカー予約・専用メッセージ）
+- `layout` が空 / 重複参照を含む / `agent=None` かつ layout 内の `agent:` 参照が 0 個または複数 / `layout` 指定 + `tune=None` かつ layout 内に agent セグメント不在（FR-4）
+
+既存経路のエラー型（registry 不在の `ValueError`・セグメント解決不能の `KeyError`）は後方互換のため型不変で伝搬する。
 
 ### `train_val_split(data, *, val_ratio=0.2, seed=0, shuffle=True)`
 

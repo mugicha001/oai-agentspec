@@ -12,6 +12,7 @@ ValueError・危険ツール非実行）・seed 経路（生 seed + rebind）・
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -127,7 +128,6 @@ def _calling_run_apo() -> Any:
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> OptimizeResult:
         candidate = dict(seeds)
@@ -361,7 +361,6 @@ async def test_direct_tracer_kwarg_flows_into_effective_config(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> OptimizeResult:
         captured["config"] = config
@@ -552,7 +551,6 @@ async def test_rollout_config_missing_propagates_unchanged(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         # train 先頭ケースで rollout を呼ぶ（内部で _apply_candidate が走る）。
@@ -849,7 +847,6 @@ async def test_approve_without_tool_mock_raises_and_halts(
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         await rollout(dict(seeds), list(train)[0])
@@ -1360,7 +1357,6 @@ async def test_var_loss_candidate_scores_zero(monkeypatch: pytest.MonkeyPatch) -
         val: Any,
         rollout: Any,
         config: Any,
-        fixed: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
         vars_per_slot: Any = None,  # noqa: ARG001 - run_apo の新パラメータに合わせる
     ) -> Any:
         # var を落とした候補（${role} 無し）で rollout する。
@@ -1752,3 +1748,729 @@ def test_normalize_workflow_graph_agent_node_mocks_via_clone() -> None:
     _agent, replaced = target_mod.normalize(wf, reg, tool_mocks={"worker": {"danger": "mock"}})
     # AGENT ノードが参照する registry agent のツールもクローン経由で mock 済み。
     assert replaced == frozenset({("worker", "danger")})
+
+
+# ----------------------------------------------------------------------
+# Issue #40 T7: 結果整形パス（新 shape slot の vars_per_slot 受け渡し・
+# run_apo 返却後の full 再合成 + diff 再計算）
+# ----------------------------------------------------------------------
+
+
+def _store_new_shape(tmp_path: Path) -> Any:
+    """新 shape（agent= 指定）テスト用ストア（agents/ ディレクトリにセグメントを配置）。"""
+    from oai_agentspec.prompts import PromptLayout, PromptStore
+
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "triage.md").write_text("Triage seed ${tone}", encoding="utf-8")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "main.md").write_text("BASE ${org}", encoding="utf-8")
+    parts_dir = tmp_path / "parts"
+    parts_dir.mkdir()
+    (parts_dir / "style.md").write_text("STYLE part", encoding="utf-8")
+    return PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
+
+
+async def test_optimize_new_shape_slot_passes_vars_per_slot_to_run_apo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """新 shape（segments 非空）の slot は run_apo へ `vars_per_slot` を渡し、固定セグメントの
+    full 再合成は optimizer の `_recompose_new_shape_results` が segments SoT から担う。"""
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    slot = prompt_slot(
+        store,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        captured["vars_per_slot"] = vars_per_slot
+        return OptimizeResult(prompt=seeds[next(iter(seeds))], train_score=0.0, val_score=0.0)
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    assert captured["vars_per_slot"]["triage"] == {"org": "AgentSpec"}
+
+
+async def test_optimize_custom_build_slot_result_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """custom build 経路（`Slot.segments = ()`）は run_apo の返却をそのまま `OptimizeResult` に
+    詰める（`_recompose_new_shape_results` の segments 空スキップ契約の regression guard）。
+
+    `_recompose_new_shape_results` の `if not slot.segments: continue` が silent regression した
+    場合、custom build 利用者の OptimizeResult.prompt が build 出力を無視して recompose された
+    文字列に書き換わるため、本テストが検知する。
+    """
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+
+    def _custom_build(candidate: str) -> AgentSpec:
+        return _spec(name="triage", instructions=candidate)
+
+    slot = prompt_slot(
+        store,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        vars={"org": "AgentSpec"},
+        build=_custom_build,
+    )
+    assert slot.segments == ()
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            prompt="RAW PROMPT", train_score=1.0, val_score=1.0, seed="RAW SEED", diff="RAW DIFF"
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    # segments 空 slot は再合成対象外・run_apo 返却がそのまま OptimizeResult に載る。
+    assert result.prompt == "RAW PROMPT"
+    assert result.seed == "RAW SEED"
+    assert result.diff == "RAW DIFF"
+
+
+async def test_optimize_vars_callable_slot_passes_empty_vars_per_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`vars=callable` の slot は `vars_per_slot` に空 dict を渡す（callable キーは最適化ループへ
+    非伝搬・論点 G）。"""
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    slot = prompt_slot(store, AgentRegistry(), agent="triage", vars=lambda ctx: {"org": ctx})
+
+    captured: dict[str, Any] = {}
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        captured["vars_per_slot"] = vars_per_slot
+        return OptimizeResult(prompt=seeds[next(iter(seeds))], train_score=0.0, val_score=0.0)
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    assert captured["vars_per_slot"]["triage"] == {}
+
+
+async def test_optimize_new_shape_result_prompt_is_full_composed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """新 shape slot は run_apo 返却後に `compose_from_marked` で full 再合成した `prompt` を返す
+    （固定セグメント本文を含み境界マーカーは含まない・論点 G）。"""
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    slot = prompt_slot(
+        store,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            prompt="OPTIMIZED TUNE TEXT",
+            train_score=1.0,
+            val_score=1.0,
+            seed=seeds["triage"],
+            diff="OLD_DIFF",
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    assert result.prompt == "BASE AgentSpec\n\nSTYLE part\n\nOPTIMIZED TUNE TEXT"
+    assert "oas_boundary" not in result.prompt
+
+
+async def test_optimize_new_shape_result_seed_is_full_composed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """新 shape slot は run_apo 返却後に `compose_from_marked` で full 再合成した `seed` を返す。"""
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    slot = prompt_slot(
+        store,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            prompt="OPTIMIZED TUNE TEXT",
+            train_score=1.0,
+            val_score=1.0,
+            seed=seeds["triage"],
+            diff="OLD_DIFF",
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    assert result.seed == "BASE AgentSpec\n\nSTYLE part\n\nTriage seed ${tone}"
+
+
+async def test_optimize_new_shape_result_diff_is_recomputed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """新 shape slot は run_apo が返す tune-only diff を破棄し、full 合成後の seed/prompt から
+    `difflib.unified_diff` で再計算した `diff` を返す（論点 G）。"""
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    slot = prompt_slot(
+        store,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            prompt="OPTIMIZED TUNE TEXT",
+            train_score=1.0,
+            val_score=1.0,
+            seed=seeds["triage"],
+            diff="OLD_DIFF",
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    assert "OLD_DIFF" not in result.diff
+    # SSoT ヘルパ `unified_diff_labeled` の統一ラベル（before / after）で再計算されている。
+    assert "--- before" in result.diff
+    assert "+++ after" in result.diff
+
+
+async def test_optimize_new_shape_multi_slot_dict_recompose_per_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """複数 slot（HandoffGraph + `prompt_slots`）で run_apo が dict 型 `OptimizeResult` を返す
+    経路の per-slot 再合成を検証する（`_recompose_new_shape_results` の isinstance(prompt, dict)
+    分岐の regression guard）。
+
+    全 slot について `result.prompt[name]` / `result.seed[name]` が固定セグメント込みの full
+    合成テキストになり、`result.diff[name]` が `unified_diff_labeled` の統一ラベルで再計算される
+    ことを固定する。将来 dict 分岐で 1 slot 分の合成しか反映されず他 slot が tune-only のまま
+    silent 通過する regression を検出する。
+    """
+    from oai_agentspec.prompts import PromptLayout, PromptStore
+    from oai_agentspec.runtime.lightning import prompt_slots
+
+    # 2 agent 用のローカルストア（_store_new_shape は triage のみのため）。
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "triage.md").write_text("Triage seed", encoding="utf-8")
+    (agents_dir / "second.md").write_text("Second seed", encoding="utf-8")
+    base_dir = tmp_path / "base"
+    base_dir.mkdir()
+    (base_dir / "main.md").write_text("BASE ${org}", encoding="utf-8")
+    store = PromptStore(tmp_path, PromptLayout(base="base", parts="parts", agents="agents"))
+
+    registry = AgentRegistry()
+    registry.register(_spec(name="triage"))
+    registry.register(_spec(name="second"))
+    graph = HandoffGraph(entry="triage")
+    graph.edge("triage", "second", description="次のエージェント")
+    graph.apply(registry)
+    registry.validate()
+
+    slots = prompt_slots(
+        store, registry, agents=["triage", "second"], base="main", vars={"org": "AgentSpec"}
+    )
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        # dict 型で複数 slot 分の tune-only テキストを返す（run_apo の複数 slot 契約）。
+        return OptimizeResult(
+            prompt={"triage": "TUNED_TRIAGE", "second": "TUNED_SECOND"},
+            seed={"triage": seeds["triage"], "second": seeds["second"]},
+            diff={"triage": "OLD_TRIAGE_DIFF", "second": "OLD_SECOND_DIFF"},
+            train_score=1.0,
+            val_score=1.0,
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        graph,
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slots,
+        registry=registry,
+        config=_apo_config(),
+    )
+    # dict 型が保持され、全 slot について base が prepend された full 合成になっている。
+    assert isinstance(result.prompt, dict)
+    assert isinstance(result.seed, dict)
+    assert isinstance(result.diff, dict)
+    for name, tuned in [("triage", "TUNED_TRIAGE"), ("second", "TUNED_SECOND")]:
+        assert result.prompt[name] == f"BASE AgentSpec\n\n{tuned}"
+        assert result.seed[name].startswith("BASE AgentSpec\n\n")
+        # 古い diff は破棄され、unified_diff_labeled の統一ラベルで再計算されている。
+        assert f"OLD_{name.upper()}_DIFF" not in result.diff[name]
+        assert "--- before" in result.diff[name]
+        assert "+++ after" in result.diff[name]
+
+
+async def test_optimize_new_shape_result_prompt_matches_rollout_build(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """rollout build の instructions と optimizer 結果整形の prompt が同一（SSoT drift 検出）。
+
+    新 shape の multi-tune slot で、rollout 経路（`slot.build(candidate).instructions`）と
+    optimizer 経路（`run_apo` 返却後の `compose_from_marked` 再合成 prompt）が同一 SSoT
+    （`compose_from_marked`）を通ることを固定する。両者がズレると
+    "OptimizeResult.prompt == rollout instructions" 契約が壊れる。
+    """
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    registry = AgentRegistry()
+    registry.register(_spec(name="triage"))
+    slot = prompt_slot(
+        store,
+        registry,
+        agent="triage",
+        base="main",
+        tune=["main", "triage"],
+        vars={"org": "AgentSpec", "tone": "formal"},
+    )
+    # 境界マーカー入り連結の具体的な candidate（`${var}` は温存）。
+    candidate = "OPTIMIZED_MAIN ${org}\n\n${oas_boundary_1}\n\nOPTIMIZED_TRIAGE ${tone}"
+
+    # rollout 経路: build が返す agent.instructions（compose_from_marked 経由）。
+    rollout_instructions = slot.build(candidate).instructions
+
+    async def _fake(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            prompt=candidate, seed=candidate, train_score=0.5, val_score=None, diff="dummy"
+        )
+
+    _patch_run_apo(monkeypatch, _fake)
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot,
+        config=_apo_config(),
+    )
+    # optimizer 経路の prompt が rollout build と一致（SSoT drift 検出）。
+    assert result.prompt == rollout_instructions
+
+
+# ----------------------------------------------------------------------
+# T10: `context_factory` の rollout ごとの新鮮な context 素通し（Issue #40 FR-2）
+# ----------------------------------------------------------------------
+
+
+async def test_optimize_with_context_factory_calls_factory_per_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`context_factory` は rollout ごとに呼ばれ、戻り値が `run_with_observation` の
+    `context=` へ素通しされる（rollout 間で同一オブジェクトを共有しない）。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from oai_agentspec.runtime.llmops import ObservedRoute, ObservedRun
+
+    _patch_run_apo(monkeypatch, _calling_run_apo())
+    observation = ObservedRun(route=ObservedRoute(steps=[], last_agent="bot"), tool_calls=[])
+    captured_contexts: list[Any] = []
+
+    async def _fake_run(
+        self: Any, agent: Any, value: Any, *, context: Any = None, **kwargs: Any
+    ) -> Any:
+        captured_contexts.append(context)
+        outcome = SimpleNamespace(
+            final_output="expected", interrupted=False, pending=[], state=None
+        )
+        return outcome, observation
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _fake_run,
+        raising=True,
+    )
+
+    factory = MagicMock(side_effect=lambda: object())
+
+    result = await optimize(
+        _spec(),
+        train=[
+            {"input": "hi", "expected": "expected"},
+            {"input": "yo", "expected": "expected"},
+        ],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        config=_apo_config(),
+        context_factory=factory,
+    )
+
+    # train(2) + val(1) = 3 rollouts → factory も 3 回呼ばれ、各回で別オブジェクトを渡す。
+    assert factory.call_count == 3
+    assert len(captured_contexts) == 3
+    assert len({id(c) for c in captured_contexts}) == 3
+    assert result.train_score == pytest.approx(1.0)
+
+
+async def test_optimize_without_context_factory_uses_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`context_factory` 未指定時は既存動作のまま `context=None` で `run_with_observation` を呼ぶ
+    （後方互換）。"""
+    from types import SimpleNamespace
+
+    from oai_agentspec.runtime.llmops import ObservedRoute, ObservedRun
+
+    _patch_run_apo(monkeypatch, _calling_run_apo())
+    observation = ObservedRun(route=ObservedRoute(steps=[], last_agent="bot"), tool_calls=[])
+    captured_contexts: list[Any] = []
+
+    async def _fake_run(
+        self: Any, agent: Any, value: Any, *, context: Any = None, **kwargs: Any
+    ) -> Any:
+        captured_contexts.append(context)
+        outcome = SimpleNamespace(
+            final_output="expected", interrupted=False, pending=[], state=None
+        )
+        return outcome, observation
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _fake_run,
+        raising=True,
+    )
+
+    result = await optimize(
+        _spec(),
+        train=[{"input": "hi", "expected": "expected"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        config=_apo_config(),
+        # context_factory を渡さない。
+    )
+
+    assert captured_contexts == [None, None]
+    assert result.train_score == pytest.approx(1.0)
+
+
+async def test_optimize_context_factory_reaches_dynamic_instructions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`context_factory` が生成した context が `vars=callable` の動的 instructions まで実際に
+    届く（SDK Runner 実行を経由・fake run_with_observation を挟まない）。"""
+    from types import SimpleNamespace
+
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    store = _store_new_shape(tmp_path)
+    registry = AgentRegistry()
+    registry.register(_spec(name="triage", output_text="expected"))
+
+    captured_contexts: list[Any] = []
+
+    def _vars_fn(ctx: Any) -> dict[str, Any]:
+        value = ctx.context.triage_result if ctx is not None and ctx.context else "none"
+        captured_contexts.append(value)
+        return {"tone": value, "org": "AgentSpec"}
+
+    slot = prompt_slot(store, registry, agent="triage", base="main", parts=["style"], vars=_vars_fn)
+
+    _patch_run_apo(monkeypatch, _calling_run_apo())
+
+    result = await optimize(
+        _spec(name="triage"),
+        train=[{"input": "hi", "expected": "expected"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        slot=slot,
+        config=_apo_config(),
+        context_factory=lambda: SimpleNamespace(triage_result="OK"),
+    )
+
+    assert "OK" in captured_contexts
+    assert result.train_score == pytest.approx(1.0)
+
+
+async def test_optimize_context_factory_not_recreated_within_resume_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """承認 resume ループ内では `context_factory` が再呼び出しされない（1 rollout = 1 回のみ・
+    SDK RunState 内包 context の再利用）。"""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from oai_agentspec.runtime.llmops import ObservedRoute, ObservedRun
+
+    _patch_run_apo(monkeypatch, _calling_run_apo())
+    observation = ObservedRun(route=ObservedRoute(steps=[], last_agent="bot"), tool_calls=[])
+
+    async def _interrupted(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        outcome = SimpleNamespace(
+            final_output=None,
+            interrupted=True,
+            pending=[{"tool_name": "danger", "call_id": "c1", "agent_name": "bot"}],
+            state=object(),
+        )
+        return outcome, observation
+
+    async def _resume(agent: Any, state: Any, **kwargs: Any) -> Any:
+        outcome = SimpleNamespace(
+            final_output="expected final", interrupted=False, pending=[], state=None
+        )
+        return outcome, observation
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _interrupted,
+        raising=True,
+    )
+    monkeypatch.setattr("oai_agentspec._adapters.resume_with_observation", _resume, raising=True)
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.apply_approvals",
+        lambda state, decisions: SimpleNamespace(
+            applied=[d["call_id"] for d in decisions], unknown=[], already_resolved=[]
+        ),
+        raising=True,
+    )
+
+    @function_tool(name_override="danger", needs_approval=True)
+    def _danger(x: str) -> str:
+        """承認必須ツール（テスト用）。"""
+        return f"real:{x}"
+
+    spec = AgentSpec(name="bot", instructions="i", model=FakeModel(), tools=[_danger])
+    factory = MagicMock(side_effect=lambda: SimpleNamespace())
+
+    result = await optimize(
+        spec,
+        train=[{"input": "hi", "expected": "expected"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        approvals=lambda p: True,
+        tool_mocks={"bot": {"danger": "mocked"}},
+        config=_apo_config(),
+        context_factory=factory,
+    )
+
+    # train + val = 2 rollout。各 rollout は承認 resume で 2 ラウンド実行されるが、
+    # context_factory は rollout 単位で 1 回のみ（resume では再生成しない）= 合計 2 回。
+    assert factory.call_count == 2
+    assert result.train_score == pytest.approx(1.0)
+
+
+# ----------------------------------------------------------------------
+# NFR-4: 複数セグメント指定は連結後の 1 候補として最適化するため、単一セグメント指定と比較して
+# APO の最適化ループ回数（run_apo 呼び出し回数）を増加させない
+# ----------------------------------------------------------------------
+
+
+async def test_optimize_new_shape_single_vs_multi_tune_matches_call_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """NFR-4: 複数セグメント指定（新 shape・tune=[複数]）は単一セグメント指定（新 shape・
+    agent= のみ）と同じ `run_apo` 呼び出し回数（= APO ループ数）で完了する。
+
+    複数セグメントは連結後の 1 候補テキスト（境界マーカー入り 1 本の seed）として `run_apo` へ
+    渡るため、セグメント数が増えても `run_apo` の呼び出し自体は常に 1 回（optimize 1 回につき
+    run_apo は 1 回しか呼ばれない設計）。単一 tune・複数 tune の双方で同じ回数（1 回）になる
+    ことを固定し、将来 `optimize` がセグメントごとにループを回す実装へ回帰した場合に検知する。
+    """
+    from oai_agentspec.runtime.lightning import prompt_slot
+
+    call_count = 0
+
+    async def _fake_run_apo(
+        *,
+        seeds: dict[str, str],
+        train: Any,
+        val: Any,
+        rollout: Any,
+        config: Any,
+        vars_per_slot: Any = None,
+    ) -> OptimizeResult:
+        nonlocal call_count
+        call_count += 1
+        name = next(iter(seeds))
+        return OptimizeResult(
+            prompt=seeds[name],
+            seed=seeds[name],
+            diff="",
+            train_score=0.0,
+            val_score=0.0,
+        )
+
+    _patch_run_apo(monkeypatch, _fake_run_apo)
+
+    same_config = _apo_config()
+
+    # 単一セグメント指定（新 shape・agent= のみ・segments=[agent:triage] の 1 tune）。
+    # ストアごとに別ディレクトリを使う（同一 tmp_path で複数 store を作ると衝突するため）。
+    single_root = tmp_path / "single"
+    single_root.mkdir()
+    store_single = _store_new_shape(single_root)
+    slot_single = prompt_slot(store_single, AgentRegistry(), agent="triage")
+    await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot_single,
+        config=same_config,
+    )
+    count_single = call_count
+
+    # 複数セグメント指定（新 shape・tune=[複数]・segments 非空）。同一 OptimizeConfig を再利用。
+    call_count = 0
+    multi_root = tmp_path / "multi"
+    multi_root.mkdir()
+    store_multi = _store_new_shape(multi_root)
+    slot_multi = prompt_slot(
+        store_multi,
+        AgentRegistry(),
+        agent="triage",
+        base="main",
+        tune=["main", "triage"],
+        vars={"org": "AgentSpec"},
+    )
+    await optimize(
+        _spec(name="triage"),
+        train=[{"input": "x"}],
+        val=_DEFAULT_VAL,
+        reward=contains("e"),
+        slot=slot_multi,
+        config=same_config,
+    )
+    count_multi = call_count
+
+    # NFR-4: 同一 OptimizeConfig（rounds / beam_width / branch_factor）で
+    # 単一・複数セグメント指定の run_apo 呼び出し回数（= APO ループ数）が一致する。
+    assert count_multi == count_single

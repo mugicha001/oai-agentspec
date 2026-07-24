@@ -31,7 +31,6 @@ agentlightning 未導入時は明示 ImportError + 案内（`_LIGHTNING_INSTALL_
 from __future__ import annotations
 
 import asyncio
-import difflib
 import logging
 import math
 import os
@@ -552,13 +551,29 @@ async def _run_apo_single_slot(
     # （契約: 「最適化済みテキストは `${var}` を保持する」）。ここで seed と同じ placeholder 集合
     # を満たさない最良候補は seed にフォールバックし、warnings で利用者へ知らせる（silent failure
     # を避ける）。
-    from ..runtime.lightning._placeholders import extract_placeholders
+    from ..runtime.lightning._placeholders import BOUNDARY_PREFIX, extract_placeholders
 
     placeholder_fallback = False
     seed_placeholders = extract_placeholders(seed_text)
     if seed_placeholders:
         best_placeholders = extract_placeholders(best_text)
-        missing = sorted(seed_placeholders - best_placeholders)
+        # 通常 placeholder は存在検査（set 差分）で欠落を検出する。予約接頭辞
+        # `oas_boundary_` を持つ境界マーカーは、slot 境界の再構成に出現順まで一致する
+        # 必要があるため、`boundary_intact`（順序込みの連番列比較）で判定する。存在検査
+        # のみでは best 側で count 一致・順序不整合の swap ケースを取りこぼし
+        # （`_recompose_new_shape_results` が silent continue して literal マーカーが
+        # OptimizeResult に漏出する契約穴）。C2 対応で `boundary_intact` に一本化する。
+        from ..runtime.lightning._placeholders import boundary_intact
+
+        if any(name.startswith(BOUNDARY_PREFIX) for name in seed_placeholders) and not (
+            boundary_intact(seed_text, best_text)
+        ):
+            boundary_mismatched = {
+                name for name in seed_placeholders if name.startswith(BOUNDARY_PREFIX)
+            }
+        else:
+            boundary_mismatched = set()
+        missing = sorted((seed_placeholders - best_placeholders) | boundary_mismatched)
         if missing:
             names = ", ".join(repr(n) for n in missing)
             warnings.warn(
@@ -606,57 +621,6 @@ async def _run_apo_single_slot(
     return best_text, history_entry
 
 
-def _compose_full(fixed: str, tune: str, vars_dict: dict[str, str] | None = None) -> str:
-    """`Slot.fixed`（base + parts）と tune を **rollout 実体**と同じ最終 instructions に合成する。
-
-    rollout 時の agent.instructions は `_default_build`（fixed 側 vars 再注入）+ `_reinject_vars`
-    （tune 側 vars 再注入）の合成結果のため、`OptimizeResult.prompt` / `seed` / `diff` を rollout
-    実体と一致させるには **fixed と tune の両方** に vars を再注入する必要がある（compose_with_vars
-    の build 用途は tune 側を温存する設計のため、ここでは追加で `substitute_braced(tune, vars)` を
-    適用する・Codex 第4 round 指摘）。`Template.safe_substitute` の bare `$var` 副作用を避けるため
-    braced (`${var}`) のみ置換する。
-
-    Args:
-        fixed: base / parts の合成済み固定部分（空文字なら合成なし）。
-        tune: APO 最適化対象 / 出力テキスト（候補プロンプト・`${var}` 保持）。
-        vars_dict: `Slot.vars`（`{name: value}`・`${var}` 再注入対象・None / 空は no-op）。
-
-    Returns:
-        合成済み full テキスト（rollout 実体と一致・`fixed + "\\n\\n" + tune` か `tune` 単体）。
-    """
-    from ..runtime.lightning._placeholders import compose_with_vars, substitute_braced
-
-    tune_substituted = substitute_braced(tune, vars_dict)
-    return compose_with_vars(fixed, tune_substituted, vars_dict)
-
-
-def _unified_diff(before: str, after: str) -> str:
-    """`before` / `after` の unified diff を 1 つの文字列として返す（差分なしは空文字）。
-
-    `OptimizeResult.diff` に詰める「どこが変わったか」のテキスト表現。stdlib `difflib.unified_diff`
-    を使い、`fromfile`/`tofile` を `before`/`after` に固定する。`splitlines()` で改行で分割し、
-    `lineterm=""` で連結時の余計な改行を防ぐ。
-
-    Args:
-        before: 最適化前テキスト（合成済み full）。
-        after: 最適化後テキスト（合成済み full）。
-
-    Returns:
-        unified diff 文字列（差分なしは空文字）。
-    """
-    if before == after:
-        return ""
-    return "\n".join(
-        difflib.unified_diff(
-            before.splitlines(),
-            after.splitlines(),
-            fromfile="before",
-            tofile="after",
-            lineterm="",
-        )
-    )
-
-
 async def run_apo(
     *,
     seeds: dict[str, str],
@@ -664,7 +628,6 @@ async def run_apo(
     val: Sequence[Any] | None,
     rollout: Callable[[dict[str, str], Any], Awaitable[float]],
     config: Any,
-    fixed: dict[str, str] | None = None,
     vars_per_slot: dict[str, dict[str, str]] | None = None,
 ) -> OptimizeResult:
     """APO 最適化ループを agent-lightning Trainer / APO へ委譲し plain 結果へ変換する（NFR-1）。
@@ -674,12 +637,11 @@ async def run_apo(
     最良候補で train / val を改めて rollout して合成スコアを再計算する（複数スロット時の合成効果を
     正しく反映）。
 
-    `fixed` を渡すと、各スロットの seed / 最適化済みテキストを `Slot.fixed`（base + parts の合成済み
-    固定部分）と連結して **rollout 時に agent が見るのと同じ合成済み full テキスト**を
-    `OptimizeResult.seed` / `OptimizeResult.prompt` に詰める。さらに before / after の unified diff
-    を `OptimizeResult.diff` に算出して詰める（複数パーツがあっても変更箇所が読みやすい）。生 seed +
-    rebind 経路や `prompt_slot` で base/parts 未指定 / custom build 経路では `fixed` 未指定 / 空で、
-    seed / prompt は tune そのものを返す。
+    seed / 最適化済みテキストに `vars_per_slot` を再注入し、before / after の unified diff を
+    `OptimizeResult.diff` に算出して詰める。新 shape slot の固定セグメントを含む full 再合成は
+    optimizer 側の `_recompose_new_shape_results` が `Slot.segments` を SoT に組み直す（本関数は
+    tune 側の `${var}` 再注入のみ担う）。custom build / 生 seed + rebind 経路（segments 空）では
+    tune そのままが返る。
 
     Args:
         seeds: 最適化対象スロットの seed テキスト（`{名前: seed}`・`${var}` 保持・tune 部分のみ）。
@@ -690,12 +652,8 @@ async def run_apo(
             利用者 reward を内部実行する。
         config: 実行制御設定（`OptimizeConfig` 想定・`apo_client` 必須）。`apo_client` 未供給は
             呼び出し側 `optimizer` が `OptimizeError(CONFIG_MISSING)` へ倒す。
-        fixed: `{名前: Slot.fixed}` の mapping（合成済み base + parts・空文字 / 未指定で合成なし）。
-            None / 空 dict のときは seed / prompt は tune そのものになる。
         vars_per_slot: `{名前: Slot.vars}` の mapping（`${var}` 再注入対象・None / 空は no-op）。
-            `Slot.fixed` 側に対しては `_default_build` と同じ規則で `substitute_braced`
-            （braced `${name}` のみ）で再注入する。`OptimizeResult.prompt` / `seed` を rollout 実体
-            と一致させるため、tune 側にも同じ `substitute_braced` を適用する（`_compose_full`）。
+            `substitute_braced`（braced `${name}` のみ・bare `$var` は非対象）で tune 側に注入する。
 
     Returns:
         plain `OptimizeResult`（合成済み full の seed / prompt・unified diff・train / val スコア
@@ -726,18 +684,21 @@ async def run_apo(
     train_score = await _score_candidate(current, train, rollout)
     val_score = await _score_candidate(current, val or [], rollout) if val else None
 
-    # 合成済み full テキスト（rollout 時の agent.instructions と同じ規則）と diff を組む。
-    fixed_map = dict(fixed or {})
+    # tune 側 `${var}` を rollout 実体と同じ規則で再注入する（固定セグメントは新 shape の
+    # `_recompose_new_shape_results` が `Slot.segments` から compose_from_marked で組み直す・
+    # custom build / 生 seed 経路は再注入なしで返す）。braced (`${var}`) のみ置換で bare `$var`
+    # 副作用を避ける。
+    from ..runtime.lightning._placeholders import substitute_braced, unified_diff_labeled
+
     vars_map = dict(vars_per_slot or {})
-    composed_seeds = {
-        name: _compose_full(fixed_map.get(name, ""), seeds[name], vars_map.get(name))
-        for name in seeds
-    }
+    composed_seeds = {name: substitute_braced(seeds[name], vars_map.get(name)) for name in seeds}
     composed_prompts = {
-        name: _compose_full(fixed_map.get(name, ""), current[name], vars_map.get(name))
-        for name in current
+        name: substitute_braced(current[name], vars_map.get(name)) for name in current
     }
-    diffs = {name: _unified_diff(composed_seeds[name], composed_prompts[name]) for name in current}
+
+    diffs = {
+        name: unified_diff_labeled(composed_seeds[name], composed_prompts[name]) for name in current
+    }
 
     prompt: str | dict[str, str]
     seed_out: str | dict[str, str]
