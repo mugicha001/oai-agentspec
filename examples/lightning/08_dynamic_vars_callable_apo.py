@@ -23,8 +23,11 @@ Issue #40 FR-2 (`context_factory`) / FR-3 (`vars=callable`) の end-to-end 動�
   factory が固定値をセットしているため `routed_from='triage'` の初期値がそのまま planner で
   読まれる）
 - APO は planner / advisor のプロンプトのみ最適化する（triage 側は登録 spec のまま固定）
-- Slot は per-agent 構成（個別 `prompt_slot`）で組み立てる。共通 base/parts がないため
-  `prompt_slots` の一括生成は使わない
+- Slot は planner / advisor で role 別 `parts` を差し込むため（planner: `planning_focus` /
+  advisor: `advisory_focus`）、`prompt_slot_factory` で共通既定値（`store` / `registry` /
+  `vars=callable`）を束ね、per-agent の `parts` だけ差し替える。共通 `vars=callable` は
+  factory の defaults で 1 度だけ書き、`make_slot("planner", parts=[...])` /
+  `make_slot("advisor", parts=[...])` の 2 行で slot 列を作る
 - **`OptimizeResult.diff` は本例では通常空**（単一 slot・短い期待出力・capable LLM の組み合わせで
   reward の S/N が低く、APO 候補は生成されるものの beam 選抜で seed に落ちる）。`${var}` 保持
   や context 注入の動線確認が本例の目的で、安定した diff を見たい場合は 07
@@ -49,7 +52,7 @@ from oai_agentspec.runtime.lightning import (
     OptimizeCase,
     contains,
     optimize,
-    prompt_slot,
+    prompt_slot_factory,
     train_val_split,
 )
 
@@ -80,14 +83,20 @@ TRIAGE_SEED = (
 )
 PLANNER_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
 ADVISOR_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
+# per-agent parts。planner は手続き用の観点、advisor は案内・情報提供用の観点を差し込む。
+PLANNING_FOCUS_PART = "実行に必要な手続き（対象・期日・確認事項）を1つずつ整理してください。"
+ADVISORY_FOCUS_PART = "選択肢と判断材料を並列に示し、ユーザーの意思決定を助けてください。"
 
 
 def _make_store(root: Path) -> PromptStore:
-    """本例専用の一時 `PromptStore` を組む（agents/ 配下に 3 テンプレート）。"""
+    """本例専用の一時 `PromptStore` を組む（agents/ に 3 テンプレート・parts/ に 2 セグメント）。"""
     (root / "agents").mkdir()
     (root / "agents" / "triage.md").write_text(TRIAGE_SEED, encoding="utf-8")
     (root / "agents" / "planner.md").write_text(PLANNER_SEED, encoding="utf-8")
     (root / "agents" / "advisor.md").write_text(ADVISOR_SEED, encoding="utf-8")
+    (root / "parts").mkdir()
+    (root / "parts" / "planning_focus.md").write_text(PLANNING_FOCUS_PART, encoding="utf-8")
+    (root / "parts" / "advisory_focus.md").write_text(ADVISORY_FOCUS_PART, encoding="utf-8")
     return PromptStore(root, PromptLayout(base="base", parts="parts", agents="agents"))
 
 
@@ -118,10 +127,15 @@ async def main() -> None:
                 "routed_from": ctx.context.routed_from,  # type: ignore[attr-defined]
             }
 
-        slots = {
-            "planner": prompt_slot(store, registry, agent="planner", vars=_dyn_vars),
-            "advisor": prompt_slot(store, registry, agent="advisor", vars=_dyn_vars),
-        }
+        # planner / advisor は role 別 `parts` を差し込むため per-agent 差分あり。
+        # `prompt_slot_factory` で共通既定値（`store` / `registry` / `vars=callable`）を束ね、
+        # 差分だけ `make_slot()` の kwarg として上書きする。`optimize(slot=)` は Slot 列を
+        # `Slot.name` をキーとする mapping へ正規化する。
+        make_slot = prompt_slot_factory(store, registry, vars=_dyn_vars)
+        slots = [
+            make_slot("planner", parts=["planning_focus"]),
+            make_slot("advisor", parts=["advisory_focus"]),
+        ]
 
         data = [
             OptimizeCase(input="請求書のPDFが欲しい", expected_output="請求"),
