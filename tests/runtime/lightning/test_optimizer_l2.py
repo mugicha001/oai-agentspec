@@ -1449,6 +1449,56 @@ def test_normalize_slots_empty_dict_raises_config_missing() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "make_iter",
+    [
+        lambda a, b: [a, b],
+        lambda a, b: (a, b),
+        lambda a, b: (s for s in [a, b]),
+    ],
+    ids=["list", "tuple", "generator"],
+)
+def test_normalize_slots_iterable_returns_name_keyed_mapping(make_iter) -> None:
+    """`Iterable[Slot]`（list / tuple / generator）は `{Slot.name: Slot}` へ正規化する。"""
+    a = Slot(name="a", seed="sa", build=lambda c: c)
+    b = Slot(name="b", seed="sb", build=lambda c: c)
+    result = _normalize_slots(object(), make_iter(a, b))
+    assert result == {"a": a, "b": b}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "build_slot_arg",
+    [
+        lambda: [],
+        lambda: [
+            Slot(name="dup", seed="1", build=lambda c: c),
+            Slot(name="dup", seed="2", build=lambda c: c),
+        ],
+        lambda: [Slot(name="a", seed="s", build=lambda c: c), "raw seed"],
+    ],
+    ids=["empty", "duplicate-name", "mixed-with-str"],
+)
+def test_normalize_slots_iterable_invalid_fails_closed(build_slot_arg) -> None:
+    """列経路の空列・name 重複・非 Slot 混在は CONFIG_MISSING で fail-closed。"""
+    with pytest.raises(OptimizeError) as exc:
+        _normalize_slots(object(), build_slot_arg())
+    assert exc.value.kind == FailureKind.CONFIG_MISSING
+
+
+@pytest.mark.unit
+def test_normalize_slots_iterable_agentspec_name_mismatch_fails_closed() -> None:
+    """target=AgentSpec + 列 は `_ensure_slot_target_name_match` が列経路にも適用される
+    （dict 経路同等）。
+    """
+    target = AgentSpec(name="A", instructions="orig", model=FakeModel())
+    other = Slot(name="B", seed="s", build=lambda c: c)
+    with pytest.raises(OptimizeError) as exc:
+        _normalize_slots(target, [other])
+    assert exc.value.kind == FailureKind.CONFIG_MISSING
+
+
+@pytest.mark.unit
 def test_extract_case_input_from_dict() -> None:
     """dict ケースからは `case["input"]` を取り出す。"""
     assert _extract_case_input({"input": "hi", "expected": "x"}) == "hi"

@@ -2,7 +2,8 @@
 
 `optimize`（最適化エントリ・APO）・結果型 / スロット型（`OptimizeResult` / `Slot`）・設定型
 （`OptimizeConfig`）・reward ファクトリ（`contains` / `exact` / `tool_match` / `judge`）・
-`prompt_slot` / `prompt_slots`・`train_val_split` を再エクスポートする。重い依存
+`prompt_slot` / `prompt_slots` / `prompt_slot_factory`・`train_val_split` を再エクスポートする。
+重い依存
 （`agentlightning`）はトップ import せず `optimizer` / `rewards` / `_adapters/lightning` の関数内
 遅延 import に閉じる。よって `from oai_agentspec.runtime.lightning import optimize` は extra
 未導入でも壊れず、実際の最適化実行 / judge 採点時に初めて必要 extra を案内する（FR-7 / NFR-2）。
@@ -26,7 +27,7 @@ from .rewards import (
     route_match,
     tool_match,
 )
-from .slots import prompt_slot, prompt_slots
+from .slots import prompt_slot, prompt_slot_factory, prompt_slots
 from .types import (
     FailureKind,
     OptimizeError,
@@ -59,6 +60,7 @@ __all__ = [
     # スロットヘルパ
     "prompt_slot",
     "prompt_slots",
+    "prompt_slot_factory",
     # データ分割
     "train_val_split",
 ]

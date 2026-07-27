@@ -1,4 +1,5 @@
-"""APO の使いやすさヘルパ（`prompt_slot` / `prompt_slots`・seed 取得 + 既定 build 内包）。
+"""APO の使いやすさヘルパ（`prompt_slot` / `prompt_slots` / `prompt_slot_factory`・seed 取得 +
+既定 build 内包）。
 
 `prompt_slot` は `PromptStore` の公開メソッド（`get` / `compose`）を**読み取るのみ**で seed
 （vars 未展開・`${var}` 保持）と固定部分（base / parts）を取得し、候補テキストから `AgentSpec` を
@@ -717,3 +718,58 @@ def prompt_slots(
         )
         for name in agents
     }
+
+
+def _merge_slot_kwargs(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """`prompt_slot_factory` の defaults / overrides を合成する（vars 双方 dict のみマージ）。
+
+    per-agent 上書きの意味論を最小限に定義する。基本方針は「overrides で置換」であり、
+    `vars` のみ双方が dict のときにマージする（同一キーは per-agent 優先・新しい dict を作る
+    ため defaults 側は非破壊）。`None` を「未指定」として除去するフィルタは入れない
+    （`base=None` / `vars=None` による共通指定の打ち消しを成立させるため）。callable が絡む
+    組み合わせ（dict + callable / callable + dict / callable + callable）はマージせず
+    置換（callable の合成意味論を `prompt_slot` に持たせないため）。
+
+    Args:
+        defaults: `prompt_slot_factory` の共通既定値。
+        overrides: `make()` 呼び出しごとの per-agent 上書き。
+
+    Returns:
+        合成済み kwargs（`prompt_slot` に素通しできる形）。
+    """
+    merged = {**defaults, **overrides}
+    default_vars, override_vars = defaults.get("vars"), overrides.get("vars")
+    if isinstance(default_vars, dict) and isinstance(override_vars, dict):
+        merged["vars"] = {**default_vars, **override_vars}
+    return merged
+
+
+def prompt_slot_factory(
+    store: PromptStore,
+    registry: AgentRegistry | None = None,
+    **defaults: Any,
+) -> Callable[..., Slot]:
+    """共通既定値を束ね、agent ごとの差分だけで `Slot` を作る callable を返す。
+
+    per-agent 差分（`base` / `parts` / `layout` / `tune` / `vars` / `build`）を本物の kwargs で
+    受けるため、キー名の typo・`agent` の二重指定は Python が `TypeError` で弾く。許可キーリスト /
+    `Mapping` 型検査 / 内側値の型契約 / 未指定時のフォールバック規約は設けない。返り値 callable の
+    シグネチャは `make(agent: str, **overrides) -> Slot` で、`prompt_slot` の全 kwarg を素通す。
+    `vars` のみ defaults / overrides の双方が dict のときにマージし、それ以外の kwarg は置換とする
+    （合成規則の詳細は `_merge_slot_kwargs`・ADR 0008）。
+
+    Args:
+        store: プロンプトストア（読み取り専用・`prompt_slot` へ素通し）。
+        registry: 既定 build の spec 解決元（`prompt_slot` へ素通し・`build=` 明示時は不要）。
+        **defaults: 共通既定値（`prompt_slot` の全 kwarg 名を許可・検査なし）。
+
+    Returns:
+        `make(agent: str, **overrides) -> Slot` の callable。呼び出しごとに defaults と overrides を
+        合成して `prompt_slot(store, registry, agent=agent, **合成 kwargs)` を呼ぶ。
+    """
+
+    def make(agent: str, **overrides: Any) -> Slot:
+        merged = _merge_slot_kwargs(defaults, overrides)
+        return prompt_slot(store, registry, agent=agent, **merged)
+
+    return make

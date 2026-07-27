@@ -38,7 +38,7 @@ from ._slots_norm import (
 from .types import FailureKind, OptimizeError, OptimizeResult, RolloutResult, Slot
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Sequence
 
     from ...registry import AgentRegistry
     from .config import OptimizeConfig
@@ -70,7 +70,7 @@ async def optimize(
     val: Sequence[Any] | None = None,
     reward: Callable[[RolloutResult], float | Awaitable[float]],
     registry: AgentRegistry | None = None,
-    slot: Slot | str | dict[str, Slot | str] | None = None,
+    slot: Slot | str | Iterable[Slot] | dict[str, Slot | str] | None = None,
     rebind: Callable[[Any], Any] | None = None,
     tool_mocks: dict[str, dict[str, Any]] | None = None,
     approvals: Callable[[dict], bool] | None = None,
@@ -114,8 +114,11 @@ async def optimize(
         reward: rollout の plain な観測（`RolloutResult`）から報酬を返す callable（同期 / async）。
         registry: 横断対象 / 既定 build の specs 供給経路（HandoffGraph 必須・既定 build の解決
             元）。
-        slot: APO の最適化対象スロット（`Slot` / 生 seed str / `{名前: Slot | str}` mapping）。
-            None で target が静的 `AgentSpec` のときのみ既定スロット（instructions 文字列）を使う。
+        slot: APO の最適化対象スロット（`Slot` / 生 seed str / `Iterable[Slot]` の列 /
+            `{名前: Slot | str}` mapping）。列経路（`prompt_slot_factory` の返す `make()` を並べる
+            等）は `Slot.name` をキーとする mapping へ正規化される（空 / name 重複 / 非 Slot 混在は
+            `OptimizeError(CONFIG_MISSING)`・列は自動 rebind 専用）。None で target が静的
+            `AgentSpec` のときのみ既定スロット（instructions 文字列）を使う。
         rebind: 生 seed 経路で候補から宣言物を組み直す関数（`Slot` 利用時は build から自動導出
             のため不要）。
         tool_mocks: agent スコープのモック dict（rollout 副作用の安全化・llmops 経路を再利用）。
