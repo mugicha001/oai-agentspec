@@ -1283,6 +1283,68 @@ def test_slot_factory_vars_callable_passthrough(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "key,defaults",
+    [
+        ("parts", {"parts": ["style"]}),
+        ("layout", {"layout": ["agent:bot"]}),
+    ],
+)
+def test_slot_factory_defaults_containers_are_not_shared(
+    tmp_path: Path, key: str, defaults: dict[str, list[str]]
+) -> None:
+    """defaults の `parts` / `layout` の list を factory 生成後に変更しても、既に生成済みの
+    `Slot.segments` には反映されない（Issue #46 #1・defaults 参照共有 pin）。
+
+    `prompt_slot` は `layout=` 指定時に `agent`/`base`/`parts` を無視するため、
+    parts と layout は独立した defaults で pin する必要がある。真に警戒すべきは
+    「factory を保持したまま defaults を書き換え → 2 回目の factory() で MUTATED が
+    漏れる」経路のため、生成済み Slot と mutation 後の再生成 Slot の両方を検査する。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), **defaults)
+    slot_before = factory("bot")
+    defaults[key].append("MUTATED")
+    slot_after = factory("bot")
+    assert "MUTATED" not in [seg.ref for seg in slot_before.segments]
+    assert "MUTATED" not in [seg.ref for seg in slot_after.segments]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"k": "v"}, lambda ctx: {"k": "v"}],
+    ids=["dict-override", "callable-override"],
+)
+def test_slot_factory_vars_callable_defaults_replaced_by_override(
+    tmp_path: Path, override: object
+) -> None:
+    """defaults=callable の `vars` に override（dict / callable のいずれか）を渡すと、
+    callable 側のマージ意味論を持たず「置換」される（Issue #46 #2・vars callable マージ経路 pin）。
+
+    `vars_fn is not None` だけでは defaults 側 callable が残っても満たされるため、実際に
+    `vars_fn(ctx)` を評価して override 側の結果のみが返り defaults 側キー（`"base"`）が
+    含まれないことを検証する。
+    """
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), vars=lambda ctx: {"base": "b"})
+    slot = factory("bot", vars=override)
+    if callable(override):
+        assert slot.vars_fn is not None
+        assert slot.vars == {}
+        resolved = slot.vars_fn(None)
+        assert resolved == {"k": "v"}
+        assert "base" not in resolved
+    else:
+        assert slot.vars == override
+        assert slot.vars_fn is None
+
+
+def test_slot_factory_passes_tune_kwarg(tmp_path: Path) -> None:
+    """`tune=` が factory 経由でも `prompt_slot` にそのまま伝わり、対象セグメントのみ
+    `tune=True` になる（Issue #46 #3・tune 素通し pin）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), base="main", parts=["style"])
+    slot = factory("bot", tune=["main"], vars={"role": "assistant"})
+    tuned = {seg.ref: seg.tune for seg in slot.segments}
+    assert tuned == {"base:main": True, "part:style": False, "agent:bot": False}
+
+
+@pytest.mark.parametrize(
     "bad_defaults",
     [
         {"agent": "conflict"},  # agent の二重指定

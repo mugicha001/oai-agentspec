@@ -744,6 +744,24 @@ def _merge_slot_kwargs(defaults: dict[str, Any], overrides: dict[str, Any]) -> d
     return merged
 
 
+def _snapshot_defaults(defaults: dict[str, Any]) -> dict[str, Any]:
+    """`prompt_slot_factory` 構築時に defaults の可変コンテナを浅く複製する。
+
+    呼び出し元が factory 生成後に元 dict / list / dict-vars を mutate しても、
+    以降の `make()` 呼び出しに漏れないよう独立コピーを保持する。callable の `vars` は
+    そのまま素通す（置換意味論のため）。
+    """
+    snapshot: dict[str, Any] = {}
+    for key, value in defaults.items():
+        if key in ("parts", "layout") and isinstance(value, list):
+            snapshot[key] = list(value)
+        elif key == "vars" and isinstance(value, dict):
+            snapshot[key] = dict(value)
+        else:
+            snapshot[key] = value
+    return snapshot
+
+
 def prompt_slot_factory(
     store: PromptStore,
     registry: AgentRegistry | None = None,
@@ -768,8 +786,10 @@ def prompt_slot_factory(
         合成して `prompt_slot(store, registry, agent=agent, **合成 kwargs)` を呼ぶ。
     """
 
+    snapshot = _snapshot_defaults(defaults)
+
     def make(agent: str, **overrides: Any) -> Slot:
-        merged = _merge_slot_kwargs(defaults, overrides)
+        merged = _merge_slot_kwargs(snapshot, overrides)
         return prompt_slot(store, registry, agent=agent, **merged)
 
     return make

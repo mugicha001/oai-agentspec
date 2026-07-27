@@ -1498,6 +1498,62 @@ def test_normalize_slots_iterable_agentspec_name_mismatch_fails_closed() -> None
     assert exc.value.kind == FailureKind.CONFIG_MISSING
 
 
+async def test_optimize_consumes_slot_generator_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`slot=` に消費済み Iterable（generator）を渡しても、`_normalize_slots` -> `_seeds_of` の
+    2 段階呼び出しで再走査されず `optimize()` が正常完結する（Issue #46 #4・generator e2e pin）。
+
+    train_score だけでは「二重消費が偶然許容される fake 経路」を検出できないため、
+    `__iter__` が 1 度しか呼ばれないことを wrapper で直接観測する。
+    """
+    _patch_run_apo(monkeypatch, _calling_run_apo())
+
+    registry = AgentRegistry()
+    registry.register(_spec(name="triage", output_text="the expected answer"))
+    registry.register(_spec(name="second", output_text="the expected answer"))
+    graph = HandoffGraph(entry="triage")
+    graph.edge("triage", "second", description="次のエージェント")
+    graph.apply(registry)
+    registry.validate()
+
+    slot_a = Slot(
+        name="triage",
+        seed="triage seed",
+        build=lambda _c: _spec(name="triage", output_text="the expected answer"),
+    )
+    slot_b = Slot(
+        name="second",
+        seed="second seed",
+        build=lambda _c: _spec(name="second", output_text="the expected answer"),
+    )
+
+    class _ConsumeOnceIterable:
+        """`__iter__` 呼び出し回数を数える wrapper（2 回目以降で pin 失敗）。"""
+
+        def __init__(self, items: list[Slot]) -> None:
+            self._items = items
+            self.iter_count = 0
+
+        def __iter__(self):
+            self.iter_count += 1
+            return iter(self._items)
+
+    wrapper = _ConsumeOnceIterable([slot_a, slot_b])
+
+    result = await optimize(
+        graph,
+        train=[{"input": "hi", "expected": "expected"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        slot=wrapper,
+        registry=registry,
+        config=_apo_config(),
+    )
+    assert result.train_score == pytest.approx(1.0)
+    assert wrapper.iter_count == 1
+
+
 @pytest.mark.unit
 def test_extract_case_input_from_dict() -> None:
     """dict ケースからは `case["input"]` を取り出す。"""
