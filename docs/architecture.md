@@ -1355,7 +1355,7 @@ extra 未導入契約・SDK 隔離方針に従う。プロンプト最適化（A
 公開窓口は `oai_agentspec.runtime.lightning` の `__init__.py` に集約し、最適化エントリ（`optimize`）・結果型
 （`OptimizeResult`・`save(path)` / `to_dict()`）・設定型・reward ファクトリ（`contains` / `exact` / `tool_match` /
 `route_match` / `last_agent_match` / `approval_match` / `judge`）・`prompt_slot` / `prompt_slots` /
-`train_val_split` はここから参照する。コア `__all__` には載せない
+`prompt_slot_factory` / `train_val_split` はここから参照する。コア `__all__` には載せない
 （extra 未導入耐性・単方向依存の規約は既存節「会話 Helper（ローカル開発支援）」「LLMOps 評価」の方針に従い再掲
 しない）。コア（registry / prompts / workflow）の挙動は変更せず、宣言物・`PromptStore` は読み取り / 複製経由で
 参照する（依存方向は `runtime/lightning` からコア / `_adapters` への一方向）。
@@ -1371,7 +1371,9 @@ extra 未導入契約・SDK 隔離方針に従う。プロンプト最適化（A
 - **APO（`algorithm="apo"`・`[lightning]` のみで完結）**: 最適化対象は利用者指定のプロンプトスロット（vars 未展開
   のテンプレート文言・`${var}` プレースホルダ保持）+ rebind モデル。vars 値は最適化対象外（不変・確定）で、各
   rollout 時に再注入し、候補生成に含めない。候補が必要な `${var}` を失えば無効化 / 低評価に倒す（fail-closed）。
-  単一スロットに加え `{名前: slot}` の mapping で系全体のプロンプトを同時最適化する。`prompt_slot` / `prompt_slots`
+  単一スロットに加え `{名前: slot}` の mapping で系全体のプロンプトを同時最適化する。`optimize(slot=)` は `Slot` 単体 /
+  `{名前: Slot}` mapping / `Slot` の iterable を受理し、iterable は `Slot.name` をキーとする mapping へ正規化する
+  （空 / `Slot.name` の重複 / 非 `Slot` の混在は fail-closed）。`prompt_slot` / `prompt_slots`
   は `PromptStore` の公開 `compose` / `get` を読み取り seed と固定部分を再合成し、`build`（候補テキスト →
   `AgentSpec`）を内包するため rebind を自動導出する（利用者は手書き rebind 不要・生 seed のパワーユーザー経路でのみ
   明示）。`build` 省略時の既定 build は registry 登録 `AgentSpec` を複製し `instructions` のみ候補で差し替える
