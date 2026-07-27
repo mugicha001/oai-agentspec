@@ -1283,6 +1283,57 @@ def test_slot_factory_vars_callable_passthrough(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "key,defaults",
+    [
+        ("parts", {"parts": ["style"]}),
+        ("layout", {"layout": ["agent:bot"]}),
+    ],
+)
+def test_slot_factory_defaults_containers_are_not_shared(
+    tmp_path: Path, key: str, defaults: dict[str, list[str]]
+) -> None:
+    """defaults の `parts` / `layout` の list を factory 生成後に変更しても、既に生成済みの
+    `Slot.segments` には反映されない（Issue #46 #1・defaults 参照共有 pin）。
+
+    `prompt_slot` は `layout=` 指定時に `agent`/`base`/`parts` を無視するため、
+    parts と layout は独立した defaults で pin する必要がある。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), **defaults)
+    slot_before = factory("bot")
+    defaults[key].append("MUTATED")
+    assert "MUTATED" not in [seg.ref for seg in slot_before.segments]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"k": "v"}, lambda ctx: {"k": "v"}],
+    ids=["dict-override", "callable-override"],
+)
+def test_slot_factory_vars_callable_defaults_replaced_by_override(
+    tmp_path: Path, override: object
+) -> None:
+    """defaults=callable の `vars` に override（dict / callable のいずれか）を渡すと、
+    callable 側のマージ意味論を持たず「置換」される（Issue #46 #2・vars callable マージ経路 pin）。
+    """
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), vars=lambda ctx: {"base": "b"})
+    slot = factory("bot", vars=override)
+    if callable(override):
+        assert slot.vars_fn is not None
+        assert slot.vars == {}
+    else:
+        assert slot.vars == override
+        assert slot.vars_fn is None
+
+
+def test_slot_factory_passes_tune_kwarg(tmp_path: Path) -> None:
+    """`tune=` が factory 経由でも `prompt_slot` にそのまま伝わり、対象セグメントのみ
+    `tune=True` になる（Issue #46 #3・tune 素通し pin）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), base="main", parts=["style"])
+    slot = factory("bot", tune=["main"], vars={"role": "assistant"})
+    tuned = {seg.ref: seg.tune for seg in slot.segments}
+    assert tuned == {"base:main": True, "part:style": False, "agent:bot": False}
+
+
+@pytest.mark.parametrize(
     "bad_defaults",
     [
         {"agent": "conflict"},  # agent の二重指定
