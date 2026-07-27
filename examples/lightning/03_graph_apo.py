@@ -27,14 +27,14 @@ from oai_agentspec.runtime.lightning import (
     OptimizeCase,
     judge,
     optimize,
-    prompt_slots,
+    prompt_slot_factory,
     train_val_split,
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
 from _azure import azure_client, azure_model  # noqa: E402
 
-PROMPTS_AGENTS = Path(__file__).resolve().parent.parent / "prompts" / "agents"
+PROMPTS_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 LAYOUT = PromptLayout(base="base", parts="parts", agents="agents")
 
 
@@ -56,15 +56,21 @@ def build_registry(model: object) -> tuple[AgentRegistry, HandoffGraph]:
 async def main() -> None:
     model = azure_model()
     registry, graph = build_registry(model)
-    store = PromptStore(PROMPTS_AGENTS, LAYOUT)
+    store = PromptStore(PROMPTS_ROOT, LAYOUT)
 
-    # triage と billing のプロンプトのみ系全体で同時最適化する（support は固定）。tune 省略時は
-    # 各 slot で agent セグメントのみ最適化される（従来動作と同一）。エージェントごとに異なる
-    # セレクタを使いたい場合は `tune={"billing": ["main", "billing"]}` のように agent 名をキーと
-    # する dict を渡す（未指定 agent は tune=None に縮退・agents に無いキーは fail-closed）。
-    slots = prompt_slots(
-        store, registry, agents=["triage", "billing"], vars={"company": "AgentSpec Inc."}
+    # triage と billing のプロンプトのみ系全体で同時最適化する（support は固定）。
+    # per-agent で `parts` / `tune` が違うため `prompt_slot_factory` で共通既定値（`store` /
+    # `registry` / `base` / `vars`）を束ね、差分だけを `make_slot()` の kwarg として上書きする。
+    # 返り値の列は `optimize(slot=)` が `Slot.name` をキーとする mapping へ正規化する。
+    make_slot = prompt_slot_factory(
+        store, registry, base="main", vars={"company": "AgentSpec Inc."}
     )
+    slots = [
+        # triage は routing 指針を parts に足し、agent セグメントのみ最適化（tune 省略）。
+        make_slot("triage", parts=["style", "routing"]),
+        # billing は billing_rules を parts に足し、base 側も同時に最適化する（tune 明示）。
+        make_slot("billing", parts=["style", "billing_rules"], tune=["main", "billing"]),
+    ]
 
     data = [
         OptimizeCase(input="二重請求の返金をお願いしたいです"),

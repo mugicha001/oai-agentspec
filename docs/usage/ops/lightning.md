@@ -16,11 +16,12 @@
 | `judge(rubric, model)` | LLM-as-judge | 意味的品質 |
 | 複合 reward | 上記の重み付き合成（利用者側で組む） | 系全体の総合最適化 |
 | `prompt_slot` | 単一 spec の slot 抽出 | 単一 agent APO |
-| `prompt_slots` | 複数 spec 一括 | グラフ全体 APO |
+| `prompt_slots` | 複数 spec 一括 | グラフ全体 APO・全 agent 同一構成で per-agent 差分が `tune` だけ |
+| `prompt_slot_factory` | 共通既定値を束ねた slot 生成 callable | per-agent で `base` / `parts` / `vars` が違う、または `layout` / `build` が要る |
 
 ## 使い方
 
-- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slots, train_val_split)`
+- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slots, prompt_slot_factory, train_val_split)`
 - extras: `pip install oai-agentspec[lightning]`（`agentlightning[apo]`）
 - 依存 env: 学習に使う Model の env
 
@@ -91,6 +92,43 @@ slot = prompt_slot(
 
 `agent` を省略した場合、layout 内に `agent:X` 参照がちょうど 1 つあれば X が spec 解決名（`Slot.name`）になる（0 個または複数は `OptimizeError(CONFIG_MISSING)`）。`prompt_slots` は `layout` 非対応で、layout が必要なエージェントは `prompt_slot` を個別に呼んで slot mapping を組み立てる。
 
+### per-agent の差分だけを上書きする
+
+`prompt_slot_factory` は `store` / `registry` と共通既定値（`base` / `parts` / `vars` など `prompt_slot` の全 kwarg）を
+束ね、エージェントごとの差分だけを本物の kwargs で受け取る callable を返す。返り値の callable が返すのは `Slot` で、
+`optimize(slot=)` は `Slot` の列を受理して `Slot.name` をキーとする mapping へ正規化するため、エージェント名は
+1 度書けばよい。
+
+```python
+from oai_agentspec.runtime.lightning import optimize, prompt_slot_factory
+
+make_slot = prompt_slot_factory(
+    store, registry,
+    base="main", parts=["style"], vars={"org": "AgentSpec"},
+)
+
+result = await optimize(
+    graph,
+    slot=[
+        make_slot("triage",  tune=["main", "triage"]),
+        make_slot("billing", base="common", parts=["style", "billing_rules"],
+                             vars={"tone": "formal"}),     # org は自動マージ
+        make_slot("support", base=None),                   # 共通 base の打ち消し
+    ],
+    registry=registry,
+    train=train, val=val, reward=reward, apo_client=client,
+)
+```
+
+共通 `vars` と per-agent `vars` はマージされる（同一キーは per-agent 優先）。`vars` 以外の kwarg は置換で、`parts` は
+列全体の差し替えになる。マージ規則の詳細は `docs/adr/0008-lightning-per-agent-slot-factory.md` を参照。キー名の typo や
+`agent` の二重指定は委譲先 `prompt_slot` の呼び出しで `TypeError` になる。
+
+- `vars=None` / `vars={}` による共通 `vars` の打ち消しは、固定セグメント（base / parts / 非 tune の agent）に `${var}` が
+  残っていない場合に限り成立する（残っていると `_ensure_fixed_vars_present` が `OptimizeError(CONFIG_MISSING)` を送出する）。
+- ファクトリは常に `agent=` を渡すため、`layout` のみを指定して `agent:X` 参照から `Slot.name` を暗黙解決する経路は
+  使えない（必要なら `prompt_slot` を直接呼ぶ）。
+
 ### 境界マーカーについて
 
 複数セグメントを連結するとき、内部的に境界へ予約 braced placeholder（`${oas_boundary_N}`）を挟んで固定・最適化セグメントの再インターリーブ位置を保全する。マーカーは rollout 合成・`OptimizeResult` の full 合成で分割消費され、成果物（`prompt` / `seed` / `diff`）には一切現れない。`oas_boundary_` 接頭辞は境界マーカー予約のため、seed 本文・固定セグメント本文・dict vars のキーで使用できない（使用すると slot 構築時に専用メッセージで `OptimizeError(CONFIG_MISSING)`）。
@@ -109,7 +147,7 @@ slot = prompt_slot(
 | `val` | `Sequence[Any] \| None` | `None`（**必須**・空は CONFIG_MISSING） | 検証ケース |
 | `reward` | `Callable[[RolloutResult], float \| Awaitable[float]]` | 必須（kw_only） | 報酬算出 |
 | `registry` | `AgentRegistry \| None` | `None` | HandoffGraph 必須 |
-| `slot` | `Slot \| str \| dict[str, Slot \| str] \| None` | `None` | 最適化対象スロット |
+| `slot` | `Slot \| str \| Iterable[Slot] \| dict[str, Slot \| str] \| None` | `None` | 最適化対象スロット（`Slot` の列は `Slot.name` をキーとする mapping へ正規化する） |
 | `rebind` | `Callable[[Any], Any] \| None` | `None` | 生 seed 経路で必須 |
 | `tool_mocks` | `dict[str, dict[str, Any]] \| None` | `None` | rollout 副作用の安全化 |
 | `approvals` | `Callable[[dict], bool] \| None` | `None` | 承認自動解決 |
@@ -198,6 +236,18 @@ fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 - `layout` が空 / 重複参照を含む / `agent=None` かつ layout 内の `agent:` 参照が 0 個または複数 / `layout` 指定 + `tune=None` かつ layout 内に agent セグメント不在（FR-4）
 
 既存経路のエラー型（registry 不在の `ValueError`・セグメント解決不能の `KeyError`）は後方互換のため型不変で伝搬する。
+
+### `prompt_slot_factory(store, registry=None, **defaults)`
+
+- 返り値: `Callable[..., Slot]`。`make(agent, **overrides) -> Slot` として呼び、`agent` は位置引数 1 個。
+- `**defaults` — `prompt_slot` の全 kwarg（`base` / `parts` / `layout` / `tune` / `vars` / `build`）を共通既定値として
+  束ねる。許可キーは制限せず、`prompt_slot` にそのまま素通しする。
+- `**overrides` — エージェントごとの差分。`vars` は双方が dict のときマージされ（同一キーは per-agent 優先・既定側の
+  dict は非破壊）、それ以外の kwarg は置換になる。`base=None` / `parts=[]` / `tune=None` / `vars=None` は明示的な
+  打ち消しとして働く。
+- 未知キー（typo）や `defaults` への `agent` 混入は、ファクトリ生成時ではなく `make()` 呼び出し時に Python の
+  `TypeError` になる（ライブラリ側の許可キーリスト検査は持たない）。
+- ファクトリは常に `agent=` を渡すため、`layout` のみによる `Slot.name` の暗黙解決は使えない。
 
 ### `train_val_split(data, *, val_ratio=0.2, seed=0, shuffle=True)`
 

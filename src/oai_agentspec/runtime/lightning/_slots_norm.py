@@ -11,6 +11,7 @@ SDK / `agentlightning` を import せず、宣言層の `AgentSpec` のみを参
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from ._placeholders import extract_placeholders, substitute_braced
@@ -39,13 +40,15 @@ def _extract_case_input(case: Any) -> Any:
 
 
 def _normalize_slots(
-    target: Any, slot: Slot | str | dict[str, Slot | str] | None
+    target: Any, slot: Slot | str | Iterable[Slot] | dict[str, Slot | str] | None
 ) -> dict[str, Slot] | None:
     """`slot` 引数を `{名前: Slot}` か None（生 seed 経路）へ正規化する。
 
-    `Slot` / `{名前: Slot}` は `Slot` mapping へ、生 seed（str / `{名前: str}`）は None（rebind
-    必須）へ倒す。`slot=None` で target が静的 `AgentSpec`（instructions が str）のときは
-    instructions を seed とする既定 `Slot`（既定 build = instructions 差し替え）を 1 件生成する。
+    `Slot` / `{名前: Slot}` / `Iterable[Slot]` は `Slot` mapping へ、生 seed（str / `{名前: str}`）
+    は None（rebind 必須）へ倒す。`slot=None` で target が静的 `AgentSpec`（instructions が str）
+    のときは instructions を seed とする既定 `Slot`（既定 build = instructions 差し替え）を 1 件
+    生成する。`str` も `Iterable` だが生 seed 経路として先に判別するため、列（`list[Slot]` 等）
+    と混同しない。
 
     Args:
         target: 最適化対象（既定スロット導出に使う）。
@@ -55,9 +58,10 @@ def _normalize_slots(
         `{名前: Slot}` の mapping（自動 rebind 経路）、または None（生 seed = rebind 必須経路）。
 
     Raises:
-        OptimizeError: `slot` の dict に `Slot` と生 seed(str) が混在する場合、または `target` が
-            `AgentSpec` のときに `slot.name` が `target.name` と不一致の場合
-            （`FailureKind.CONFIG_MISSING`・fail-closed）。
+        OptimizeError: `slot` の dict に `Slot` と生 seed(str) が混在する場合、`slot` の列が空、
+            列に `Slot` 以外の要素が混在する場合、列内の `Slot.name` が重複する場合、または
+            `target` が `AgentSpec` のときに `slot.name`（列は各要素名）が `target.name` と
+            不一致の場合（`FailureKind.CONFIG_MISSING`・fail-closed）。
     """
     from ...spec import AgentSpec
 
@@ -114,12 +118,44 @@ def _normalize_slots(
             )
         return None
 
-    # 生 seed（str）は rebind 必須経路。
+    if isinstance(slot, str):
+        # 生 seed（str）は rebind 必須経路。`str` は `Iterable` でもあるため、以降の
+        # Iterable[Slot] 分岐より前に処理して silent な列解釈を防ぐ（ADR 0008）。
+        return None
+
+    if isinstance(slot, Iterable):
+        items = list(slot)
+        if not items:
+            raise OptimizeError(
+                FailureKind.CONFIG_MISSING,
+                "slot の列が空です（最適化対象スロットがありません）。"
+                "少なくとも 1 つの Slot を含めるか、"
+                "slot=prompt_slot(...) で単一スロットを渡してください",
+            )
+        if not all(isinstance(item, Slot) for item in items):
+            raise OptimizeError(
+                FailureKind.CONFIG_MISSING,
+                "slot の列に Slot 以外の要素が含まれます（列経路は自動 rebind 専用・"
+                "生 seed の列は不可）。全要素を Slot にするか、"
+                "生 seed の列は使わずに個別 rebind 経路を選んでください",
+            )
+        names = [item.name for item in items]
+        if len(set(names)) != len(names):
+            raise OptimizeError(
+                FailureKind.CONFIG_MISSING,
+                f"slot の列に Slot.name の重複があります: {names}。"
+                "各 Slot に一意な name を割り当ててください",
+            )
+        _ensure_slot_target_name_match(target, names)
+        return {item.name: item for item in items}
+
+    # 保険（防御的フォールバック）: 上記いずれの型にも該当しない場合。
     return None
 
 
 def _seeds_of(
-    slots: dict[str, Slot] | None, slot: Slot | str | dict[str, Slot | str] | None
+    slots: dict[str, Slot] | None,
+    slot: Slot | str | Iterable[Slot] | dict[str, Slot | str] | None,
 ) -> dict[str, str]:
     """最適化対象スロットの seed テキスト（`{名前: seed}`・`${var}` 保持）を導出する。
 

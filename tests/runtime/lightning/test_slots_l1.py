@@ -20,6 +20,7 @@ from oai_agentspec.runtime.lightning import (
     OptimizeError,
     Slot,
     prompt_slot,
+    prompt_slot_factory,
     prompt_slots,
 )
 
@@ -1180,3 +1181,118 @@ def test_prompt_slot_vars_dict_still_calls_fixed_vars_check(tmp_path: Path) -> N
             base="main",
         )
     assert exc.value.kind == FailureKind.CONFIG_MISSING
+
+
+# ----------------------------------------------------------------------
+# prompt_slot_factory: 共通既定値を束ねた per-agent Slot 生成（RED: Issue #41 T3・本テスト
+# 作成時点で未実装。実装は後段。）
+# ----------------------------------------------------------------------
+
+
+def test_slot_factory_applies_defaults(tmp_path: Path) -> None:
+    """既定値のみの生成が `prompt_slot(agent=...)` 直呼びと同一構造になる。"""
+    factory = prompt_slot_factory(
+        _store(tmp_path),
+        _registry(),
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+    slot = factory("bot")
+    assert slot.name == "bot"
+    assert [seg.ref for seg in slot.segments] == ["base:main", "part:style", "agent:bot"]
+
+
+def test_slot_factory_override_replaces_parts(tmp_path: Path) -> None:
+    """`parts` の上書きは追記でなく置換になる。"""
+    factory = prompt_slot_factory(
+        _store(tmp_path),
+        _registry(),
+        base="main",
+        parts=["style"],
+        vars={"org": "AgentSpec"},
+    )
+    slot = factory("bot", parts=[])
+    assert [seg.ref for seg in slot.segments] == ["base:main", "agent:bot"]
+
+
+def test_slot_factory_merges_vars(tmp_path: Path) -> None:
+    """`vars` は defaults と override が双方 dict のときのみマージされ、per-agent が優先する。"""
+    factory = prompt_slot_factory(
+        _store(tmp_path),
+        _registry(),
+        vars={"org": "AgentSpec", "tone": "casual"},
+    )
+    slot = factory("bot", vars={"tone": "formal", "extra": "z"})
+    assert slot.vars == {"org": "AgentSpec", "tone": "formal", "extra": "z"}
+
+
+def test_slot_factory_does_not_mutate_defaults(tmp_path: Path) -> None:
+    """同一ファクトリで 2 回 `make()` しても、defaults の `vars` に per-agent キーが混入しない。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), vars={"org": "shared"})
+    factory("bot", vars={"role": "assistant"})
+    slot2 = factory("triage", vars={"tone": "formal"})
+    assert "role" not in slot2.vars
+
+
+def test_slot_factory_vars_none_clears(tmp_path: Path) -> None:
+    """`vars=None` 明示で `Slot.vars` が空 dict になる（打ち消しフィルタを入れないことの pin）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), vars={"org": "AgentSpec"})
+    slot = factory("billing", vars=None)
+    assert slot.vars == {}
+
+
+def test_slot_factory_base_none_clears(tmp_path: Path) -> None:
+    """`base=None` 明示で `base:` セグメントが消える（None 除去フィルタを入れないことの pin）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), base="main")
+    slot = factory("billing", base=None)
+    assert "base:main" not in [seg.ref for seg in slot.segments]
+
+
+def test_slot_factory_passes_layout_through(tmp_path: Path) -> None:
+    """`layout` の並びがそのまま `Slot.segments` の ref 順になり、`Slot.name` は常に `agent=`
+    から決まる（layout の暗黙解決経路には到達しない）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry())
+    slot = factory(
+        "billing",
+        layout=["part:style", "base:main", "agent:billing"],
+        vars={"org": "AgentSpec"},
+    )
+    assert [seg.ref for seg in slot.segments] == ["part:style", "base:main", "agent:billing"]
+    assert slot.name == "billing"
+
+
+def test_slot_factory_passes_build_through(tmp_path: Path) -> None:
+    """`build=` 素通し時に `Slot.segments` が空になる（custom build 経路）。"""
+    sentinel = AgentSpec(name="custom", instructions="x", model=FakeModel())
+
+    def _build(_candidate: str) -> AgentSpec:
+        return sentinel
+
+    factory = prompt_slot_factory(_store(tmp_path))
+    slot = factory("bot", build=_build)
+    assert slot.segments == ()
+
+
+def test_slot_factory_vars_callable_passthrough(tmp_path: Path) -> None:
+    """defaults dict + override callable は置換になり、`Slot.vars_fn` が設定される。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), vars={"org": "x"})
+    slot = factory("billing", vars=lambda ctx: {"org": "dyn"})
+    assert slot.vars_fn is not None
+    assert slot.vars == {}
+
+
+@pytest.mark.parametrize(
+    "bad_defaults",
+    [
+        {"agent": "conflict"},  # agent の二重指定
+        {"part": ["style"]},  # typo（parts の間違い）
+    ],
+    ids=["agent-in-defaults", "typo-part"],
+)
+def test_slot_factory_invalid_kwarg_raises_type_error(tmp_path: Path, bad_defaults: dict) -> None:
+    """defaults に `agent` / 未知キーを含むと `make()` 呼び出し時（factory 生成時ではなく）に
+    `TypeError`（許可キーリスト・`agent` 衝突検査を追加していないことの pin）。"""
+    factory = prompt_slot_factory(_store(tmp_path), _registry(), **bad_defaults)
+    with pytest.raises(TypeError):
+        factory("bot")
