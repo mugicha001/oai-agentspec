@@ -1,6 +1,6 @@
 # 0008: per-agent のプロンプトスロット指定をファクトリで畳み、`optimize(slot=)` に `Slot` の列を受理させる
 
-- Status: accepted
+- Status: superseded by 0011 (partially: prompt_slots 併存決定のみ)
 - Date: 2026-07-27
 
 ## Context
