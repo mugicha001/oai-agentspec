@@ -1390,7 +1390,18 @@ rollout の結線と reward 算出への plain データ供給に徹する。
   `HandoffGraph` を `copy.deepcopy` してから `apply(registry)`・`WorkflowGraph` は registry を伴って Agent 化・
   利用者状態を汚さない）。
 - 候補生成: APO の候補プロンプト生成は Trainer に委譲し、lib は beam-search / テキスト勾配 /
-  最適化アルゴリズムを実装しない。
+  最適化アルゴリズムを実装しない。gradient / apply-edit の API は
+  `OptimizeConfig.apo_api`（None = auto / "responses" 固定 / "chat_completions" 固定）で明示選択
+  できる。auto（未指定）では Responses API を優先し、`/responses` エンドポイント不在（404・
+  litellm 等の chat-only ゲートウェイ）のときのみ `chat.completions` へ自動 fallback する安全網が
+  働く（APO インスタンス単位のモデル名 memo・1 slot 実行に閉じる・モデル不在を示す 404 は fallback せず伝搬・
+  `responses` 属性を持たない client は最初から chat）。"responses" 明示時は fallback しない
+  （不整合は optimize() が事前に CONFIG_MISSING で fail-fast）。"chat_completions" 明示時は
+  上流 agent-lightning 本来の chat 実装を使う。
+- 複数 slot 逐次 APO の途中失敗・スコア再計算失敗では、完了済み slot の最良テキストと履歴を
+  `OptimizeError.partial`（`OptimizePartial`・`completed_slots` は repr 抑止・`failed_slot=None` =
+  全 slot 完了）として保全する（ADR 0010）。ループ内 `ImportError`（サブ依存欠落 / rollout 内
+  import 失敗）は `EXTRA_MISSING` の `OptimizeError` に partial 付きで包む（kind 契約と保全の両立）。
 - rollout: `_adapters` の `DefaultRunnerAdapter.run_with_observation` で 1 回実行し、`observe_run_result` で plain な
   実行経路 / ツール呼び出し列へ変換して利用者供給の reward へ渡す（生 `RunResult` は `_adapters` 外へ出さない・
   実行トレース捕捉の流儀は「LLMOps 評価」節の実行トレース捕捉を再利用する）。
@@ -1398,7 +1409,13 @@ rollout の結線と reward 算出への plain データ供給に徹する。
   `run_apo` 委譲前に seed 状態で `train` 全件を観測し、未到達 slot を
   `OptimizeError(CONFIG_MISSING, coverage=CoverageReport(...))` で fail-fast する（allow-list であり `AgentSpec` /
   `WorkflowGraph` target と生 seed + rebind 経路（`slots is None`）は skip する。既定有効・`skip_coverage_check`
-  で opt-out・詳細は ADR 0009）。
+  で opt-out・詳細は ADR 0009）。観測は 1 case あたり `OptimizeConfig.timeout_seconds` の上限が適用される
+  （未指定なら上限なし）。観測が途中の例外（timeout 等）で失敗した場合は `complete=False` の部分
+  `CoverageReport` を添付した `OptimizeError(TRAINER_FAILED)` へ変換し、そこまでの到達観測を保全する。
+  候補無効化（`${var}` 喪失 / `vars=callable` 非 dict / 境界マーカー崩れ）の case は `per_case` に
+  `None` で記録し `invalid_cases` に加算する（「実行済みだが観測が空」の `()` と区別・全件無効化時は
+  「未到達」と主張しないメッセージ分岐）。`missing` が確定であるのは `complete=True` かつ
+  `invalid_cases == 0` のときに限る。
 - context 配線: `optimize(context_factory=...)` を渡すと各 rollout（pre-flight coverage 観測を含む）の冒頭で
   factory を 1 回呼び、
   新鮮な context を `run_with_observation(context=...)` 経由で SDK `Runner.run(context=...)` まで素通しする。粒度は
