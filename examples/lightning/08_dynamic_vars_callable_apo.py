@@ -28,6 +28,11 @@ Issue #40 FR-2 (`context_factory`) / FR-3 (`vars=callable`) の end-to-end 動�
   `vars=callable`）を束ね、per-agent の `parts` だけ差し替える。共通 `vars=callable` は
   factory の defaults で 1 度だけ書き、`make_slot("planner", parts=[...])` /
   `make_slot("advisor", parts=[...])` の 2 行で slot 列を作る
+- **graph target のため pre-flight route coverage が走る**（既定有効）。`optimize()` は APO へ
+  委譲する前に seed 状態で `train` 全件を 1 巡 rollout し、`slot` に挙げた planner / advisor が
+  routing で 1 度も到達しない場合は `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast する。
+  そのぶん **`train` の件数だけ実 API 呼び出しが追加**される点に注意（本例では 2 件）。動的 routing
+  で seed 状態では判定できない構成なら `skip_coverage_check=True` で opt-out できる
 - **`OptimizeResult.diff` は本例では通常空**（単一 slot・短い期待出力・capable LLM の組み合わせで
   reward の S/N が低く、APO 候補は生成されるものの beam 選抜で seed に落ちる）。`${var}` 保持
   や context 注入の動線確認が本例の目的で、安定した diff を見たい場合は 07
@@ -57,7 +62,7 @@ from oai_agentspec.runtime.lightning import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
-from _azure import azure_client, azure_model  # noqa: E402
+from _azure import api_style, azure_client, azure_deployment, azure_model  # noqa: E402
 
 
 @dataclass
@@ -77,9 +82,16 @@ class ConversationContext:
 
 # 意図的に弱い seed（07 と同じ規範）。`${var}` プレースホルダは APO 中も保持され rollout 時に
 # 注入される。APO は routing 指示・応答方針を textual gradient で追加する余地を持つ。
+# triage は本例の最適化対象外（slot に載せない・固定）のため、routing 規則は明確に書く。
+# 弱い seed は「APO の改善余地」を作るための設計だが、それは最適化対象（planner / advisor）に
+# のみ必要で、固定 slot の routing まで弱くすると seed 状態の経路が不安定になり
+# pre-flight route coverage が flaky に fail する（実 API で確認済み）。
 TRIAGE_SEED = (
-    "あなたはトリアージ担当です。ユーザーの依頼を読み、手続き系なら planner に、"
-    "案内・情報提供系なら advisor にハンドオフしてください。"
+    "あなたはトリアージ担当です。ユーザーの依頼を必ずどちらかへハンドオフしてください。\n"
+    "- 依頼が操作・変更・申請の実行（例:「〜の手続きをしたい」「解約したい」「変更したい」）"
+    "なら planner へ。\n"
+    "- 依頼が質問・情報の確認（例:「〜を教えて」「〜はある？」）なら advisor へ。\n"
+    "自分では回答しないこと。"
 )
 PLANNER_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
 ADVISOR_SEED = "${tone} で応答。ハンドオフ元 ${routed_from}。"
@@ -89,9 +101,12 @@ ADVISORY_FOCUS_PART = "選択肢と判断材料を並列に示し、ユーザー
 
 
 def _make_store(root: Path) -> PromptStore:
-    """本例専用の一時 `PromptStore` を組む（agents/ に 3 テンプレート・parts/ に 2 セグメント）。"""
+    """本例専用の一時 `PromptStore` を組む（agents/ に 2 テンプレート・parts/ に 2 セグメント）。
+
+    triage は slot に含まれず store から合成されないため、agents/ には最適化対象
+    （planner / advisor）のみ置く（TRIAGE_SEED は登録 spec の instructions へ直接渡す）。
+    """
     (root / "agents").mkdir()
-    (root / "agents" / "triage.md").write_text(TRIAGE_SEED, encoding="utf-8")
     (root / "agents" / "planner.md").write_text(PLANNER_SEED, encoding="utf-8")
     (root / "agents" / "advisor.md").write_text(ADVISOR_SEED, encoding="utf-8")
     (root / "parts").mkdir()
@@ -103,7 +118,10 @@ def _make_store(root: Path) -> PromptStore:
 async def main() -> None:
     model = azure_model()
     registry = AgentRegistry()
-    registry.register(AgentSpec(name="triage", instructions="(seed)", model=model))
+    # triage は slot に含まれない（store から合成されない）ため、routing 規則を持つ実
+    # instructions を登録 spec へ直接渡す。placeholder 文字列にすると triage は routing
+    # 指示ゼロで動き、pre-flight の経路観測がほぼランダムになる（実 API で確認済み）。
+    registry.register(AgentSpec(name="triage", instructions=TRIAGE_SEED, model=model))
     registry.register(AgentSpec(name="planner", instructions="(seed)", model=model))
     registry.register(AgentSpec(name="advisor", instructions="(seed)", model=model))
 
@@ -137,13 +155,22 @@ async def main() -> None:
             make_slot("advisor", parts=["advisory_focus"]),
         ]
 
+        # 手続き系 / 案内系が routing 上明確に分離する入力にする。graph target で複数 slot を
+        # 最適化する場合、train が全 slot の経路を実際に踏む必要がある（seed 状態の routing で
+        # 到達しない slot があると pre-flight route coverage が
+        # `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast する）。曖昧な入力
+        # （例: 「明細が欲しい」）は実モデルが案内系へ倒すことがあり、経路の実証は split の
+        # 机上計算でなく実 API 実行で行う。
         data = [
-            OptimizeCase(input="請求書のPDFが欲しい", expected_output="請求"),
+            OptimizeCase(input="解約の手続きを進めてほしい", expected_output="解約"),
             OptimizeCase(input="料金プランを教えて", expected_output="プラン"),
-            OptimizeCase(input="今月分の明細ください", expected_output="明細"),
+            OptimizeCase(input="支払い方法の変更手続きをしたい", expected_output="支払い"),
             OptimizeCase(input="法人プランはある？", expected_output="法人"),
         ]
-        train, val = train_val_split(data, val_ratio=0.5, seed=0)
+        # `seed=1` は恣意的な値ではなく、train が planner 経路（手続き系: 「支払い方法の変更
+        # 手続きをしたい」）と advisor 経路（案内系: 「料金プランを教えて」）の**両方**を含む
+        # ように選んである（`seed=0` は train が案内系 2 件に偏り planner 未到達で落ちる）。
+        train, val = train_val_split(data, val_ratio=0.5, seed=1)
 
         # contains() で expected_output の語を判定する（seed に指示が薄いため APO が routing 指示や
         # 応答方針を textual gradient で追加する余地を持つ・07 の設計と同じ規範）。
@@ -160,6 +187,12 @@ async def main() -> None:
             # 承認 resume ループ内は SDK `RunState` 内包の同一 context を再利用する。
             context_factory=lambda: ConversationContext(tone="polite", routed_from="triage"),
             apo_client=azure_client(),
+            # APO の gradient / apply-edit 用モデルは rollout と同じものへ明示的に揃える
+            # （既定 gpt-5.4-mini はプロバイダ / ゲートウェイによっては存在しないため）。
+            apo_gradient_model=azure_deployment(),
+            apo_apply_edit_model=azure_deployment(),
+            # gradient / apply-edit の API はプロバイダ設定（OPENAI_API_STYLE）に揃えて明示する。
+            apo_api=api_style(),
             # E2E 動作確認用の最小 APO 設定。本番では rounds / beam を増やす。
             rounds=1,
             apo_beam_width=1,

@@ -16,6 +16,7 @@ registry は read-only で扱い変更しない。プロンプト・評価ケー
 5. [リファレンス](#リファレンス)
    - [`optimize` 引数](#optimize-引数)
    - [APO 設定（直接 kwargs / `OptimizeConfig`）](#apo-設定直接-kwargs--optimizeconfig)
+     - [pre-flight route coverage（graph target・既定有効）](#pre-flight-route-coveragegraph-target既定有効)
    - [`OptimizeCase`（推奨データ型）](#optimizecase推奨データ型)
    - [報酬ファクトリ](#報酬ファクトリ)
    - [スロットヘルパ（`prompt_slot` / `prompt_slots`）](#スロットヘルパprompt_slot--prompt_slots)
@@ -107,7 +108,7 @@ asyncio.run(main())
 | 期待ツールを ground truth にしつつ承認必須の危険ツールを安全に回したい | `04_reward_and_safety.py` | `tool_match()` + `tool_mocks` + `approvals` |
 | 危険操作を必ず承認ゲートへ回すプロンプトを学習させたい（HITL） | `06_approval_match_apo.py` | `approval_match()` |
 | 出力 / ツール / 経路 / 最終 agent を 1 ケースに集約して複合 reward で学習 | `07_composite_reward_apo.py` | `OptimizeCase` 全観点 + 複合 reward |
-| 失敗種別の判別だけ確認したい（オフライン・LLM 不要） | `05_failure_handling.py` | `OptimizeError` / `FailureKind` |
+| 失敗種別の判別だけ確認したい（オフライン・LLM 不要） | `05_failure_handling.py` | `OptimizeError` / `FailureKind` / pre-flight タイムアウト |
 
 実行（Azure OpenAI の環境変数が必要。`examples/_shared/_azure.py` 参照）:
 
@@ -151,10 +152,11 @@ uv run python examples/lightning/05_failure_handling.py   # これは環境変�
 | APO 計算用クライアント | `apo_client` | `apo_client` | `AsyncOpenAI` 互換（**必須**） |
 | 訓練ラウンド数 | `rounds` | `rounds` | APO の `beam_rounds` |
 | 並列度 | `concurrency` | `concurrency` | `Trainer.n_runners` |
-| タイムアウト | `timeout_seconds` | `timeout_seconds` | 1 batch の `rollout_batch_timeout` 秒 |
+| タイムアウト | `timeout_seconds` | `timeout_seconds` | 1 batch の `rollout_batch_timeout` 秒 + pre-flight の 1 case 観測上限（lib ローカル・`None` で上限なし） |
 | Store 抽象 | `store` | `store` | InMemory / Sqlite / Mongo（不透明値・passthrough） |
 | gradient モデル | `apo_gradient_model` | `apo_gradient_model` | 既定 `gpt-5.4-mini` |
 | edit 適用モデル | `apo_apply_edit_model` | `apo_apply_edit_model` | 既定 `gpt-5.4-mini` |
+| gradient / edit の API | `apo_api` | `apo_api` | `None` = auto（Responses 優先 + 404 で chat fallback）/ `"responses"` 固定 / `"chat_completions"` 固定。examples は `api_style()`（`OPENAI_API_STYLE` 連動）で明示 |
 | beam 幅 / 分岐数 | `apo_beam_width` / `apo_branch_factor` | 同名 | APO beam search |
 
 ```python
@@ -188,6 +190,35 @@ result = await optimize(
 この設定で「seed → 1 候補生成 → 評価 → 採用 / 棄却」の最小フローを 1 巡だけ回す（実 LLM 呼び出しは
 gradient + apply_edit + train rollout × 件数 + val rollout × 件数 程度）。本番運用では `rounds` を
 増やし beam を広げて多候補比較を有効化する。`examples/lightning/*.py` はすべてこの最小設定で動く。
+
+#### pre-flight route coverage（graph target・既定有効）
+
+`optimize(target=HandoffGraph, slot={...})` では、APO へ委譲する **前に** seed 状態で `train` 全件を
+1 巡 rollout し、`slot` に挙げたエージェントが routing で 1 度も到達しないものを検出して
+`OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast する。未到達 slot は最適化されないのに
+エラーも warning も出ない silent no-op になり、reward の noise がデタラメな textual gradient として
+載りうるため、既定を安全側（有効）に倒している。
+
+- **追加コスト**: `train` の件数だけ実 API 呼び出しが増える（候補ごとではなく seed 1 回のみ）
+- **診断**: 送出された `OptimizeError` の `coverage` 属性（`CoverageReport`）から `covered` /
+  `missing` / `per_case` を参照できる。あわせて `logger.warning` に集計行が出る。**観測が
+  途中で失敗した場合（timeout 等）も部分レポートが付く**（`complete=False`）。候補無効化
+  （`${var}` 喪失等）の case は `per_case` に `None`・`invalid_cases` に加算される。
+  `missing` が「未到達の確定」なのは **`complete=True` かつ `invalid_cases == 0`** のときに
+  限るので、両方を見てから解釈すること
+- **時間上限**: `timeout_seconds` を指定すると pre-flight の **1 case あたり**の観測上限としても
+  適用される（未指定なら pre-flight 側は上限なし）。超過は `TimeoutError` をチェーンした
+  `TRAINER_FAILED` になる（`CONFIG_MISSING` ではない）。動く例は `05_failure_handling.py` の
+  ケース 6（応答しない疑似モデルで発火させるためオフラインで確認できる）
+- **opt-out**: 動的 routing で seed 状態では判定できない構成や、追加コストを避けたい場合は
+  `skip_coverage_check=True`（`optimize()` の kwarg または `OptimizeConfig` フィールド）
+
+`AgentSpec` を target にする場合は起点が自身の slot を必ずカバーするため pre-flight は走らない。
+判断根拠は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
+
+**注意**: graph target で複数 slot を最適化する example（`03` / `07` / `08`）は、`train` が全 slot の
+経路を踏むデータ構成になっている必要がある。`08` の `train_val_split(..., seed=1)` は、train が
+planner / advisor の両経路を含むように選んだ値である。
 
 #### Trace 計測と AgentOps
 
@@ -421,8 +452,8 @@ result = await optimize(
 | `FailureKind` | 意味 |
 |---|---|
 | `EXTRA_MISSING` | `[lightning]` extra（agentlightning）未導入 |
-| `CONFIG_MISSING` | 必須設定不在: `algorithm` 不正 / `train` 空 / `reward=None` / `val` 空 / `apo_client` 不在 / `slot` と `rebind` の解決不能 / `registry` 不在（グラフ最適化）/ 直接 kwargs と `config=` の同時指定 / 承認の安全違反 |
-| `TRAINER_FAILED` | 最適化実行（Trainer / rollout / reward）中の失敗 |
+| `CONFIG_MISSING` | 必須設定不在: `algorithm` 不正 / `train` 空 / `reward=None` / `val` 空 / `apo_client` 不在 / `slot` と `rebind` の解決不能 / `registry` 不在（グラフ最適化）/ 直接 kwargs と `config=` の同時指定 / 承認の安全違反 / **pre-flight route coverage の未到達 slot**（`exc.coverage` に `CoverageReport`） |
+| `TRAINER_FAILED` | 最適化実行（Trainer / rollout / reward）中の失敗。pre-flight 観測中の失敗（timeout 含む）もここに入り、`exc.coverage` に `complete=False` の部分 `CoverageReport` が付く。複数 slot APO の途中失敗では `exc.partial`（`OptimizePartial`）に完了済み slot の最良テキストと履歴が残る（`failed_slot=None` なら全 slot 完了・スコア再計算段の失敗） |
 
 ```python
 try:
@@ -436,7 +467,9 @@ except OptimizeError as exc:
         ...   # exc.__cause__ に元の例外がチェーンされる（ログ / リトライ判断）
 ```
 
-詳細は `05_failure_handling.py`（オフラインで動く・LLM 不要）。
+詳細は `05_failure_handling.py`（オフラインで動く・LLM 不要）。ケース 6 は graph target の
+pre-flight 観測をタイムアウトさせ、設定不備（`CONFIG_MISSING`）と実行時失敗（`TRAINER_FAILED`）の
+区別を実コードで示す。
 
 ---
 
@@ -444,6 +477,16 @@ except OptimizeError as exc:
 
 APO は内部の textual gradient 計算 / prompt 編集に `AsyncOpenAI` 互換クライアントを必要とする。
 採点用の SDK モデル（`AgentSpec.model`）とは別の関心。
+
+gradient / apply-edit の API は `apo_api` で明示選択できる（`"responses"` / `"chat_completions"`。
+examples は `_shared` の `api_style()` で `OPENAI_API_STYLE` に連動させている）。未指定（auto）では
+Responses API を優先し、`/responses` エンドポイント不在（404・litellm 等の chat-only ゲートウェイ）
+のときのみ `chat.completions` へ自動 fallback する安全網が働く（warning ログ 1 回・
+記憶は 1 回の APO 実行内に閉じる）。つまり **chat-only の互換ゲートウェイでも `apo_client=` に渡すだけ
+で動く**。モデル不在を示す 404（`model_not_found` /
+`DeploymentNotFound`）は設定ミスの隠蔽を避けるため fallback せず伝搬する。gradient 用モデルの
+既定は `gpt-5.4-mini` で、ゲートウェイに存在しない場合は `apo_gradient_model=` /
+`apo_apply_edit_model=` で明示する（examples は rollout と同じモデルへ揃えている）。
 
 **Azure OpenAI**（`examples/_shared/_azure.py` 参照）:
 

@@ -52,7 +52,7 @@ from oai_agentspec.runtime.lightning import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
-from _azure import azure_client, azure_model  # noqa: E402
+from _azure import api_style, azure_client, azure_deployment, azure_model  # noqa: E402
 
 PROMPTS_ROOT = Path(__file__).resolve().parent.parent / "prompts"
 LAYOUT = PromptLayout(base="base", parts="parts", agents="agents")
@@ -116,6 +116,12 @@ async def main() -> None:
         slot=slot,
         registry=registry,
         apo_client=azure_client(),
+        # APO の gradient / apply-edit 用モデルは rollout と同じものへ明示的に揃える
+        # （既定 gpt-5.4-mini はプロバイダ / ゲートウェイによっては存在しないため）。
+        apo_gradient_model=azure_deployment(),
+        apo_apply_edit_model=azure_deployment(),
+        # gradient / apply-edit の API はプロバイダ設定（OPENAI_API_STYLE）に揃えて明示する。
+        apo_api=api_style(),
         # 複数セグメント tune のため 1 ラウンドで各 tune 対象に 1 候補ずつ生成する最小構成。
         # 本番では rounds / beam を増やして候補多様性を確保する。
         rounds=1,
