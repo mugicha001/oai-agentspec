@@ -32,6 +32,7 @@ from .types import (
     CoverageReport,
     FailureKind,
     OptimizeError,
+    OptimizePartial,
     OptimizeResult,
     RolloutResult,
     Slot,
@@ -49,6 +50,7 @@ __all__ = [
     "FailureKind",
     "OptimizeError",
     "CoverageReport",
+    "OptimizePartial",
     # 設定型
     "OptimizeConfig",
     # reward ファクトリ

@@ -3297,6 +3297,50 @@ async def test_optimize_preflight_extra_missing_before_rollout(
     assert run_apo_calls["n"] == 0
 
 
+async def test_optimize_preflight_extra_probe_runtime_error_maps_to_trainer_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """段 1（extra 可用性検査）の非 ImportError も TRAINER_FAILED へ構造化される。
+
+    `_require_agentlightning()` は内側で `ImportError` しか捕捉しないため、`import
+    agentlightning` のモジュール初期化中に出る非 `ImportError`（依存バージョン不整合由来の
+    `TypeError` / `RuntimeError` / pydantic 系エラー等）はそのまま段 1 の外へ抜ける。段 1 が
+    `except ImportError` だけだと、この例外が生のまま `optimize()` の外へ漏れて FR-8（最適化の
+    失敗は構造化エラーへ倒す）が破れる。段 2 と同じく `{type(exc).__name__}: {exc}` 形式の
+    メッセージで TRAINER_FAILED へ倒すことを固定する。
+    """
+
+    def _incompatible() -> Any:
+        raise RuntimeError("incompatible agentlightning version")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._require_agentlightning", _incompatible, raising=True
+    )
+    run_apo_calls = _counting_run_apo(monkeypatch)
+    obs_calls = _script_observations(monkeypatch, [_observed(("triage", "billing"))])
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "pre-flight" in exc.message.lower()
+    assert "RuntimeError" in exc.message  # 型名がないと空本文の例外型で原因が読めない。
+    # 段 1 で fail-fast するため rollout（実 API コスト）は 1 件も消費しない。
+    assert obs_calls["n"] == 0
+    assert run_apo_calls["n"] == 0
+
+
 async def test_optimize_preflight_runtime_error_maps_to_trainer_failed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3573,3 +3617,599 @@ async def test_optimize_preflight_per_case_records_empty_observation_as_empty_tu
     # 全 case が interrupted で除外 → 各 per_case の route_steps は () として記録される。
     for _case_key, route_steps in exc.coverage.per_case:
         assert route_steps == ()
+
+
+async def test_optimize_preflight_observation_import_error_maps_to_trainer_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pre-flight 観測本体が投げる ImportError は EXTRA_MISSING でなく TRAINER_FAILED になる。
+
+    extra 可用性検査（`_require_agentlightning`）と観測本体（`_check_route_coverage`）を同じ
+    try で覆うと、利用者コード（`context_factory` / `Slot.build` / ツール実装等）由来の
+    `ImportError`（例: 存在しないモジュールの import）まで「extra 未導入」と誤分類してしまい、
+    利用者は `pip install 'oai-agentspec[lightning]'` という無効な対処を案内される。例外境界を
+    2 段に分け、観測本体の `ImportError` は他の実行時例外と同様 TRAINER_FAILED へ倒す。
+    メッセージには診断のためフェーズ標識（pre-flight）と元例外の型名を含める。
+    """
+    _counting_run_apo(monkeypatch)
+
+    async def _import_boom(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        raise ImportError("No module named 'my_ctx'")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _import_boom,
+        raising=True,
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "pre-flight" in exc.message.lower()
+    assert "ImportError" in exc.message
+
+
+async def test_optimize_preflight_partial_observation_logged_on_failure(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """観測が途中で失敗しても、そこまでの部分観測を warning で保全してから re-raise する。
+
+    pre-flight は train 件数ぶんの実 API コストを払う。途中の case で例外が出ると、それまでに
+    支払ったコストで得られた到達情報（covered）が失われ、利用者は「どこまで進んだか」を知らずに
+    やり直すことになる。例外を握って degrade する（= 空観測扱い）と偽陽性 fail を生むため、
+    ログでのみ保全して例外はそのまま伝播させる。ログには case 位置 / そこまでの covered /
+    例外型名のみを出し、case 本文（利用者の入力データ）は出さない（機微データの漏出防止）。
+    """
+    import logging
+
+    _counting_run_apo(monkeypatch)
+
+    scripted = [_observed(("triage",)), _observed(("triage", "billing"))]
+    calls = {"n": 0}
+
+    async def _fail_on_third(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        index = calls["n"]
+        calls["n"] += 1
+        if index >= len(scripted):
+            raise RuntimeError("boom")
+        return scripted[index]
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _fail_on_third,
+        raising=True,
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    train = [
+        {"input": "SECRET-CASE-MARKER-1"},
+        {"input": "SECRET-CASE-MARKER-2"},
+        {"input": "SECRET-CASE-MARKER-3"},
+    ]
+
+    with caplog.at_level(logging.WARNING, logger="oai_agentspec.runtime.lightning._rollout"):
+        with pytest.raises(OptimizeError):
+            await optimize(
+                target=graph,
+                algorithm="apo",
+                train=train,
+                val=_DEFAULT_VAL,
+                reward=contains("expected"),
+                slot=slots,
+                registry=registry,
+                config=_apo_config(),
+            )
+
+    assert calls["n"] == 3  # 3 件目で失敗している（部分観測は 2 件ぶん）。
+    assert "3/3" in caplog.text  # 失敗した case 位置（1 始まり / 全件数）。
+    assert "triage" in caplog.text  # そこまでの covered が保全されている。
+    assert "RuntimeError" in caplog.text  # 例外型名（メッセージ本文でなく型で識別可能）。
+    assert "SECRET-CASE-MARKER" not in caplog.text  # case 本文は出さない。
+
+
+async def test_optimize_preflight_timeout_maps_to_trainer_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`timeout_seconds` は pre-flight の 1 case 観測の上限にも適用される（無限待機の防止）。
+
+    pre-flight は実 rollout を回すため、モデル / ツールが応答を返さないと `optimize` 全体が
+    無限待機しうる。`timeout_seconds`（APO の 1 batch 上限）を pre-flight の 1 case 上限として
+    も適用し、超過は TRAINER_FAILED へ倒す。
+
+    Note:
+        安全網として外側 timeout を掛け、超過時は明示的に fail させて必ず終了させる。
+        `_require_agentlightning` を no-op に差し替えるのは、単独実行時に `agentlightning`
+        のコールドスタート import（litellm のリモートフェッチ試行を含む）が外側予算を
+        食い潰して内側の timeout 到達前に落ちるため（本テストの関心は timeout 経路のみで、
+        extra 検査は `test_optimize_preflight_extra_missing_before_rollout` が担当する）。
+    """
+    import asyncio
+
+    _counting_run_apo(monkeypatch)
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._require_agentlightning",
+        lambda: None,
+        raising=True,
+    )
+
+    async def _hang(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()  # 永久待機（sleep 依存のフレーキーを避ける）。
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation", _hang, raising=True
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    async def _call() -> Any:
+        return await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            # config= と直接 kwargs は排他のため、apo_client も直接 kwargs で渡す。
+            apo_client=_FAKE_APO_CLIENT,
+            timeout_seconds=0.01,
+        )
+
+    try:
+        with pytest.raises(OptimizeError) as exc_info:
+            await asyncio.wait_for(_call(), timeout=5.0)
+    except TimeoutError:
+        pytest.fail("pre-flight に timeout_seconds が適用されず無限待機した（未実装）")
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "pre-flight" in exc.message.lower()
+    assert "TimeoutError" in exc.message
+
+
+def _spy_wait_for(monkeypatch: pytest.MonkeyPatch) -> list[float | None]:
+    """`_rollout` が参照する `asyncio.wait_for` を実体委譲の spy で包み timeout 引数列を返す。
+
+    `_rollout` モジュールの `asyncio` 属性経由で差し替えるため、他テスト・他モジュールの
+    `asyncio.wait_for` には影響しない（`monkeypatch` がテスト終了時に自動復元する）。
+    """
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+
+    real_wait_for = rollout_mod.asyncio.wait_for
+    timeouts: list[float | None] = []
+
+    async def _spy(awaitable: Any, timeout: float | None = None) -> Any:
+        timeouts.append(timeout)
+        return await real_wait_for(awaitable, timeout=timeout)
+
+    monkeypatch.setattr(rollout_mod.asyncio, "wait_for", _spy, raising=True)
+    return timeouts
+
+
+async def test_optimize_preflight_timeout_none_does_not_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`timeout_seconds` 未指定（既定 None）では pre-flight に上限を掛けない（既定挙動の回帰 pin）。
+
+    1 case 上限の導入で「未指定時に既定値の上限が入る」方向へ回帰すると、長時間 rollout が
+    静かに TRAINER_FAILED になる。観測が完走して `run_apo` へ到達することだけを見ると、モック
+    観測は即座に返るため既定値（例: 3600 秒）が混入しても緑のままになる。`asyncio.wait_for`
+    自体を spy して「呼ばれない（呼ばれるとしても timeout=None）」を直接固定する。
+    """
+    wait_for_timeouts = _spy_wait_for(monkeypatch)
+    preflight_calls = _spy_preflight(monkeypatch)
+    run_apo_calls = _counting_run_apo(monkeypatch)
+    obs_calls = _script_observations(monkeypatch, [_observed(("triage", "billing"))])
+
+    graph, registry, slots = _two_slot_graph()
+
+    result = await optimize(
+        target=graph,
+        algorithm="apo",
+        train=[{"input": "route me"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        slot=slots,
+        registry=registry,
+        config=_apo_config(),  # timeout_seconds 未指定（OptimizeConfig 既定の None）。
+    )
+
+    assert preflight_calls["n"] == 1
+    assert obs_calls["n"] == 1
+    assert run_apo_calls["n"] == 1
+    assert isinstance(result, OptimizeResult)
+    # 既定値混入の検知: wait_for 未使用（または timeout=None）以外は回帰。
+    assert all(t is None for t in wait_for_timeouts), (
+        f"timeout_seconds 未指定なのに上限が適用された: {wait_for_timeouts}"
+    )
+
+
+async def test_optimize_preflight_timeout_value_passed_to_wait_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`timeout_seconds` 明示時は指定値がそのまま 1 case 観測の `wait_for` へ渡る（pin の対称）。
+
+    未指定側の pin（`..._timeout_none_does_not_limit`）と対にして、上限が「掛かる / 掛からない」
+    の両方向を固定する。値の丸め・既定値での上書き・別スケール（ミリ秒等）への変換が入ると
+    ここで落ちる。
+    """
+    wait_for_timeouts = _spy_wait_for(monkeypatch)
+    preflight_calls = _spy_preflight(monkeypatch)
+    run_apo_calls = _counting_run_apo(monkeypatch)
+    obs_calls = _script_observations(monkeypatch, [_observed(("triage", "billing"))])
+
+    graph, registry, slots = _two_slot_graph()
+
+    result = await optimize(
+        target=graph,
+        algorithm="apo",
+        train=[{"input": "route me"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        slot=slots,
+        registry=registry,
+        # config= と直接 kwargs は排他のため、apo_client も直接 kwargs で渡す。
+        apo_client=_FAKE_APO_CLIENT,
+        timeout_seconds=12.5,
+    )
+
+    assert preflight_calls["n"] == 1
+    assert obs_calls["n"] == 1
+    assert run_apo_calls["n"] == 1
+    assert isinstance(result, OptimizeResult)
+    assert wait_for_timeouts == [12.5]  # 1 case につき 1 回・指定値そのまま。
+
+
+async def test_optimize_preflight_partial_coverage_reaches_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """観測失敗時の部分 CoverageReport が optimize() の呼び出し側まで届く（end-to-end）。
+
+    `_check_route_coverage` が組んだ部分レポートは optimizer の `except OptimizeError: raise`
+    を素通りする必要がある。ここで再ラップされると coverage が落ち、案 B の保全が無効化される。
+    """
+    _counting_run_apo(monkeypatch)
+    calls = {"n": 0}
+
+    async def _boom_on_second(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        calls["n"] += 1
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _boom_on_second,
+        raising=True,
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "SECRET-CASE-MARKER-E2E"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert exc.coverage is not None
+    assert exc.coverage.complete is False
+    assert "case 1/1" in exc.message
+    # PII: case 本文は message にも repr にも出さない。
+    assert "SECRET-CASE-MARKER-E2E" not in exc.message
+    assert "SECRET-CASE-MARKER-E2E" not in repr(exc.coverage)
+
+
+async def test_optimize_preflight_outer_safety_net_maps_to_trainer_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """観測ループ外の例外も FR-8 の安全網で TRAINER_FAILED へ倒れる（coverage は付かない）。
+
+    ループ内例外は `_check_route_coverage` が構造化するため optimizer の `except Exception` は
+    通らなくなった。呼び出し準備段階の例外に対する安全網としてこの枝を残しており、削除・
+    無効化されていないことを直接 pin する（残すなら到達可能性を示す義務がある）。
+    """
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+
+    _counting_run_apo(monkeypatch)
+
+    async def _raise_outside_loop(**kwargs: Any) -> None:
+        raise RuntimeError("prep failed")
+
+    monkeypatch.setattr(rollout_mod, "_check_route_coverage", _raise_outside_loop, raising=True)
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "pre-flight" in exc.message.lower()
+    assert "prep failed" in exc.message
+    assert exc.coverage is None
+
+
+async def test_optimize_run_apo_boundary_message_carries_type_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run_apo 境界の catch-all は本文が空の例外でも型名をメッセージに残す。
+
+    `str(TimeoutError())` は空文字で、旧実装（`f"...: {exc}"`）だと
+    `'最適化の実行に失敗しました: '` とコロン終わりの情報ゼロ文字列になる（pre-flight で
+    修正した穴と同型）。あわせて、この catch-all が run_apo の構造化後も生きた枝である
+    ことを直接 pin する（run_apo 自体の失敗はこの境界にしか受け手がない）。
+    """
+
+    async def _raise_bare_timeout(**kwargs: Any) -> Any:
+        raise TimeoutError()
+
+    monkeypatch.setattr("oai_agentspec._adapters.run_apo", _raise_bare_timeout, raising=True)
+
+    target = AgentSpec(name="solo", instructions="seed", model=None)
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=target,
+            algorithm="apo",
+            train=[{"input": "a"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            config=_apo_config(),
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "TimeoutError" in exc.message
+    assert not exc.message.endswith(": ")
+
+
+async def test_optimize_preflight_all_invalid_reports_invalidation_not_unreached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """rollout 実行時の `_CandidateInvalid` 全件無効化は「未到達確定」と診断されない（e2e）。
+
+    vars=callable の非 dict 戻り値等で全 train が無効化されると、旧実装は
+    「train 全 N 件の rollout で一度も routing されませんでした」と偽の主張をし、
+    効かない救済策（train 追加 / edge 見直し）へ誘導していた（実測で確認済みの欠陥）。
+    公開 API 経由で invalid_cases / per_case=None / 専用メッセージが届くことを pin する。
+    """
+    from oai_agentspec.runtime.lightning.types import _CandidateInvalid
+
+    _counting_run_apo(monkeypatch)
+
+    async def _raise_invalid(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        raise _CandidateInvalid("boundary marker broken")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _raise_invalid,
+        raising=True,
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "SECRET-CASE-MARKER-INV"}, {"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.CONFIG_MISSING
+    assert exc.coverage is not None
+    assert exc.coverage.invalid_cases == 2
+    assert exc.coverage.complete is True
+    assert [steps for _, steps in exc.coverage.per_case] == [None, None]
+    assert "一度も routing されませんでした" not in exc.message
+    assert "候補無効化" in exc.message
+    # PII: case 本文は message にも repr にも出さない。
+    assert "SECRET-CASE-MARKER-INV" not in exc.message
+    assert "SECRET-CASE-MARKER-INV" not in repr(exc.coverage)
+
+
+async def test_optimize_preflight_extra_check_message_uses_shared_formatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """段 1（extra 可用性検査）の非 ImportError も共有整形（型名常時・空本文は連結しない）。
+
+    `_format_exception_message` は「失敗メッセージを組む全境界で使う」と docstring で宣言して
+    いるが、pre-flight の 2 境界だけ旧形式のままだった。空本文の例外で末尾コロンになる。
+    """
+    _counting_run_apo(monkeypatch)
+
+    def _boom() -> None:
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._require_agentlightning", _boom, raising=True
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "TimeoutError" in exc.message
+    assert not exc.message.endswith(": ")
+
+
+async def test_optimize_preflight_outer_safety_net_message_uses_shared_formatter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """段 2 の安全網（ループ外例外）も共有整形を使う（空本文で末尾コロンにしない）。"""
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+
+    _counting_run_apo(monkeypatch)
+
+    async def _raise_bare(**kwargs: Any) -> None:
+        raise TimeoutError()
+
+    monkeypatch.setattr(rollout_mod, "_check_route_coverage", _raise_bare, raising=True)
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+
+    assert "TimeoutError" in exc_info.value.message
+    assert not exc_info.value.message.endswith(": ")
+
+
+async def test_optimize_config_mutex_message_names_offending_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """config= と直接 kwargs の同時指定エラーは、衝突した kwarg 名を列挙する。
+
+    `skip_coverage_check=False`（意味的には既定値）でも明示指定は衝突扱いになる。
+    仕様としては正しい mutex だが、どの kwarg が引っかかったか名前が出ないと
+    利用者が原因を特定できない（bool 既定値の罠が self-explanatory にならない）。
+    """
+    _counting_run_apo(monkeypatch)
+    target = AgentSpec(name="solo", instructions="seed", model=None)
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=target,
+            algorithm="apo",
+            train=[{"input": "a"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            config=_apo_config(),
+            skip_coverage_check=False,
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.CONFIG_MISSING
+    assert "skip_coverage_check" in exc.message
+
+
+async def test_optimize_apo_api_invalid_value_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`apo_api` の不正値は CONFIG_MISSING で fail-closed する（受理値を列挙）。"""
+    _counting_run_apo(monkeypatch)
+    target = AgentSpec(name="solo", instructions="seed", model=None)
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=target,
+            algorithm="apo",
+            train=[{"input": "a"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            apo_client=_FAKE_APO_CLIENT,
+            apo_api="bogus",
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.CONFIG_MISSING
+    assert "apo_api" in exc.message
+    assert "responses" in exc.message
+    assert "chat_completions" in exc.message
+
+
+async def test_optimize_apo_api_responses_requires_responses_attr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`apo_api="responses"` 明示 + `responses` 属性なし client は事前に CONFIG_MISSING。
+
+    明示固定したのに実行段で AttributeError / 404 になるより、pre-flight の API コストを
+    消費する前に設定不整合として検出する（fail-fast）。
+    """
+    _counting_run_apo(monkeypatch)
+    target = AgentSpec(name="solo", instructions="seed", model=None)
+
+    class _ChatOnlyClient:
+        pass  # responses 属性を持たない
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=target,
+            algorithm="apo",
+            train=[{"input": "a"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            apo_client=_ChatOnlyClient(),
+            apo_api="responses",
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.CONFIG_MISSING
+    assert "apo_api" in exc.message
+
+
+async def test_optimize_apo_api_direct_kwarg_conflicts_with_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`apo_api` 直接 kwarg は config= と mutex で、衝突名として列挙される。"""
+    _counting_run_apo(monkeypatch)
+    target = AgentSpec(name="solo", instructions="seed", model=None)
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=target,
+            algorithm="apo",
+            train=[{"input": "a"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            config=_apo_config(),
+            apo_api="chat_completions",
+        )
+
+    exc = exc_info.value
+    assert exc.kind == FailureKind.CONFIG_MISSING
+    assert "apo_api" in exc.message

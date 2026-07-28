@@ -35,7 +35,14 @@ from ._slots_norm import (
     _reinject_vars,  # noqa: F401
     _seeds_of,
 )
-from .types import FailureKind, OptimizeError, OptimizeResult, RolloutResult, Slot
+from .types import (
+    FailureKind,
+    OptimizeError,
+    OptimizeResult,
+    RolloutResult,
+    Slot,
+    _format_exception_message,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterable, Sequence
@@ -57,6 +64,7 @@ _DIRECT_CONFIG_KEYS = (
     "store",
     "apo_gradient_model",
     "apo_apply_edit_model",
+    "apo_api",
     "apo_beam_width",
     "apo_branch_factor",
     "tracer",
@@ -84,6 +92,7 @@ async def optimize(
     store: Any = None,
     apo_gradient_model: str | None = None,
     apo_apply_edit_model: str | None = None,
+    apo_api: str | None = None,
     apo_beam_width: int | None = None,
     apo_branch_factor: int | None = None,
     tracer: Any = None,
@@ -137,10 +146,15 @@ async def optimize(
             最小ケースの推奨経路）。
         rounds: 最適化の訓練ラウンド数（APO は `beam_rounds` にマップ）。
         concurrency: rollout の並列実行数。
-        timeout_seconds: APO の 1 batch のタイムアウト秒（`rollout_batch_timeout`）。
+        timeout_seconds: APO の 1 batch のタイムアウト秒（`rollout_batch_timeout`）。あわせて
+            pre-flight route coverage の **1 case あたりの観測上限**としても適用される
+            （None は APO 側では APO 既定 3600 秒・pre-flight 側では上限なし）。
         store: Agent Lightning の Store 設定（不透明値・passthrough）。
         apo_gradient_model: APO の textual gradient 用モデル名。
         apo_apply_edit_model: APO の prompt edit 適用用モデル名。
+        apo_api: gradient / apply-edit で使う API の明示選択（None = auto: Responses 優先 +
+            404 で chat fallback / "responses" = 固定・fallback なし / "chat_completions" =
+            最初から chat）。詳細は `OptimizeConfig.apo_api`。
         apo_beam_width: APO beam search の幅。
         apo_branch_factor: APO beam search の分岐数。
         tracer: agent-lightning Tracer 派生を直接渡す escape hatch（不透明・上級者向け・通常不要）。
@@ -162,7 +176,15 @@ async def optimize(
             `coverage=CoverageReport(...)` 添付））は `FailureKind.CONFIG_MISSING`、extra 不在
             （pre-flight 実行前の可用性検査を含む）は `FailureKind.EXTRA_MISSING`、Trainer /
             rollout / reward 実行中の失敗および pre-flight 観測中の実行時失敗は
-            `FailureKind.TRAINER_FAILED` で送出する。
+            `FailureKind.TRAINER_FAILED` で送出する。pre-flight 観測中の失敗には
+            `complete=False` の部分 `CoverageReport` が `coverage` に添付される
+            （そこまでの到達観測の保全・`missing` は未観測を含むため未確定）。
+            pre-flight の例外境界は 2 段で、
+            **観測中に発生した `ImportError` は `TRAINER_FAILED`**（`EXTRA_MISSING` は
+            pre-flight 実行前の extra 可用性検査が送出した `ImportError` 由来のもののみ）。
+            利用者コード（`context_factory` / `Slot.build` / ツール実装）の import 失敗を
+            「extra 未導入」と誤診断しないための区別。extra 可用性検査が `ImportError` 以外
+            （依存バージョン不整合の `TypeError` 等）を投げた場合も `TRAINER_FAILED` へ倒す。
 
     Note:
         pre-flight route coverage 検証（Phase 1）の適用対象は **`HandoffGraph` target のみ**
@@ -172,6 +194,9 @@ async def optimize(
         また pre-flight は seed 状態のみで実行するため、動的 routing 下で seed 状態と
         candidate 状態で経路が変わる構成は完全にはカバーできません。API コストは
         `train × 1 rollout` の追加消費が発生します。
+        `timeout_seconds` は pre-flight の **1 case あたり**の観測上限として適用されます
+        （全体上限ではなく、pre-flight 全体の壁時計は `timeout_seconds × len(train)` まで
+        伸びます）。既定（None）では pre-flight に上限はかかりません。
         詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
     """
     direct_kwargs = {
@@ -183,6 +208,7 @@ async def optimize(
         "store": store,
         "apo_gradient_model": apo_gradient_model,
         "apo_apply_edit_model": apo_apply_edit_model,
+        "apo_api": apo_api,
         "apo_beam_width": apo_beam_width,
         "apo_branch_factor": apo_branch_factor,
         "tracer": tracer,
@@ -219,6 +245,26 @@ async def optimize(
             "optimize(..., apo_client=<AsyncOpenAI>) を渡すか、"
             "config=OptimizeConfig(apo_client=...) で指定してください "
             "（textual gradient 計算と prompt 編集に使用）",
+        )
+    from .config import APO_API_RESPONSES, APO_API_VALUES
+
+    if effective_config.apo_api is not None and effective_config.apo_api not in APO_API_VALUES:
+        raise OptimizeError(
+            FailureKind.CONFIG_MISSING,
+            f"apo_api={effective_config.apo_api!r} は未対応です"
+            f"（受理値: {' | '.join(repr(v) for v in APO_API_VALUES)}・未指定 None = 自動選択）",
+        )
+    if (
+        effective_config.apo_api == APO_API_RESPONSES
+        and getattr(effective_config.apo_client, "responses", None) is None
+    ):
+        # 明示固定したのに実行段で属性エラー / 404 になるより、pre-flight の API コストを
+        # 消費する前に設定不整合として fail-fast する。
+        raise OptimizeError(
+            FailureKind.CONFIG_MISSING,
+            "apo_api='responses' が指定されましたが、apo_client が responses 属性を"
+            "持ちません（Responses API 非対応 client）。apo_api='chat_completions' を"
+            "指定するか、Responses 対応クライアントを渡してください",
         )
 
     slots = _normalize_slots(target, slot)
@@ -270,13 +316,31 @@ async def optimize(
         from ..._adapters.lightning import _require_agentlightning
         from ._rollout import _check_route_coverage
 
-        # FR-8: pre-flight 失敗も構造化エラーへ倒す（run_apo 経路と同じ 3 段変換）。
-        # その他 Exception のメッセージにはフェーズ識別のため pre-flight である旨を含める。
-        # `OptimizeError` は kind と原文メッセージ（coverage 添付を含む）を保つため
-        # raise-through する（この経路には pre-flight 標識は入らない）。
+        # FR-8: pre-flight 失敗も構造化エラーへ倒す（run_apo 経路と同じ変換方針）。例外境界は
+        # 2 段に分ける。1 段構造だと観測中に利用者コード（context_factory / Slot.build / ツール
+        # 実装）が投げた ImportError まで「extra 未導入」と誤診断されるため。
+        # 段 1: extra 可用性の確定（実 rollout の API コストを払う前に fail-fast する）。
+        # `_require_agentlightning` は内側で ImportError しか受けないため、`import agentlightning`
+        # のモジュール初期化中に出る非 ImportError（依存バージョン不整合の TypeError 等）も
+        # TRAINER_FAILED へ倒す（FR-8: pre-flight 失敗も構造化エラーで返す）。
         try:
-            # 実 rollout（train × 1 件の API コスト）を払う前に extra 可用性を確定させる。
             _require_agentlightning()
+        except ImportError as exc:
+            raise OptimizeError(FailureKind.EXTRA_MISSING, str(exc)) from exc
+        except Exception as exc:
+            raise OptimizeError(
+                FailureKind.TRAINER_FAILED,
+                f"pre-flight の extra 可用性検査に失敗しました: {_format_exception_message(exc)}",
+            ) from exc
+
+        # 段 2: 観測の実行。ImportError を特別扱いしない（利用者ツールの import 失敗を extra
+        # 未導入と誤診断しないため）。`OptimizeError` は kind と原文メッセージ（coverage 添付を
+        # 含む）を保つため raise-through する。観測ループ内の例外は `_check_route_coverage` が
+        # 部分 `CoverageReport` 付きの `TRAINER_FAILED` へ変換済みで、この経路を通る。
+        # 下の `except Exception` はループ外（呼び出し準備段階）の例外に対する FR-8 の安全網
+        # として残す（`coverage` は付かない）。標識文字列が `_rollout` 側と重複するが、
+        # 診断の入口が 2 つある事実を隠さない方を優先する。
+        try:
             await _check_route_coverage(
                 target=target,
                 registry=registry,
@@ -286,15 +350,14 @@ async def optimize(
                 approvals=approvals,
                 tool_mocks=tool_mocks,
                 context_factory=context_factory,
+                timeout_seconds=effective_config.timeout_seconds,
             )
         except OptimizeError:
             raise
-        except ImportError as exc:
-            raise OptimizeError(FailureKind.EXTRA_MISSING, str(exc)) from exc
         except Exception as exc:
             raise OptimizeError(
                 FailureKind.TRAINER_FAILED,
-                f"pre-flight route coverage の観測に失敗しました: {exc}",
+                f"pre-flight route coverage の観測に失敗しました: {_format_exception_message(exc)}",
             ) from exc
 
     from ..._adapters import run_apo
@@ -322,8 +385,13 @@ async def optimize(
     except ImportError as exc:
         raise OptimizeError(FailureKind.EXTRA_MISSING, str(exc)) from exc
     except Exception as exc:
+        # 型名は常に・本文は非空のときだけ（`str(TimeoutError())` は空で、無条件連結だと
+        # コロン終わりの情報ゼロ文字列になる）。run_apo 内の X1/X2 は partial 付きの
+        # OptimizeError を発生源で組むため、この catch-all に落ちるのは run_apo の外縁
+        # （`_require_agentlightning` の非 ImportError・準備段階の失敗等）のみ。
         raise OptimizeError(
-            FailureKind.TRAINER_FAILED, f"最適化の実行に失敗しました: {exc}"
+            FailureKind.TRAINER_FAILED,
+            f"最適化の実行に失敗しました: {_format_exception_message(exc)}",
         ) from exc
 
     # 新 shape slot（`Slot.segments` 非空）は run_apo が tune-only テキストを返すため、返却後に
@@ -447,9 +515,13 @@ def _resolve_config(config: OptimizeConfig | None, direct_kwargs: dict[str, Any]
 
     has_direct = any(direct_kwargs[k] is not None for k in _DIRECT_CONFIG_KEYS)
     if config is not None and has_direct:
+        # どの kwarg が衝突したかを列挙する。特に `skip_coverage_check=False` は意味的には
+        # 既定値だが明示指定として衝突扱いになるため、名前が出ないと利用者が原因を特定できない。
+        offending = sorted(k for k, v in direct_kwargs.items() if v is not None)
         raise OptimizeError(
             FailureKind.CONFIG_MISSING,
-            "config= と直接 kwargs（apo_client= 等）を同時に指定することはできません。"
+            "config= と直接 kwargs を同時に指定することはできません。"
+            f"同時指定された kwargs: {offending}。"
             "どちらか一方のみを使ってください（最小ケースは直接 kwargs を推奨）",
         )
     if config is not None:

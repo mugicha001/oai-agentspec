@@ -64,3 +64,11 @@ def test_optimize_config_skip_coverage_check_default_false() -> None:
 def test_optimize_config_skip_coverage_check_can_be_true() -> None:
     """skip_coverage_check=True で opt-out できる。"""
     assert OptimizeConfig(skip_coverage_check=True).skip_coverage_check is True
+
+
+def test_optimize_config_apo_api_defaults_none() -> None:
+    """`apo_api` は既定 None（auto = Responses 優先 + 404 fallback・現行互換）。"""
+    from oai_agentspec.runtime.lightning import OptimizeConfig
+
+    assert OptimizeConfig().apo_api is None
+    assert OptimizeConfig(apo_api="chat_completions").apo_api == "chat_completions"

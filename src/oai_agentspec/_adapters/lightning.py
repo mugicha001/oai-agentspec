@@ -234,25 +234,127 @@ def _messages_to_responses_input(
     return input_messages, instructions
 
 
-async def _responses_complete_text(
-    *, client: Any, model: str, messages: list[dict[str, Any]], temperature: float
-) -> str:
-    """Responses API で chat-style messages を 1 ターン実行し最終テキストを返す。
+# モデル / デプロイ不在を示す 404 の error code（これらは fallback せず伝搬させる。
+# chat へ倒すと「モデル名のタイポ」が「chat 側の別エラー」に化けて真因が隠れるため）。
+_MODEL_NOT_FOUND_CODES = frozenset({"model_not_found", "deploymentnotfound"})
 
-    `chat.completions.create` の代替として使う（agent-lightning APO のサブクラス内部で利用）。
-    `messages` を `(input, instructions)` に分解し `client.responses.create(...)` を呼ぶ。戻り値は
-    `response.output_text`（OpenAI SDK の便宜プロパティ・全 output text セグメントを連結した str）。
-    Azure の Responses-only deployment（gpt-5 系等）でも動作する経路。
+
+def _is_endpoint_missing_404(exc: Any) -> bool:
+    """404 が「/responses エンドポイント不在」かを判定する（モデル不在なら False）。
+
+    OpenAI は未知モデルに `error.code='model_not_found'`、Azure は `DeploymentNotFound` を
+    返す。いずれもエンドポイント自体は存在するため chat への fallback は不適切
+    （設定ミスの隠蔽になる）。判別できない 404（`{'detail': 'Not Found'}` 形式の
+    ゲートウェイ応答等）はエンドポイント不在とみなす。
 
     Args:
-        client: AsyncOpenAI 互換クライアント（`responses` 属性を持つ）。
-        model: 呼び出すモデル名（Azure ではデプロイ名）。
-        messages: chat-style messages（poml 生成・system は instructions に分離される）。
+        exc: 捕捉した `openai.NotFoundError`。
+
+    Returns:
+        エンドポイント不在（fallback してよい）なら True。
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, str) and code.lower() in _MODEL_NOT_FOUND_CODES:
+        return False
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        body_code = body.get("code")
+        if isinstance(body_code, str) and body_code.lower() in _MODEL_NOT_FOUND_CODES:
+            return False
+    return True
+
+
+async def _chat_complete_text(
+    *, client: Any, model: str, messages: list[dict[str, Any]], temperature: float
+) -> str:
+    """chat.completions で chat-style messages を 1 ターン実行し最終テキストを返す。
+
+    上流 agent-lightning APO 本来の呼び出し形（`apo.py` は chat.completions を使う）。
+    Responses API を持たない chat-only ゲートウェイ（litellm 等）向けの fallback 経路。
+
+    Args:
+        client: AsyncOpenAI 互換クライアント（`chat.completions` を持つ）。
+        model: 呼び出すモデル名。
+        messages: chat-style messages（system 分離は不要・そのまま渡す）。
         temperature: 生成温度。
 
     Returns:
-        モデル出力テキスト（`response.output_text`・空 / None なら空文字列）。
+        モデル出力テキスト（空 / None なら空文字列）。
     """
+    response = await client.chat.completions.create(
+        model=model, messages=messages, temperature=temperature
+    )
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", "") or ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # 互換ゲートウェイの content-parts 形式（[{"type": "text", "text": ...}, ...]）を
+        # text 連結で str へ強制する（`-> str` 契約の維持・list 混入で下流の文字列処理が
+        # 原因から遠い場所で落ちるのを防ぐ）。
+        return "".join(
+            part.get("text", "") if isinstance(part, dict) else (getattr(part, "text", "") or "")
+            for part in content
+        )
+    return str(content)
+
+
+async def _responses_complete_text(
+    *,
+    client: Any,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    allow_chat_fallback: bool = True,
+    unsupported_models: set[str] | None = None,
+) -> str:
+    """chat-style messages を 1 ターン実行し最終テキストを返す（Responses 優先・chat fallback）。
+
+    `chat.completions.create` の代替として使う（agent-lightning APO のサブクラス内部で利用）。
+    まず `messages` を `(input, instructions)` に分解し `client.responses.create(...)` を呼ぶ
+    （Azure の Responses-only deployment（gpt-5 系等）でも動作する経路）。エンドポイント不在
+    （`openai.NotFoundError` = 404）の場合のみ、上流 agent-lightning 本来の
+    `chat.completions.create` へ自動 fallback する（litellm 等の chat-only ゲートウェイ対応・
+    「client を渡せばそのまま動く」の維持）。fallback は client 単位で記憶し、同一 client の
+    2 回目以降は Responses を再試行しない。記憶は呼び出し側が渡す `unsupported_models`
+    （モデル名の set）に閉じる — `_build_apo` が APO インスタンス属性として持たせるため、
+    寿命は 1 APO インスタンス（= 1 slot の実行）に限定され、一過性の誤分類 404 が
+    プロセス寿命まで残らない。モデル名単位なので他モデルの正常な Responses 経路を
+    巻き込まない。None なら記憶なしで毎回試行する。
+    モデル / デプロイ不在を示す 404（`model_not_found` / `DeploymentNotFound`）および
+    404 以外の失敗（認証エラー等）は fallback せず伝搬する（誤設定の隠蔽防止）。
+
+    Args:
+        client: AsyncOpenAI 互換クライアント（`responses` または `chat.completions` を持つ）。
+        model: 呼び出すモデル名（Azure ではデプロイ名）。
+        messages: chat-style messages（poml 生成・Responses 経路では system を instructions に
+            分離し、chat fallback 経路ではそのまま渡す）。
+        temperature: 生成温度。
+
+    Returns:
+        モデル出力テキスト（空 / None なら空文字列）。
+    """
+    from openai import NotFoundError
+
+    if allow_chat_fallback:
+        # auto（apo_api 未指定）のみの経路。明示 "responses"（allow_chat_fallback=False）では
+        # 属性ショートカットも memo ヒットも使わず必ず Responses を呼ぶ — 「明示したのに黙って
+        # chat へ行く」経路をゼロにする fail-closed（先行 auto 実行の記憶にも影響されない）。
+        # `responses` 属性を持たない最小構成の chat-only client / プロキシは、404 を待つ以前に
+        # 属性アクセスで落ちるため最初から chat を使う（memo 不関与・getattr は毎回で十分安い）。
+        if getattr(client, "responses", None) is None:
+            return await _chat_complete_text(
+                client=client, model=model, messages=messages, temperature=temperature
+            )
+
+        if unsupported_models is not None and model in unsupported_models:
+            return await _chat_complete_text(
+                client=client, model=model, messages=messages, temperature=temperature
+            )
+
     input_messages, instructions = _messages_to_responses_input(messages)
     kwargs: dict[str, Any] = {
         "model": model,
@@ -261,7 +363,28 @@ async def _responses_complete_text(
     }
     if instructions is not None:
         kwargs["instructions"] = instructions
-    response = await client.responses.create(**kwargs)
+    try:
+        response = await client.responses.create(**kwargs)
+    except NotFoundError as exc:
+        if not allow_chat_fallback:
+            # 明示 "responses": 404 でも fallback せず伝搬（記憶にも書かない）。
+            raise
+        if not _is_endpoint_missing_404(exc):
+            # モデル / デプロイ不在の 404。chat へ倒すと設定ミスが別のエラーに化けるため伝搬。
+            raise
+        # /responses エンドポイント不在（chat-only ゲートウェイ）。上流本来の chat へ倒す。
+        logger.warning(
+            "[apo] client が Responses API 非対応（404）のため chat.completions へ "
+            "fallback します（model=%s・以降この (client, model) では chat を使用）",
+            model,
+        )
+        text = await _chat_complete_text(
+            client=client, model=model, messages=messages, temperature=temperature
+        )
+        # 記憶は fallback が成功してから（一過性の失敗で chat 固定化しないため）。
+        if unsupported_models is not None:
+            unsupported_models.add(model)
+        return text
     return getattr(response, "output_text", "") or ""
 
 
@@ -305,6 +428,8 @@ async def _responses_compute_textual_gradient(
     )
     return await _responses_complete_text(
         client=self.async_openai_client,
+        allow_chat_fallback=getattr(self, "_oas_allow_chat_fallback", True),
+        unsupported_models=getattr(self, "_oas_responses_unsupported", None),
         model=self.gradient_model,
         messages=tg_msg["messages"],
         temperature=self.diversity_temperature,
@@ -348,6 +473,8 @@ async def _responses_textual_gradient_and_apply_edit(
     )
     return await _responses_complete_text(
         client=self.async_openai_client,
+        allow_chat_fallback=getattr(self, "_oas_allow_chat_fallback", True),
+        unsupported_models=getattr(self, "_oas_responses_unsupported", None),
         model=self.apply_edit_model,
         messages=ae_msg["messages"],
         temperature=self.diversity_temperature,
@@ -401,14 +528,27 @@ def _build_apo(config: OptimizeConfig | None) -> Any:
         kwargs["rollout_batch_timeout"] = config.timeout_seconds
 
     instance = APO(**kwargs)
+    from ..runtime.lightning.config import APO_API_CHAT_COMPLETIONS
+
+    apo_api = getattr(config, "apo_api", None)
+    if apo_api == APO_API_CHAT_COMPLETIONS:
+        # 明示 chat: override を bind しない = 上流 agent-lightning 本来の chat.completions
+        # 実装がそのまま動く（gradient / apply-edit とも）。
+        return instance
     # Responses API 版へインスタンスメソッド差し替え（dataclass instance / pydantic model どちらでも
-    # 動く・bound method として束ねるため `types.MethodType` を使う）。
+    # 動く・bound method として束ねるため `types.MethodType` を使う）。override 2 本は必ず同時に
+    # bind する（片方のみだと gradient と apply-edit で API が食い違う不整合になる）。
     instance.compute_textual_gradient = types.MethodType(  # type: ignore[method-assign]
         _responses_compute_textual_gradient, instance
     )
     instance.textual_gradient_and_apply_edit = types.MethodType(  # type: ignore[method-assign]
         _responses_textual_gradient_and_apply_edit, instance
     )
+    # 明示 "responses" は fallback 禁止（明示したのに黙って chat へ化けない）。None（auto）は許可。
+    instance._oas_allow_chat_fallback = apo_api is None
+    # fallback 済みモデルの memo（本インスタンスの寿命に閉じる。gradient / apply-edit の
+    # 呼び出し間で 404 再試行を省く目的だけの最小状態）。
+    instance._oas_responses_unsupported = set()
     return instance
 
 
@@ -621,6 +761,102 @@ async def _run_apo_single_slot(
     return best_text, history_entry
 
 
+def _build_partial(
+    *,
+    current: dict[str, str],
+    history: list[Any],
+    vars_map: dict[str, dict[str, str]],
+    failed_slot: str | None,
+) -> Any:
+    """完了済み slot の部分成果 `OptimizePartial` を組み立てる（best-effort・失敗時 None）。
+
+    `${var}` 再注入は run_apo 正常経路と同一規則（`substitute_braced`・braced のみ）。
+    `substitute_braced` は vars 値へ `str()` を適用するため、`__str__` が例外を投げる利用者
+    オブジェクトで組み立て自体が失敗しうる。診断のための処理を新たな失敗源にしないため、
+    失敗時は None を返して元例外を優先する（fail-safe）。
+
+    Args:
+        current: 現在の候補 mapping（完了済み slot は最良テキスト・未処理 slot は seed のまま）。
+        history: 完了済み slot の `HistoryEntry` 列（この `slot` キーの集合が「完了済み」の SoT）。
+        vars_map: `{slot 名: vars}` の再注入 mapping。
+        failed_slot: 失敗した slot 名（None は全 slot 完了・スコア再計算段の失敗）。
+
+    Returns:
+        `OptimizePartial`。保全対象がない（history 空）または組み立て失敗時は None。
+    """
+    if not history:
+        return None
+    from ..runtime.lightning._placeholders import substitute_braced
+    from ..runtime.lightning.types import OptimizePartial
+
+    try:
+        completed = {
+            entry["slot"]: substitute_braced(current[entry["slot"]], vars_map.get(entry["slot"]))
+            for entry in history
+        }
+        return OptimizePartial(
+            completed_slots=completed,
+            # to_dict と同様に各 entry を浅コピーして独立化する（利用者が partial 経由で
+            # 書き換えても run_apo ローカルの history と共有参照にならない）。
+            history=[dict(entry) for entry in history],
+            failed_slot=failed_slot,
+        )
+    except Exception:
+        logger.warning(
+            "[apo] 部分成果の組み立てに失敗しました（partial なしで継続）", exc_info=True
+        )
+        return None
+
+
+def _raise_run_apo_failure(
+    exc: BaseException,
+    *,
+    partial: Any,
+    trainer_message: str,
+) -> None:
+    """run_apo の失敗を 3 系統へ振り分けて送出する（X1 / X2 共有・partial 保全ポリシーの単一定義）。
+
+    - 既に `OptimizeError` の失敗（NFR-8 fail-closed の CONFIG_MISSING 等）: kind / message を
+      保つため再ラップせず、`partial` が空のときのみ属性後付けして re-raise する。
+    - `ImportError`（agentlightning の `[apo]` 系サブ依存（poml 等）の遅延 import 失敗、または
+      rollout 内の利用者コード import 失敗）: kind 契約（`EXTRA_MISSING`）を維持しつつ
+      `OptimizeError` に包み `partial` を保全する（生 raise は完了済み slot の成果を捨てる）。
+    - その他: `TRAINER_FAILED` として `trainer_message` で送出する。
+
+    Args:
+        exc: 捕捉した例外。
+        partial: `_build_partial` の結果（None 可）。
+        trainer_message: `TRAINER_FAILED` 用の完成済みメッセージ。
+
+    Raises:
+        OptimizeError: 常に送出する（本関数は戻らない）。
+    """
+    from ..runtime.lightning.types import (
+        FailureKind,
+        OptimizeError,
+        _format_exception_message,
+    )
+
+    if isinstance(exc, OptimizeError):
+        if exc.partial is None:
+            exc.partial = partial
+        raise exc
+    if isinstance(exc, ImportError):
+        hint = (
+            "（完了済み slot の部分成果は error.partial から取得できます）"
+            if partial is not None
+            else ""
+        )
+        raise OptimizeError(
+            FailureKind.EXTRA_MISSING,
+            "APO の実行に必要な import に失敗しました"
+            "（agentlightning のサブ依存（poml 等）の欠落、または rollout 内の"
+            f"利用者コード import 失敗）: {_format_exception_message(exc)}{hint}",
+            partial=partial,
+        ) from exc
+    raise OptimizeError(FailureKind.TRAINER_FAILED, trainer_message, partial=partial) from exc
+
+
 async def run_apo(
     *,
     seeds: dict[str, str],
@@ -664,41 +900,90 @@ async def run_apo(
     # NFR-1: コア（`_adapters`）は runtime を module top で import しない（`docs/architecture.md`
     # 単方向依存）。本関数内の遅延 import で参照する（`_make_litagent` / `_run_apo_single_slot` /
     # `_compose_full` でも同じパターン）。
-    from ..runtime.lightning.types import HistoryEntry, OptimizeResult
+    from ..runtime.lightning.types import (
+        HistoryEntry,
+        OptimizeResult,
+        _format_exception_message,
+    )
 
     current = dict(seeds)
     history: list[HistoryEntry] = []
-    for slot_name in seeds:
-        best_text, entry = await _run_apo_single_slot(
-            slot_name=slot_name,
-            other_candidates=current,
-            train=train,
-            val=val,  # type: ignore[arg-type]  # 呼び出し側で None でないことを保証
-            rollout=rollout,
-            config=config,
-        )
+    vars_map = dict(vars_per_slot or {})
+    slot_names = list(seeds)
+    for index, slot_name in enumerate(slot_names, start=1):
+        # X1: slot 途中失敗。完了済み slot（1..index-1）の最良テキストと履歴は API コストを
+        # 払って確定済みで、失敗とともにローカル変数ごと破棄しない（`OptimizeError.partial`
+        # へ添付・pre-flight の `coverage` 保全と同じ動機）。
+        try:
+            best_text, entry = await _run_apo_single_slot(
+                slot_name=slot_name,
+                other_candidates=current,
+                train=train,
+                val=val,  # type: ignore[arg-type]  # 呼び出し側で None でないことを保証
+                rollout=rollout,
+                config=config,
+            )
+        except Exception as exc:
+            partial = _build_partial(
+                current=current, history=history, vars_map=vars_map, failed_slot=slot_name
+            )
+            hint = (
+                "（完了済み slot の部分成果は error.partial から取得できます）"
+                if partial is not None
+                else ""
+            )
+            _raise_run_apo_failure(
+                exc,
+                partial=partial,
+                trainer_message=(
+                    f"slot {index}/{len(slot_names)} {slot_name!r} の APO 実行に失敗しました: "
+                    f"{_format_exception_message(exc)}{hint}"
+                ),
+            )
         current[slot_name] = best_text
         history.append(entry)
 
-    # 全スロット最良の合成候補で train / val を再計算（複数スロット時の合成効果を反映）。
-    train_score = await _score_candidate(current, train, rollout)
-    val_score = await _score_candidate(current, val or [], rollout) if val else None
+    # X2: 全 slot 完了後の失敗（スコア再計算・`${var}` 再注入・diff 算出）。最適化そのものは
+    # 全部成功しているため、全 slot の最良テキストを partial に載せて全損を防ぐ。
+    try:
+        # 全スロット最良の合成候補で train / val を再計算（複数スロット時の合成効果を反映）。
+        train_score = await _score_candidate(current, train, rollout)
+        val_score = await _score_candidate(current, val or [], rollout) if val else None
 
-    # tune 側 `${var}` を rollout 実体と同じ規則で再注入する（固定セグメントは新 shape の
-    # `_recompose_new_shape_results` が `Slot.segments` から compose_from_marked で組み直す・
-    # custom build / 生 seed 経路は再注入なしで返す）。braced (`${var}`) のみ置換で bare `$var`
-    # 副作用を避ける。
-    from ..runtime.lightning._placeholders import substitute_braced, unified_diff_labeled
+        # tune 側 `${var}` を rollout 実体と同じ規則で再注入する（固定セグメントは新 shape の
+        # `_recompose_new_shape_results` が `Slot.segments` から compose_from_marked で組み直す・
+        # custom build / 生 seed 経路は再注入なしで返す）。braced (`${var}`) のみ置換で bare
+        # `$var` 副作用を避ける。
+        from ..runtime.lightning._placeholders import substitute_braced, unified_diff_labeled
 
-    vars_map = dict(vars_per_slot or {})
-    composed_seeds = {name: substitute_braced(seeds[name], vars_map.get(name)) for name in seeds}
-    composed_prompts = {
-        name: substitute_braced(current[name], vars_map.get(name)) for name in current
-    }
+        composed_seeds = {
+            name: substitute_braced(seeds[name], vars_map.get(name)) for name in seeds
+        }
+        composed_prompts = {
+            name: substitute_braced(current[name], vars_map.get(name)) for name in current
+        }
 
-    diffs = {
-        name: unified_diff_labeled(composed_seeds[name], composed_prompts[name]) for name in current
-    }
+        diffs = {
+            name: unified_diff_labeled(composed_seeds[name], composed_prompts[name])
+            for name in current
+        }
+    except Exception as exc:
+        partial = _build_partial(
+            current=current, history=history, vars_map=vars_map, failed_slot=None
+        )
+        hint = (
+            "（全 slot の最適化は完了済みです。最良テキストは error.partial から取得できます）"
+            if partial is not None
+            else ""
+        )
+        _raise_run_apo_failure(
+            exc,
+            partial=partial,
+            trainer_message=(
+                f"最適化結果のスコア再計算・整形に失敗しました: "
+                f"{_format_exception_message(exc)}{hint}"
+            ),
+        )
 
     prompt: str | dict[str, str]
     seed_out: str | dict[str, str]

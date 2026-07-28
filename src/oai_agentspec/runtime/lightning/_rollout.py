@@ -11,6 +11,7 @@ registry 組み直し → SDK 経由実行 + 承認自動解決 (`_make_rollout`
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 from typing import TYPE_CHECKING, Any
@@ -23,6 +24,7 @@ from .types import (
     RolloutResult,
     Slot,
     _CandidateInvalid,
+    _format_exception_message,
 )
 
 if TYPE_CHECKING:
@@ -31,6 +33,77 @@ if TYPE_CHECKING:
     from ...registry import AgentRegistry
 
 logger = logging.getLogger(__name__)
+
+
+async def _execute_once(
+    *,
+    target: Any,
+    registry: AgentRegistry | None,
+    slots: dict[str, Slot] | None,
+    rebind: Callable[[Any], Any] | None,
+    candidate: dict[str, str],
+    case: Any,
+    approvals: Callable[[dict], bool] | None,
+    tool_mocks: dict[str, dict[str, Any]] | None,
+    context_factory: Callable[[], Any] | None,
+) -> tuple[Any, Any, list[str]] | None:
+    """候補を適用して 1 case を実行し `(outcome, observation, fired_approvals)` を返す。
+
+    pre-flight 観測（`_observe_route_steps`）と本番 rollout（`_make_rollout` の closure）の共通
+    実行経路。候補適用 → 早期 return → `_target.normalize` → `_run_one` の手順を 1 箇所に集約し、
+    両経路が同一手順で agent を組むことを構造で担保する（片方だけが変更されて pre-flight の
+    観測条件が本番 routing と silent に乖離するのを防ぐ）。
+
+    candidate 無効（`_apply_candidate` が None を返す / 実行中に `_CandidateInvalid`）のときは
+    `None` を返し、degrade の仕方（reward 0.0 / 空観測）は呼び出し側に委ねる。
+
+    Args:
+        target: 最適化対象。
+        registry: specs 供給経路 / 既定 build の spec 解決元。
+        slots: 自動 rebind 経路の `{名前: Slot}`（None で生 seed + rebind 経路）。
+        rebind: 生 seed 経路の rebind（pre-flight 経路は None）。
+        candidate: 適用する候補スロット mapping。
+        case: 実行する入力ケース。
+        approvals: 承認自動解決ポリシー。
+        tool_mocks: agent スコープのモック dict。
+        context_factory: 実行ごとに新鮮な context を生成する引数なし callable（None で
+            `context=None`）。
+
+    Returns:
+        `(RunOutcome, マージ済み ObservedRun, fired_approvals ツール名列)`。候補無効なら None。
+    """
+    applied = _apply_candidate(
+        target=target, registry=registry, slots=slots, rebind=rebind, candidate=candidate
+    )
+    if applied is None:
+        # 必要 ${var} 喪失 / `_CandidateInvalid` による無効化（fail-closed）。
+        return None
+    opt_target, opt_registry = applied
+
+    # 遅延 import は早期 return の後に置く（候補無効ケースで import を走らせない本番経路の
+    # 挙動を保つ）。
+    from ..._adapters import DefaultRunnerAdapter
+    from . import _target as target_mod
+
+    # 1 実行 = 1 context（承認 resume ループ内は SDK RunState 内包 context を再利用するため
+    # `_run_one` へは初回分のみ渡す）。
+    context = context_factory() if context_factory is not None else None
+    agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
+    try:
+        return await _run_one(
+            agent=agent,
+            case=case,
+            replaced=replaced,
+            approvals=approvals,
+            runner=DefaultRunnerAdapter(),
+            context=context,
+        )
+    except _CandidateInvalid:
+        # vars=callable 経路: dynamic instructions closure が SDK Runner.run 実行時に
+        # `_CandidateInvalid` を投げるケース（境界マーカー崩れ or vars_fn 非 dict 戻り値）。
+        # C1 対応: build 時ではなく rollout 時に発火する例外を per-candidate 無効化経路へ
+        # 落とす。他の例外（TypeError / RuntimeError 等）は暴走防止のため伝搬させる。
+        return None
 
 
 async def _observe_route_steps(
@@ -43,7 +116,7 @@ async def _observe_route_steps(
     approvals: Callable[[dict], bool] | None,
     tool_mocks: dict[str, dict[str, Any]] | None,
     context_factory: Callable[[], Any] | None,
-) -> tuple[tuple[str, ...], bool]:
+) -> tuple[tuple[str, ...] | None, bool]:
     """seed 状態で 1 case を rollout し `(route_steps, interrupted)` を返す（pre-flight 用）。
 
     `_make_rollout` の rollout closure（reward 呼び出しを含む）を経由せず、`_apply_candidate`
@@ -65,46 +138,86 @@ async def _observe_route_steps(
         context_factory: context 生成 factory（引数なし・本番同値素通し）。
 
     Returns:
-        `(route_steps: tuple[str, ...], interrupted: bool)`。candidate 無効（`_apply_candidate`
-        が None / `_CandidateInvalid`）の場合のみ `((), False)`（観測なし）。interrupted の
-        場合も観測できた route_steps を返す。
+        `(route_steps: tuple[str, ...] | None, interrupted: bool)`。route_steps は 3 値:
+        `None` = candidate 無効（`_apply_candidate` の None / rollout 実行時の
+        `_CandidateInvalid`。rollout の観測が得られていない）/ `()` = 実行済みだが観測が空
+        （防御的経路）/ 非空 tuple = 到達観測。`None` を `()` へ畳むと「未到達確定」と
+        区別できず誤診断になるため、無効化は型レベルで排他表現する。interrupted の場合も
+        観測できた route_steps を返す。
 
     Note:
         candidate 無効以外の例外（API のレート制限・タイムアウト等）は捕捉せず伝播させ、
-        呼び出し側の `optimize()` が `TRAINER_FAILED` へ変換する。観測失敗を空観測へ
-        degrade させると `covered` が過小になり偽陽性の fail-fast を生むため、意図的に
-        握らない。
+        呼び出し側の `_check_route_coverage` が部分 `CoverageReport` を添付した
+        `TRAINER_FAILED` へ変換する。観測失敗を空観測へ degrade させると `covered` が
+        過小になり偽陽性の fail-fast を生むため、意図的に握らない。呼び出し側が
+        `timeout_seconds` で被せる `asyncio.wait_for` 由来の `TimeoutError` も同方針。
     """
-    from ..._adapters import DefaultRunnerAdapter
-    from . import _target as target_mod
-
-    applied = _apply_candidate(
+    executed = await _execute_once(
         target=target,
         registry=registry,
         slots=slots,
         rebind=None,
         candidate=dict(seeds),
+        case=case,
+        approvals=approvals,
+        tool_mocks=tool_mocks,
+        context_factory=context_factory,
     )
-    if applied is None:
-        # 必要 ${var} 喪失 / _CandidateInvalid で無効化 → 空観測（union 集計から除外）
-        return (), False
-    opt_target, opt_registry = applied
-
-    context = context_factory() if context_factory is not None else None
-    agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
-    try:
-        outcome, observation, _fired = await _run_one(
-            agent=agent,
-            case=case,
-            replaced=replaced,
-            approvals=approvals,
-            runner=DefaultRunnerAdapter(),
-            context=context,
-        )
-    except _CandidateInvalid:
-        return (), False
+    if executed is None:
+        # 必要 ${var} 喪失 / _CandidateInvalid で無効化 → None（観測なしの標識・union 不寄与。
+        # 系統 3（rollout 実行時の _CandidateInvalid）は部分実行後の観測破棄を含むため
+        # 「実行されなかった」ではなく「観測が得られなかった」が正確な意味論）
+        return None, False
+    outcome, observation, _fired = executed
 
     return tuple(step.agent for step in observation.route.steps), bool(outcome.interrupted)
+
+
+def _format_observation_failure(
+    *,
+    exc: BaseException,
+    index: int,
+    total: int,
+    timeout_seconds: float | None,
+    covered: set[str],
+    observed: int,
+    interrupted: int,
+    invalid: int = 0,
+) -> str:
+    """pre-flight 観測失敗の人間可読メッセージを組み立てる（case 本文は含めない）。
+
+    `str(TimeoutError())` のように本文が空になる例外型があるため、型名は常に出し、本文は
+    非空のときだけ連結する（連結すると `'... TimeoutError: '` とコロンで終わり情報がゼロになる）。
+
+    Args:
+        exc: 観測を中断させた例外。
+        index: 失敗した case の 1 始まり位置。
+        total: train の総件数。
+        timeout_seconds: 1 case 観測上限（None は未適用）。
+        covered: そこまでに到達を観測した slot 名集合。
+        observed: 観測を完了した case 数（無効化 case は含まない・per_case の非 None
+            エントリ数）。
+        interrupted: `RunOutcome.interrupted` となった case 数。
+        invalid: 候補無効化により観測が得られなかった case 数（既定 0）。
+
+    Returns:
+        診断メッセージ（複数行・機微データ非含有）。
+    """
+    detail = _format_exception_message(exc)
+    limit = (
+        f"1 case 観測上限 {timeout_seconds} 秒"
+        if timeout_seconds is not None
+        else "1 case 観測上限なし"
+    )
+    return (
+        f"pre-flight route coverage の観測が case {index}/{total} で失敗しました"
+        f"（{limit}）: {detail}\n"
+        f"  到達済み slot（部分観測）: {sorted(covered)}\n"
+        f"  観測完了 case: {observed}/{total}（interrupted={interrupted}）\n"
+        + (f"  無効化 case: {invalid}/{total}\n" if invalid else "")
+        + "  部分診断は error.coverage（CoverageReport・complete=False）から取得できます"
+        "（missing は未到達の確定ではなく未観測を含みます）。"
+    )
 
 
 async def _check_route_coverage(
@@ -117,6 +230,7 @@ async def _check_route_coverage(
     approvals: Callable[[dict], bool] | None,
     tool_mocks: dict[str, dict[str, Any]] | None,
     context_factory: Callable[[], Any] | None,
+    timeout_seconds: float | None = None,
 ) -> None:
     """train 全件で seed 状態 rollout を観測し未到達 slot があれば fail-fast する（pre-flight）。
 
@@ -139,16 +253,32 @@ async def _check_route_coverage(
         approvals: 承認ガード（本番同値素通し）。
         tool_mocks: ツールモック（本番同値素通し）。
         context_factory: context 生成 factory（引数なし・本番同値素通し）。
+        timeout_seconds: 1 case の観測に掛ける壁時計上限秒（`asyncio.wait_for`）。承認自動解決
+            ループ（最大 6 rollout）も内側に含む。None（既定）は `wait_for` を適用せず上限なし。
+            pre-flight 全体の上限ではないため、全体の壁時計は `timeout_seconds × len(train)`
+            まで伸びうる。
 
     Raises:
-        OptimizeError: 未到達 slot 集合が非空のとき `FailureKind.CONFIG_MISSING`
-            （`coverage` 添付・`logger.warning` 出力）。
+        OptimizeError: 次の 3 経路。いずれも `logger.warning` に集計行を出す。
+            (1) 未到達 slot 集合が非空 → `FailureKind.CONFIG_MISSING`・`coverage` は
+                `complete=True`（観測ループを完走）。メッセージは無効化 case の有無で
+                3 分岐する（無効化ゼロ = 未到達確定の全数主張 / 部分無効化 = 観測件数と
+                無効化件数を分離 / 全件無効化 = 「一度も routing されなかった」と主張せず
+                無効化原因のみ提示）。
+            (2) 観測が例外で中断（`timeout_seconds` 超過の `TimeoutError` / モデル API
+                エラー等）→ `FailureKind.TRAINER_FAILED`・`coverage` は `complete=False`
+                の部分レポート（原例外は `__cause__`）。degrade はせず、支払い済み API
+                コストで得た到達観測を構造化して載せてから送出する。
+            (3) 観測中に既に `OptimizeError` が飛んだ場合（承認安全違反の `CONFIG_MISSING`
+                等）はそのまま通す。再ラップすると kind が変質するため（`coverage` は
+                当該経路の値のまま = 通常 None）。
     """
     covered: set[str] = set()
-    per_case: list[tuple[Any, tuple[str, ...]]] = []
+    per_case: list[tuple[Any, tuple[str, ...] | None]] = []
     interrupted = 0
-    for case in train:
-        steps, was_interrupted = await _observe_route_steps(
+    invalid = 0
+    for index, case in enumerate(train, start=1):
+        observe = _observe_route_steps(
             target=target,
             registry=registry,
             slots=slots,
@@ -158,6 +288,67 @@ async def _check_route_coverage(
             tool_mocks=tool_mocks,
             context_factory=context_factory,
         )
+        try:
+            if timeout_seconds is not None:
+                steps, was_interrupted = await asyncio.wait_for(observe, timeout=timeout_seconds)
+            else:
+                steps, was_interrupted = await observe
+        except Exception as exc:
+            # 部分観測の保全: 支払い済みの API コストで得た到達情報を診断可能な形で残す。
+            # case 本文は出力しない（機微データの漏出防止・`CoverageReport.per_case` を
+            # repr 抑止しているのと同じ PII 方針）。
+            if isinstance(exc, OptimizeError):
+                # 既に構造化済みの失敗（承認安全違反の CONFIG_MISSING 等）はそのまま通す。
+                # 再ラップすると kind が TRAINER_FAILED へ変質し、docs 明記済みの契約が壊れる。
+                # observation failed の warning も出さない（意図的な fail-closed であって観測
+                # 失敗ではなく、2 つの矛盾する診断が並ぶため）。
+                raise
+            logger.warning(
+                "[preflight] observation failed at case %d/%d: "
+                "error=%s, covered=%s, interrupted=%d",
+                index,
+                len(train),
+                type(exc).__name__,
+                sorted(covered),
+                interrupted,
+            )
+            # ログは設定次第で消え文字列でしか残らないため、部分観測を構造化して例外に載せる
+            # （案 B の動機「エラーで観測データがなくなる」を観測失敗経路にも適用する）。
+            raise OptimizeError(
+                FailureKind.TRAINER_FAILED,
+                _format_observation_failure(
+                    exc=exc,
+                    index=index,
+                    total=len(train),
+                    timeout_seconds=timeout_seconds,
+                    covered=covered,
+                    # 観測完了数は非 None エントリで数える（無効化 case は per_case に
+                    # `None` で記録されるため、`len(per_case)` は「記録数」であり
+                    # 観測完了の過大計上になる）。
+                    observed=sum(1 for _, s in per_case if s is not None),
+                    interrupted=interrupted,
+                    invalid=invalid,
+                ),
+                coverage=CoverageReport(
+                    covered=frozenset(covered),
+                    missing=frozenset(set(slots.keys()) - covered),
+                    per_case=tuple(per_case),
+                    interrupted_cases=interrupted,
+                    complete=False,
+                    invalid_cases=invalid,
+                ),
+            ) from exc
+        if steps is None:
+            # 候補無効化（観測なし）。union へは不寄与、per_case には None で記録し、
+            # 実行済み観測空（`()`）と区別する。case 本文は出さない（PII 方針）。
+            invalid += 1
+            per_case.append((case, None))
+            logger.warning(
+                "[preflight] candidate invalidated at case %d/%d (observation discarded)",
+                index,
+                len(train),
+            )
+            continue
         per_case.append((case, steps))
         if was_interrupted:
             interrupted += 1
@@ -166,6 +357,14 @@ async def _check_route_coverage(
 
     missing = set(slots.keys()) - covered
     if not missing:
+        if invalid:
+            # 判定は pass（必要な観測は揃った）が、seed 状態での無効化は構成問題の
+            # シグナルのため silent にしない。
+            logger.warning(
+                "[preflight] coverage passed with %d/%d invalidated case(s)",
+                invalid,
+                len(train),
+            )
         return
 
     report = CoverageReport(
@@ -173,29 +372,66 @@ async def _check_route_coverage(
         missing=frozenset(missing),
         per_case=tuple(per_case),
         interrupted_cases=interrupted,
+        invalid_cases=invalid,
     )
     logger.warning(
-        "[preflight] coverage insufficient: covered=%s, missing=%s, cases=%d, interrupted=%d",
+        "[preflight] coverage insufficient: covered=%s, missing=%s, cases=%d, "
+        "interrupted=%d, invalid=%d",
         sorted(covered),
         sorted(missing),
         len(per_case),
         interrupted,
+        invalid,
     )
-    raise OptimizeError(
-        FailureKind.CONFIG_MISSING,
-        f"train 全 {len(per_case)} 件の seed 状態 rollout で slot {sorted(missing)!r} が"
-        "一度も routing されませんでした（route coverage 不足）。"
-        "以下のいずれかで対処してください:\n"
-        "  1. train ケースに未到達 slot を経由する入力を追加する\n"
-        "     （例: OptimizeCase(input=..., expected_route=[..., '<slot>']) を train へ）\n"
-        "  2. HandoffGraph の handoff edge / trigger 条件を見直し seed prompt から到達可能にする\n"
-        "  3. 意図的に到達不能な slot を最適化対象へ含めている場合は "
-        "optimize(..., skip_coverage_check=True) で本検査を無効化する\n"
-        f"  検出 slot（到達済み）: {sorted(covered)}\n"
-        f"  未到達 slot: {sorted(missing)}\n"
-        "  診断情報は error.coverage（CoverageReport）から取得できます。",
-        coverage=report,
+
+    # メッセージは無効化 case の有無で 3 分岐する。無効化がある状態で「train 全 N 件の
+    # rollout で一度も routing されなかった」と主張するのは偽（観測できていない case が
+    # 混ざる）であり、誤った救済策（train 追加 / edge 見直し）へ誘導してしまうため。
+    invalid_causes = (
+        "  候補無効化の一般的原因:\n"
+        "  a. seed に実在する ${var} プレースホルダの喪失（seed と Slot.vars / 候補テキストの"
+        "不整合）\n"
+        "  b. vars=callable が dict 以外を返している\n"
+        "  c. custom build / セグメント境界マーカーの崩れ（内部無効化シグナル）\n"
     )
+    if invalid == len(per_case):
+        # 全件無効化: rollout の観測が 1 件も得られておらず、未到達は確定していない。
+        message = (
+            f"seed 状態の候補適用が train 全 {len(per_case)} 件で無効化され、"
+            "routing を 1 件も観測できませんでした（route coverage は未判定。"
+            "missing は未観測であり未到達の確定ではありません）。\n"
+            + invalid_causes
+            + f"  無効化 case: {invalid}/{len(per_case)}\n"
+            "  診断情報は error.coverage"
+            "（CoverageReport.invalid_cases / per_case）から取得できます。"
+        )
+    else:
+        observed = len(per_case) - invalid
+        header = (
+            f"train {len(per_case)} 件中 {observed} 件の seed 状態 rollout で slot "
+            f"{sorted(missing)!r} が一度も routing されませんでした（route coverage 不足"
+            + (
+                f"。{invalid} 件は候補無効化で観測できておらず、"
+                f"missing は観測済み {observed} 件の範囲での判定です"
+                if invalid
+                else ""
+            )
+            + "）。以下のいずれかで対処してください:\n"
+        )
+        message = (
+            header + "  1. train ケースに未到達 slot を経由する入力を追加する\n"
+            "     （例: OptimizeCase(input=..., expected_route=[..., '<slot>']) を train へ）\n"
+            "  2. HandoffGraph の handoff edge / trigger 条件を見直し"
+            " seed prompt から到達可能にする\n"
+            "  3. 意図的に到達不能な slot を最適化対象へ含めている場合は "
+            "optimize(..., skip_coverage_check=True) で本検査を無効化する\n"
+            + (invalid_causes if invalid else "")
+            + f"  検出 slot（到達済み）: {sorted(covered)}\n"
+            f"  未到達 slot: {sorted(missing)}\n"
+            + (f"  無効化 case: {invalid}/{len(per_case)}\n" if invalid else "")
+            + "  診断情報は error.coverage（CoverageReport）から取得できます。"
+        )
+    raise OptimizeError(FailureKind.CONFIG_MISSING, message, coverage=report)
 
 
 def _merge_observation(base: Any, nxt: Any) -> Any:
@@ -271,37 +507,22 @@ def _make_rollout(
     """
 
     async def rollout(candidate: dict[str, str], case: Any) -> float:
-        applied = _apply_candidate(
-            target=target, registry=registry, slots=slots, rebind=rebind, candidate=candidate
+        executed = await _execute_once(
+            target=target,
+            registry=registry,
+            slots=slots,
+            rebind=rebind,
+            candidate=candidate,
+            case=case,
+            approvals=approvals,
+            tool_mocks=tool_mocks,
+            context_factory=context_factory,
         )
-        if applied is None:
-            # 必要 ${var} を喪失した候補は無効化（fail-closed・低評価）。
+        if executed is None:
+            # 必要 ${var} を喪失した候補 / rollout 時 `_CandidateInvalid` は無効化
+            # （fail-closed・低評価）。
             return 0.0
-        opt_target, opt_registry = applied
-
-        from ..._adapters import DefaultRunnerAdapter
-        from . import _target as target_mod
-
-        # rollout ごとに新鮮な context を生成する（1 rollout = 1 context・承認 resume ループ内は
-        # SDK RunState 内包 context を再利用するため `_run_one` へは初回分のみ渡す）。
-        context = context_factory() if context_factory is not None else None
-        agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
-        try:
-            outcome, observation, fired_approvals = await _run_one(
-                agent=agent,
-                case=case,
-                replaced=replaced,
-                approvals=approvals,
-                runner=DefaultRunnerAdapter(),
-                context=context,
-            )
-        except _CandidateInvalid:
-            # vars=callable 経路: dynamic instructions closure が SDK Runner.run 実行時に
-            # `_CandidateInvalid` を投げるケース（境界マーカー崩れ or vars_fn 非 dict 戻り値）。
-            # C1 対応: build 時ではなく rollout 時に発火する例外を per-candidate 無効化経路
-            # （reward 0.0）で吸収する。他の例外（TypeError / RuntimeError 等）は
-            # 暴走防止のため伝搬させる。
-            return 0.0
+        outcome, observation, fired_approvals = executed
         result = RolloutResult(
             case=case,
             output=outcome.final_output or "",
