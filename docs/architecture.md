@@ -1394,9 +1394,11 @@ rollout の結線と reward 算出への plain データ供給に徹する。
 - rollout: `_adapters` の `DefaultRunnerAdapter.run_with_observation` で 1 回実行し、`observe_run_result` で plain な
   実行経路 / ツール呼び出し列へ変換して利用者供給の reward へ渡す（生 `RunResult` は `_adapters` 外へ出さない・
   実行トレース捕捉の流儀は「LLMOps 評価」節の実行トレース捕捉を再利用する）。
-- pre-flight coverage: `slots` が非 None かつ target が `AgentSpec` でないとき、`run_apo` 委譲前に seed 状態で `train`
-  全件を観測し、未到達 slot を `OptimizeError(CONFIG_MISSING, coverage=CoverageReport(...))` で fail-fast する
-  （既定有効・`skip_coverage_check` で opt-out・詳細は ADR 0009）。
+- pre-flight coverage: `slots` が非 None かつ target が `HandoffGraph` かつ `skip_coverage_check=False` のとき、
+  `run_apo` 委譲前に seed 状態で `train` 全件を観測し、未到達 slot を
+  `OptimizeError(CONFIG_MISSING, coverage=CoverageReport(...))` で fail-fast する（allow-list であり `AgentSpec` /
+  `WorkflowGraph` target と生 seed + rebind 経路（`slots is None`）は skip する。既定有効・`skip_coverage_check`
+  で opt-out・詳細は ADR 0009）。
 - context 配線: `optimize(context_factory=...)` を渡すと各 rollout（pre-flight coverage 観測を含む）の冒頭で
   factory を 1 回呼び、
   新鮮な context を `run_with_observation(context=...)` 経由で SDK `Runner.run(context=...)` まで素通しする。粒度は

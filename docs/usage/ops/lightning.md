@@ -8,7 +8,7 @@
 
 > **重要（pre-flight coverage 検証が既定有効）**
 >
-> `target` が `HandoffGraph` / `WorkflowGraph` で `slot` を指定した場合、`optimize()` は `run_apo` へ委譲する前に seed 状態の pre-flight rollout を `train` 全件に対して実行し、`slot` に指定した agent が routing で 1 度も呼ばれない構成を `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast します。意図的に到達不能な slot を最適化対象へ含める場合は `skip_coverage_check=True`（`OptimizeConfig` フィールドまたは `optimize()` の kwarg）で opt-out できます。詳細は「[Route coverage 検証（pre-flight）](#route-coverage-検証pre-flight)」節および `docs/adr/0009-lightning-preflight-coverage.md` を参照。
+> `target` が `HandoffGraph` で `slot` を指定した場合、`optimize()` は `run_apo` へ委譲する前に seed 状態の pre-flight rollout を `train` 全件に対して実行し、`slot` に指定した agent が routing で 1 度も呼ばれない構成を `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast します。意図的に到達不能な slot を最適化対象へ含める場合は `skip_coverage_check=True`（`OptimizeConfig` フィールドまたは `optimize()` の kwarg）で opt-out できます。詳細は「[Route coverage 検証（pre-flight）](#route-coverage-検証pre-flight)」節および `docs/adr/0009-lightning-preflight-coverage.md` を参照。
 
 ## 使い分け
 
@@ -271,19 +271,23 @@ fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 
 ## Route coverage 検証（pre-flight）
 
-`optimize()` は冒頭で seed 状態の pre-flight rollout を `train` 全件について実行し、`ObservedRun.route.steps` の agent 名 union と `slot` 集合を突き合わせて未到達 slot を検出します（pre-flight は `RolloutResult` を構築せず reward も呼びません）。既定で有効（`skip_coverage_check=False`）。
+`target` が `HandoffGraph` で `slot` を指定した場合、`optimize()` は `run_apo` へ委譲する前に seed 状態の pre-flight rollout を `train` 全件に対して実行し、`ObservedRun.route.steps` の agent 名 union と `slot` 集合を突き合わせて未到達 slot を検出します（既定有効・`skip_coverage_check=False`）。pre-flight は `RolloutResult` を構築せず reward も呼びません。
+
+`Slot.name` は registry の spec 名（= `route.steps` に現れる agent 名）と一致している必要があります。名前が一致しない slot は構造的に必ず未到達判定になります（`prompt_slot` / `prompt_slots` / `prompt_slot_factory` 経由なら registry 解決名が入るため発生しません）。
 
 ### 検証内容
 
-- **対象**: `_normalize_slots` が非 None mapping を返し、かつ target が `AgentSpec` でない経路（`HandoffGraph` / `WorkflowGraph` × Slot(s)）。生 seed + rebind 経路（`slots is None`）と `AgentSpec` target は skip。
+- **対象**: `HandoffGraph` × Slot(s) のみ（allow-list）。`WorkflowGraph` は内部 agent の route が観測できないため skip します（coverage 検証は Phase 2 の宣言的検証で扱います）。生 seed + rebind 経路（`slots is None`）と `AgentSpec` target も skip。
 - **観測方法**: 現行 seed をそのまま候補として `_apply_candidate` で reify し、`train` 各 case を `_run_one` で観測して `observation.route.steps` のみ採取（reward は評価しない）。`approvals` / `tool_mocks` / `context_factory` は本番 rollout と同値で素通し。
-- **除外規則**: 次のいずれかに該当する case は union 集計から case 単位で除外（rollout 完全失敗の case で偽陽性を作らないため）。他 case で救えれば通ります。いずれも `per_case` には `()` として記録されます。
-  - `route_steps=[]`（観測経路が空）
-  - `RunOutcome.interrupted=True`（`_run_one` の戻り値タプル第 1 要素）で途中打ち切りとなった
-  - `_apply_candidate` が None を返した（seed 状態で必要な `${var}` が失われた）、または `_CandidateInvalid` が送出された
+- **union への算入**: 観測できた到達はすべて union に算入します。`RunOutcome.interrupted=True`（`_run_one` の戻り値タプル第 1 要素）で途中打ち切りとなった case でも、観測できた到達は union に算入されます（`interrupted_cases` は診断カウンタで、判定には使いません）。空 route（`route_steps=[]`）および候補適用失敗（seed 状態で必要な `${var}` が失われ `_apply_candidate` が None を返した、または `_CandidateInvalid` が送出された）の case は観測が空になるため、結果的に union へ寄与しません。
 - **fail-fast 条件**: `missing = set(slots.keys()) - covered` が非空のとき `OptimizeError(FailureKind.CONFIG_MISSING)` を送出。raise 前に `logger.warning` に集計行（`covered` / `missing` / `cases` / `interrupted`）を出力。
 
 ### エラー時の診断情報（`CoverageReport`）
+
+pre-flight 経路の失敗も構造化エラーへ倒れます。
+
+- extra（`agentlightning`）未導入の場合は rollout を 1 件も消費せず `OptimizeError(FailureKind.EXTRA_MISSING)` で fail-fast します（実 rollout の API コストを払う前に確定させます）。
+- pre-flight 観測中の実行時例外は `OptimizeError(FailureKind.TRAINER_FAILED)`（メッセージに `pre-flight` を含む）へ変換されます。この経路ではそこまでの部分観測は保全されません（`coverage=None`）。
 
 `OptimizeError.coverage` に構造化 `CoverageReport` が添付されます（pre-flight 経路のみ非 None。他の `OptimizeError` 送出経路は `coverage=None`）。ただし pre-flight 実行中でも、承認自動解決ループで approve したツールに `tool_mocks` が未指定の場合は coverage 判定へ到達しないため、`coverage=None` の `OptimizeError(CONFIG_MISSING)` が送出されます。
 
@@ -302,9 +306,9 @@ except OptimizeError as exc:
             print(f"  case={case}: route={list(steps)}")
 ```
 
-`CoverageReport`（frozen）: `covered: frozenset[str]` / `missing: frozenset[str]` / `per_case: tuple[tuple[Any, tuple[str, ...]], ...]` / `interrupted_cases: int`。`per_case` は集計除外された case も `route_steps=()` として含めて記録します（診断用）。
+`CoverageReport`（frozen）: `covered: frozenset[str]` / `missing: frozenset[str]` / `per_case: tuple[tuple[Any, tuple[str, ...]], ...]` / `interrupted_cases: int`。観測が空だった case は `route_steps=()` として記録されます（診断用）。
 
-`per_case` は利用者の case オブジェクトを raw のまま保持するため、`repr(exc)` / `logging.exception(exc)` で例外を丸ごとダンプすると case 本文（PII を含みうる）が展開されます。ログへ出す場合は `[route for _, route in report.per_case]` のように case を除いて扱ってください。
+`per_case` は利用者の case オブジェクトを raw のまま保持しますが、`repr(exc)` / `logging.exception(exc)` は case 本文を展開しません（`OptimizeError` は message のみを args に持ちます）。`CoverageReport` の `repr()` も `per_case` を含みません（`field(repr=False)`）。case 本文（PII を含みうる）へ到達しうるのは、`report.per_case` への明示アクセスと、フレームローカル変数を収集するエラートラッカ（例: Sentry の `include_local_variables`）経由です。後者を使う環境では scrubbing 設定を推奨します。加えて `dataclasses.asdict(report)` / `dataclasses.astuple(report)` は `field(repr=False)` の影響を受けず `per_case` を展開するため、`CoverageReport` を dict 化して構造化ログへ流す場合は事前に `per_case` を除外してください。
 
 ### opt-out
 
@@ -320,11 +324,13 @@ result = await optimize(target=graph, slot=[...], train=train, val=val, reward=r
 
 ### limitation
 
+- **`WorkflowGraph` target は pre-flight の対象外**: workflow は全体が単一 agent として実行されるため内部 agent の route が観測できず、rollout ベースの coverage 検証が成立しません。coverage 検証は Phase 2 の `expected_route` 宣言的検証で扱います。
 - **seed 状態のみ検証**: 動的 routing 下で seed 状態と candidate 状態で経路が変わる構成は seed pre-flight のみでは検出しきれません。`OptimizeCase.expected_route` を必須化する静的検証は Phase 2 で扱います。
 - **train の設計品質に依存**: train ケースが handoff を誘導しない構成では、想定より多くの slot が未到達判定になります（検知結果は train ケースの設計品質に依存します）。
 - **API コスト**: pre-flight は `train × 1 rollout` の LLM API コストが追加で発生します（相対増分は既存の `run_apo` に対して `1 / (candidate × rounds)` 程度）。動的 routing など pre-flight が判定に寄与しない graph 経路では `skip_coverage_check=True` で opt-out できます。
-- **副作用の追加発火**: pre-flight は `approvals` / `context_factory` を本番 rollout と同値で発火するため、副作用（承認記録・context 生成・DB session 確保等）が train 件数分追加で発生します。副作用が問題になる場合は `skip_coverage_check=True` を検討してください。
+- **副作用の追加発火**: pre-flight は `approvals` / `tool_mocks` / `context_factory` を本番 rollout と同値で素通しするため、副作用（承認記録・context 生成・DB session 確保等）が train 件数分追加で発生します。特に承認ゲートを持たないツールは `tool_mocks` で差し替えない限り pre-flight でも実際に実行されます。安全化したいツールは本番 rollout と同じく `tool_mocks` に登録するか、`skip_coverage_check=True` を検討してください。
 - **逐次実行**: pre-flight は `OptimizeConfig.concurrency` の影響を受けず逐次実行するため、train 件数に比例したレイテンシが加算されます。
+- **skip は silent**: 適用条件を満たさない場合の skip はログに出ません。適用有無は target 種（`HandoffGraph` のみ適用）と `slot` 指定の有無で判断してください。
 - 判断根拠の詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
 
 ## 落とし穴

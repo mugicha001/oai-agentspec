@@ -14,7 +14,7 @@
 
 Phase 分割方針:
 
-- **Phase 1（本 ADR）**: `optimize()` 冒頭で seed 状態の pre-flight rollout を `train`
+- **Phase 1（本 ADR）**: `run_apo` 委譲直前に seed 状態の pre-flight rollout を `train`
   全件について実行し、`ObservedRun.route.steps` の agent 名を集計する（pre-flight は
   `RolloutResult` を構築しない）。slot 集合と set 差分で
   突き合わせ、1 度も呼ばれていない slot があれば `OptimizeError(CONFIG_MISSING)` で
@@ -37,9 +37,12 @@ Phase 分割方針:
 - **並列 pre-flight**: `train` 件数は通常小規模（10-50 件想定）で逐次でも実測負担が
   小さく、並列化は overcomplicated 回避の観点から採用しない。将来は `OptimizeConfig.concurrency`
   に揃える余地を残す。
-- **route_steps=[] / 承認中断 case を coverage 集計に含める**: rollout が完全失敗した
-  case を集計に含めると本来 wireable な構成が偽陽性で塞がれる。union 到達の合成として
-  扱い、当該 case は集計から除外する。
+- **interrupted case の観測到達を union から破棄する**: coverage は「到達の union」であり、
+  観測された到達は常に陽性証拠である。interrupted は「未完走で追加の到達が観測できなかった」
+  ことを意味するだけで、観測済み到達を無効化する根拠にならない。破棄すると `covered` が
+  過小になり、wireable な構成を fail 判定する偽陽性を作る方向にしか働かないため採用しない。
+  なお空 route（`steps=[]`）の case は union に対して恒等（no-op）であり、特別な除外規則
+  自体が不要である。
 - **新規 module 分離（`_preflight.py` 等）**: 既存の observation 収集責務
   （`_apply_candidate` / `_run_one`）と同一系統のため `_rollout.py` に集約し、
   module 分離は行わない。
@@ -63,18 +66,32 @@ kwarg で opt-out できる。
   いずれも）は pre-flight を skip する。起点 agent が必ず自身の slot をカバーするため
   trivial pass にしかならず、mock ベースの既存 rollout テストへ実 rollout を強制する
   副作用が上回るため。
-- 上記いずれにも該当しない経路（`HandoffGraph` / `WorkflowGraph` × Slot(s)）で
-  pre-flight を実行する。
+- pre-flight の適用対象は `isinstance(target, HandoffGraph)` の allow-list とする。
+  slot 名 = registry spec 名 = `route.steps` の agent 名が同一名前空間である経路のみが
+  検証可能なため。将来の target 種追加時は allow-list により「skip 側（fail しない）」へ
+  倒れる。
+- `WorkflowGraph` は skip する。`_target.normalize` が workflow 全体を単一 agent
+  （`"workflow"`）へ畳むため内部 agent の route が観測できず、rollout ベースの coverage
+  検証が原理的に成立しない。Phase 2 の `expected_route` 宣言的検証に委ねる。
+- pre-flight 実行前に extra（`agentlightning`）の可用性を検査し、未導入なら
+  `OptimizeError(EXTRA_MISSING)` へ倒す（実 rollout コストを消費する前の fail-fast）。
+- pre-flight 全体を専用の例外変換で包む: `OptimizeError` は raise-through、`ImportError`
+  は `EXTRA_MISSING`、その他 `Exception` は `TRAINER_FAILED` へ変換し、メッセージで
+  pre-flight フェーズであることを識別可能にする（Trainer 本体の失敗とコスト構造・
+  救済策が異なるため）。
 - seed 状態（現行 seed をそのまま候補として `_apply_candidate` で reify）で `train` 全件を
   逐次 `_run_one` で観測し、`observation.route.steps` のみ採取する。reward callable は
   経由せず、`_make_rollout` の返す rollout closure ではなく `_rollout` internals
   （`_apply_candidate` + `target_mod.normalize` + `_run_one`）を直接組む。
   `approvals` / `tool_mocks` / `context_factory` は本番 rollout と同値で素通しし、
   routing 挙動を同じ状態で観測する。
-- `route_steps=[]` の case および `RunOutcome.interrupted=True`（`_run_one` の戻り値
-  タプル第 1 要素）で途中打ち切りとなった case は case 単位で union 集計から除外する
-  （誤検出防止）。`_apply_candidate` が None を返した case（seed 状態で必要な `${var}`
-  が失われた場合）と `_CandidateInvalid` が送出された case も同様に空観測として除外する。
+- `RunOutcome.interrupted=True`（`_run_one` の戻り値タプル第 1 要素）で途中打ち切りと
+  なった case でも、観測できた `route.steps` は union に算入する（観測された到達は常に
+  陽性証拠であり、破棄すると `covered` が過小になり偽陽性の fail を作る）。
+  `interrupted_cases` は診断カウンタとしてのみ残し、判定には使わない。
+  `_apply_candidate` が None を返した case（seed 状態で必要な `${var}` が失われた場合）と
+  `_CandidateInvalid` が送出された case は観測が空になる。空観測（`steps=()`）は union に
+  対して恒等（no-op）であり、結果的に union へ寄与しない（特別な除外規則は持たない）。
 - 集計後 `missing = set(slots.keys()) - covered` が非空なら
   `OptimizeError(FailureKind.CONFIG_MISSING, ..., coverage=CoverageReport(...))` を送出する。
   raise 前に `logger.warning` で集計行（`covered` / `missing` / `cases` / `interrupted`）を
@@ -86,7 +103,9 @@ kwarg で opt-out できる。
 （コア `oai_agentspec.__all__` には載せない。lightning の公開シンボルは extra 窓口経由で
 取得する既存契約に揃える）。`per_case` の case 要素は
 `RolloutResult.case: Any` と型を揃え、`train` が受理する `OptimizeCase` / dict / 利用者
-定義任意型の多態性を保持する。`OptimizeError.__init__` に optional keyword-only
+定義任意型の多態性を保持する。`per_case` は `field(repr=False)` とし、`CoverageReport` の
+`repr()` に raw case を展開しない（case 本文に含まれうる PII の accidental dump 防止）。
+`report.per_case` への明示アクセスは不変。`OptimizeError.__init__` に optional keyword-only
 `coverage: CoverageReport | None = None` を追加し、pre-flight 経路のみ非 None を注入する
 （既存の他 `OptimizeError` 送出経路は `coverage=None` のまま。既存呼び出しには影響なし・
 非破壊拡張）。
@@ -116,20 +135,29 @@ pre-flight 検証本体は `runtime/lightning/_rollout.py` 内 private
   `expected_route` 静的検証に委ねる。
 - - 却下: 並列 pre-flight（overcomplicated 回避）。将来 `OptimizeConfig.concurrency` に
   揃える余地は残す。
-- - 却下: `route_steps=[]` / 承認中断 case を coverage 集計に含める（偽陽性防止）。
+- - 却下: interrupted case の観測到達を union から破棄する（`covered` が過小になり
+  偽陽性の fail を作るため。`interrupted_cases` は診断カウンタに限定する）。
 - - 却下: `CoverageReport` の case 型を `OptimizeCase` に絞る（利用者任意型が失われる）。
   `Any` で `RolloutResult.case` と揃える。
 
 ## Confirmation
 
 - 強制手段: `tests/runtime/lightning/test_optimizer_l2.py` の `test_optimize_preflight_*`
-  系 11 件（未到達 slot で `OptimizeError(CONFIG_MISSING, coverage=CoverageReport(...))` +
+  系（未到達 slot で `OptimizeError(CONFIG_MISSING, coverage=CoverageReport(...))` +
   メッセージが「原因 / 未到達 slot 名 / 救済策 3 段」を含む / 全 slot 到達で `run_apo` へ通す /
-  `config=` 経路と kwarg 経路それぞれで `skip_coverage_check=True` opt-out / `slots is None`
-  経路で skip / `route_steps=[]` および中断 case を含んでも他 case で救えれば pass /
-  `interrupted_cases` の集計 / `logger.warning` の集計行出力 / `per_case` が除外 case を
-  空タプルで記録）。AgentSpec target の skip は
-  `test_optimize_preflight_skipped_for_agentspec_target` が pin する。型と設定の契約は
+  `config=` 経路と kwarg 経路それぞれで `skip_coverage_check=True` opt-out・opt-out 時に
+  pre-flight rollout コストを消費しない / `slots is None` 経路で skip / `AgentSpec` /
+  `WorkflowGraph` target で skip（allow-list: `HandoffGraph` のみ）/ interrupted case の
+  観測到達が union に算入され陽性証拠として働く / `approvals` / `tool_mocks` / `context_factory` の
+  素通し / `logger.warning` の集計行出力 / `per_case` が観測空 case を空タプルで記録 /
+  extra 不在時に rollout を 1 件も消費する前に `EXTRA_MISSING` で fail-fast する
+  （`test_optimize_preflight_extra_missing_before_rollout`）/ pre-flight 観測中の実行時例外が
+  pre-flight 標識付きの `TRAINER_FAILED` へ変換される
+  （`test_optimize_preflight_runtime_error_maps_to_trainer_failed`））。fail-closed 2 経路
+  （candidate 適用 None・`_CandidateInvalid` で観測が空になり到達を誤申告しない）は
+  `tests/runtime/lightning/test_rollout_l2.py` の `test_observe_route_steps_*`
+  （`test_observe_route_steps_applied_none_returns_empty_no_reach_claim` /
+  `test_observe_route_steps_candidate_invalid_returns_empty_no_reach_claim`）が担う。型と設定の契約は
   `tests/runtime/lightning/test_types_l1.py` の `test_coverage_report_*` /
   `test_optimize_error_*coverage*` と `tests/runtime/lightning/test_config_l1.py` の
   `test_optimize_config_skip_coverage_check_*` が担う。
