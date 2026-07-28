@@ -6,6 +6,10 @@
 
 本 extra は APO（プロンプト最適化）のみを提供します。`optimize()` に `algorithm="rl"` を渡すと未対応として明確なエラーで案内されます。
 
+> **重要（pre-flight coverage 検証が既定有効）**
+>
+> `target` が `HandoffGraph` / `WorkflowGraph` で `slot` を指定した場合、`optimize()` は `run_apo` へ委譲する前に seed 状態の pre-flight rollout を `train` 全件に対して実行し、`slot` に指定した agent が routing で 1 度も呼ばれない構成を `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast します。意図的に到達不能な slot を最適化対象へ含める場合は `skip_coverage_check=True`（`OptimizeConfig` フィールドまたは `optimize()` の kwarg）で opt-out できます。詳細は「[Route coverage 検証（pre-flight）](#route-coverage-検証pre-flight)」節および `docs/adr/0009-lightning-preflight-coverage.md` を参照。
+
 ## 使い分け
 
 | パターン | 仕組み | 最適な場合 |
@@ -21,7 +25,7 @@
 
 ## 使い方
 
-- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slots, prompt_slot_factory, train_val_split)`
+- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, CoverageReport, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slots, prompt_slot_factory, train_val_split)`
 - extras: `pip install oai-agentspec[lightning]`（`agentlightning[apo]`）
 - 依存 env: 学習に使う Model の env
 
@@ -153,6 +157,7 @@ result = await optimize(
 | `approvals` | `Callable[[dict], bool] \| None` | `None` | 承認自動解決 |
 | `apo_client` | `Any` | `None`（**APO 必須**） | `AsyncOpenAI` 互換クライアント |
 | `context_factory` | `Callable[[], Any] \| None` | `None` | rollout ごとに新鮮な実行時 context を生成する factory。`run_with_observation(context=...)` 経由で SDK `Runner.run(context=...)` へ素通しする（rollout 間で context を共有しない） |
+| `skip_coverage_check` | `bool \| None` | `None`（未指定 = `OptimizeConfig.skip_coverage_check` の既定 `False` を尊重） | `True` で pre-flight route coverage 検証を skip。kwarg のみ「未指定」を表す `None` を取り、`OptimizeConfig` フィールドは `bool`（既定 `False`）である点が異なる |
 
 省略した追加 kwarg（`config` / `rounds` / `concurrency` / `timeout_seconds` / `store` / `apo_gradient_model` / `apo_apply_edit_model` / `apo_beam_width` / `apo_branch_factor` / `tracer`）は `OptimizeConfig` の各フィールドと同じ意味で、直接 kwargs か `config=OptimizeConfig(...)` の一方で渡す（同時指定は `CONFIG_MISSING`）。
 
@@ -170,6 +175,7 @@ result = await optimize(
 | `apo_beam_width` | `int \| None` | `None` | beam 幅 |
 | `apo_branch_factor` | `int \| None` | `None` | beam 分岐数 |
 | `tracer` | `Any` | `None` | 独自 Tracer（escape hatch） |
+| `skip_coverage_check` | `bool` | `False` | `True` で pre-flight route coverage 検証を skip（動的 routing 下で seed 状態のみでは判定できない構成の escape hatch。詳細は「Route coverage 検証（pre-flight）」節） |
 
 ### `OptimizeCase`（frozen）
 
@@ -255,13 +261,71 @@ fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 
 ### `OptimizeError`
 
-`OptimizeError(kind: FailureKind, message: str)`。
+`OptimizeError(kind: FailureKind, message: str, *, coverage: CoverageReport | None = None)`。`coverage` は pre-flight route coverage 検証の経路のみ非 None（他の送出経路は `None`）。
 
 ## 判断軸
 
 - 期待出力が決定的 → **`contains` / `exact`**、意味的品質 → **`judge`**、tool / handoff / 承認は該当 reward
 - 単一 agent の改善は **`prompt_slot`**、グラフ全体は **`prompt_slots`**
 - 学習 rollout は API コスト源。`OptimizeConfig` で試行回数を制御し `train_val_split` で汎化確認
+
+## Route coverage 検証（pre-flight）
+
+`optimize()` は冒頭で seed 状態の pre-flight rollout を `train` 全件について実行し、`ObservedRun.route.steps` の agent 名 union と `slot` 集合を突き合わせて未到達 slot を検出します（pre-flight は `RolloutResult` を構築せず reward も呼びません）。既定で有効（`skip_coverage_check=False`）。
+
+### 検証内容
+
+- **対象**: `_normalize_slots` が非 None mapping を返し、かつ target が `AgentSpec` でない経路（`HandoffGraph` / `WorkflowGraph` × Slot(s)）。生 seed + rebind 経路（`slots is None`）と `AgentSpec` target は skip。
+- **観測方法**: 現行 seed をそのまま候補として `_apply_candidate` で reify し、`train` 各 case を `_run_one` で観測して `observation.route.steps` のみ採取（reward は評価しない）。`approvals` / `tool_mocks` / `context_factory` は本番 rollout と同値で素通し。
+- **除外規則**: 次のいずれかに該当する case は union 集計から case 単位で除外（rollout 完全失敗の case で偽陽性を作らないため）。他 case で救えれば通ります。いずれも `per_case` には `()` として記録されます。
+  - `route_steps=[]`（観測経路が空）
+  - `RunOutcome.interrupted=True`（`_run_one` の戻り値タプル第 1 要素）で途中打ち切りとなった
+  - `_apply_candidate` が None を返した（seed 状態で必要な `${var}` が失われた）、または `_CandidateInvalid` が送出された
+- **fail-fast 条件**: `missing = set(slots.keys()) - covered` が非空のとき `OptimizeError(FailureKind.CONFIG_MISSING)` を送出。raise 前に `logger.warning` に集計行（`covered` / `missing` / `cases` / `interrupted`）を出力。
+
+### エラー時の診断情報（`CoverageReport`）
+
+`OptimizeError.coverage` に構造化 `CoverageReport` が添付されます（pre-flight 経路のみ非 None。他の `OptimizeError` 送出経路は `coverage=None`）。ただし pre-flight 実行中でも、承認自動解決ループで approve したツールに `tool_mocks` が未指定の場合は coverage 判定へ到達しないため、`coverage=None` の `OptimizeError(CONFIG_MISSING)` が送出されます。
+
+```python
+from oai_agentspec.runtime.lightning import CoverageReport, OptimizeError, optimize
+
+try:
+    result = await optimize(target=graph, slot=[...], train=train, val=val, reward=reward, apo_client=client, registry=registry)
+except OptimizeError as exc:
+    if exc.coverage is not None:
+        report: CoverageReport = exc.coverage
+        print("到達:", sorted(report.covered))
+        print("未到達:", sorted(report.missing))
+        print("中断 case 数:", report.interrupted_cases)
+        for case, steps in report.per_case:
+            print(f"  case={case}: route={list(steps)}")
+```
+
+`CoverageReport`（frozen）: `covered: frozenset[str]` / `missing: frozenset[str]` / `per_case: tuple[tuple[Any, tuple[str, ...]], ...]` / `interrupted_cases: int`。`per_case` は集計除外された case も `route_steps=()` として含めて記録します（診断用）。
+
+`per_case` は利用者の case オブジェクトを raw のまま保持するため、`repr(exc)` / `logging.exception(exc)` で例外を丸ごとダンプすると case 本文（PII を含みうる）が展開されます。ログへ出す場合は `[route for _, route in report.per_case]` のように case を除いて扱ってください。
+
+### opt-out
+
+`skip_coverage_check=True` を `OptimizeConfig` フィールドまたは `optimize()` の kwarg で渡すと pre-flight を skip します（動的 routing 下で seed 状態のみでは判定できない構成の escape hatch）。
+
+```python
+config = OptimizeConfig(apo_client=client, skip_coverage_check=True)
+result = await optimize(target=graph, slot=[...], train=train, val=val, reward=reward, config=config, registry=registry)
+```
+
+- `skip_coverage_check` は直接 kwarg と `config=` の二者択一に含まれ、併用はできません（同時指定は `OptimizeError(CONFIG_MISSING)`）。`skip_coverage_check=False` の明示指定も「直接 kwarg あり」と判定されるため、`config=` を使う場合は kwarg 側を省略します。
+- skip すると未到達 slot は seed のまま最適化スコアへ反映されず、silent no-op のまま `OptimizeResult` が返ります。
+
+### limitation
+
+- **seed 状態のみ検証**: 動的 routing 下で seed 状態と candidate 状態で経路が変わる構成は seed pre-flight のみでは検出しきれません。`OptimizeCase.expected_route` を必須化する静的検証は Phase 2 で扱います。
+- **train の設計品質に依存**: train ケースが handoff を誘導しない構成では、想定より多くの slot が未到達判定になります（検知結果は train ケースの設計品質に依存します）。
+- **API コスト**: pre-flight は `train × 1 rollout` の LLM API コストが追加で発生します（相対増分は既存の `run_apo` に対して `1 / (candidate × rounds)` 程度）。動的 routing など pre-flight が判定に寄与しない graph 経路では `skip_coverage_check=True` で opt-out できます。
+- **副作用の追加発火**: pre-flight は `approvals` / `context_factory` を本番 rollout と同値で発火するため、副作用（承認記録・context 生成・DB session 確保等）が train 件数分追加で発生します。副作用が問題になる場合は `skip_coverage_check=True` を検討してください。
+- **逐次実行**: pre-flight は `OptimizeConfig.concurrency` の影響を受けず逐次実行するため、train 件数に比例したレイテンシが加算されます。
+- 判断根拠の詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
 
 ## 落とし穴
 
