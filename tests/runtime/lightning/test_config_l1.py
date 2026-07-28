@@ -49,3 +49,18 @@ def test_optimize_config_is_frozen() -> None:
     config = OptimizeConfig(concurrency=1)
     with pytest.raises((AttributeError, TypeError)):
         config.concurrency = 2  # type: ignore[misc]
+
+
+# ----------------------------------------------------------------------
+# skip_coverage_check（Issue #47 Phase 1: pre-flight opt-out フラグ）
+# ----------------------------------------------------------------------
+
+
+def test_optimize_config_skip_coverage_check_default_false() -> None:
+    """OptimizeConfig の skip_coverage_check は既定 False（pre-flight 有効）。"""
+    assert OptimizeConfig().skip_coverage_check is False
+
+
+def test_optimize_config_skip_coverage_check_can_be_true() -> None:
+    """skip_coverage_check=True で opt-out できる。"""
+    assert OptimizeConfig(skip_coverage_check=True).skip_coverage_check is True

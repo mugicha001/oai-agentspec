@@ -57,6 +57,25 @@ class FailureKind(StrEnum):
     TRAINER_FAILED = "trainer_failed"
 
 
+@dataclass(frozen=True)
+class CoverageReport:
+    """pre-flight route coverage 観測の集計（`OptimizeError.coverage` に添付・診断用・NFR-1）。
+
+    Attributes:
+        covered: 到達済み slot 名の union（frozenset・順序非依存）。
+        missing: 未到達 slot 名（`slots.keys() - covered`・frozenset）。
+        per_case: `(case, route_steps)` の tuple 列。`route_steps=[]` / interrupted で
+            集計除外された case も `route_steps=()` として含める（診断用）。case 要素は
+            `RolloutResult.case` と型を揃えて `Any`（利用者任意型の多態性を保持）。
+        interrupted_cases: `RunOutcome.interrupted=True` で途中打ち切りとなった case 数。
+    """
+
+    covered: frozenset[str]
+    missing: frozenset[str]
+    per_case: tuple[tuple[Any, tuple[str, ...]], ...]
+    interrupted_cases: int
+
+
 class OptimizeError(Exception):
     """最適化が送出する構造化エラー（未捕捉例外でプロセスを止めないための変換先・FR-8）。
 
@@ -66,18 +85,31 @@ class OptimizeError(Exception):
     Attributes:
         kind: 失敗種別（`FailureKind`）。
         message: 人間可読のエラーメッセージ。
+        coverage: pre-flight route coverage 診断（`CoverageReport`）。pre-flight 経路のみ
+            非 None・他の raise 経路では None（既存呼び出しには影響なし）。
     """
 
-    def __init__(self, kind: FailureKind, message: str) -> None:
+    def __init__(
+        self,
+        kind: FailureKind,
+        message: str,
+        *,
+        coverage: CoverageReport | None = None,
+    ) -> None:
         """最適化エラーを生成する。
 
         Args:
             kind: 失敗種別。
             message: 人間可読メッセージ。
+            coverage: pre-flight route coverage の診断情報（keyword-only・pre-flight 経路のみ）。
+
+        Note:
+            `coverage` は keyword-only。位置引数で渡すと `TypeError`（既存呼び出し互換）。
         """
         super().__init__(message)
         self.kind = kind
         self.message = message
+        self.coverage = coverage
 
 
 class _CandidateInvalid(Exception):

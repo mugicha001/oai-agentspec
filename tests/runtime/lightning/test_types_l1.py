@@ -177,3 +177,54 @@ def test_save_accepts_str_path(tmp_path: object) -> None:
     result = OptimizeResult(prompt="x", train_score=0.0)
     result.save(str(target))
     assert target.read_text(encoding="utf-8") == "x"
+
+
+# ----------------------------------------------------------------------
+# CoverageReport（Issue #47 Phase 1: graph routing 未到達 slot 検知）
+# ----------------------------------------------------------------------
+
+
+def test_coverage_report_is_frozen_with_expected_fields() -> None:
+    """CoverageReport は frozen dataclass で covered/missing/per_case/interrupted_cases を持つ。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    r = CoverageReport(
+        covered=frozenset({"a"}),
+        missing=frozenset({"b"}),
+        per_case=(("case_x", ("a",)),),
+        interrupted_cases=0,
+    )
+    assert r.covered == frozenset({"a"})
+    assert r.missing == frozenset({"b"})
+    assert r.per_case == (("case_x", ("a",)),)
+    assert r.interrupted_cases == 0
+    with pytest.raises((AttributeError, TypeError)):
+        r.covered = frozenset()  # type: ignore[misc]  # frozen なので代入不可
+
+
+def test_optimize_error_accepts_and_stores_coverage() -> None:
+    """OptimizeError は optional keyword-only `coverage` を受け取り self.coverage に保持する。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    r = CoverageReport(
+        covered=frozenset(), missing=frozenset({"x"}), per_case=(), interrupted_cases=0
+    )
+    err = OptimizeError(FailureKind.CONFIG_MISSING, "msg", coverage=r)
+    assert err.coverage is r
+    assert err.kind == FailureKind.CONFIG_MISSING
+    assert err.message == "msg"
+
+
+def test_optimize_error_coverage_defaults_none() -> None:
+    """既存の `OptimizeError(kind, message)` 呼び出しは非破壊で通り coverage=None。"""
+    err = OptimizeError(FailureKind.CONFIG_MISSING, "msg")
+    assert err.coverage is None
+
+
+def test_optimize_error_coverage_is_keyword_only() -> None:
+    """coverage は keyword-only（位置引数として渡すと TypeError）。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    r = CoverageReport(frozenset(), frozenset({"x"}), (), 0)
+    with pytest.raises(TypeError):
+        OptimizeError(FailureKind.CONFIG_MISSING, "msg", r)  # type: ignore[misc]

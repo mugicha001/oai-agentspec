@@ -12,15 +12,178 @@ registry 組み直し → SDK 経由実行 + 承認自動解決 (`_make_rollout`
 from __future__ import annotations
 
 import inspect
+import logging
 from typing import TYPE_CHECKING, Any
 
 from ._slots_norm import _extract_case_input, _reinject_vars
-from .types import FailureKind, OptimizeError, RolloutResult, Slot, _CandidateInvalid
+from .types import (
+    CoverageReport,
+    FailureKind,
+    OptimizeError,
+    RolloutResult,
+    Slot,
+    _CandidateInvalid,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
 
     from ...registry import AgentRegistry
+
+logger = logging.getLogger(__name__)
+
+
+async def _observe_route_steps(
+    *,
+    target: Any,
+    registry: AgentRegistry | None,
+    slots: dict[str, Slot],
+    seeds: dict[str, str],
+    case: Any,
+    approvals: Callable[[dict], bool] | None,
+    tool_mocks: dict[str, dict[str, Any]] | None,
+    context_factory: Callable[[], Any] | None,
+) -> tuple[tuple[str, ...], bool]:
+    """seed 状態で 1 case を rollout し `(route_steps, interrupted)` を返す（pre-flight 用）。
+
+    `_make_rollout` の rollout closure（reward 呼び出しを含む）を経由せず、`_apply_candidate`
+    + `_target.normalize` + `_run_one` を直接組んで observation.route.steps のみ採取する。
+    approvals / tool_mocks / context_factory は本番 rollout と同値で素通しし routing 挙動を
+    同じ状態で観測する（承認保留などで RunOutcome.interrupted=True になった case は
+    route_steps=() として union 集計から除外・偽陽性防止）。
+
+    Args:
+        target: 最適化対象（graph / AgentSpec）。
+        registry: 現行 registry（graph 経路必須）。
+        slots: 正規化済み Slot mapping。
+        seeds: seed テキスト mapping。
+        case: train ケース（`OptimizeCase` / dict / 利用者定義任意型）。
+        approvals: 承認ガード（本番同値素通し）。
+        tool_mocks: ツールモック（本番同値素通し）。
+        context_factory: context 生成 factory（引数なし・本番同値素通し）。
+
+    Returns:
+        `(route_steps: tuple[str, ...], interrupted: bool)`。
+        rollout 失敗 / candidate 無効 / interrupted の場合は `((), False or True)` を返す。
+    """
+    from ..._adapters import DefaultRunnerAdapter
+    from . import _target as target_mod
+
+    applied = _apply_candidate(
+        target=target,
+        registry=registry,
+        slots=slots,
+        rebind=None,
+        candidate=dict(seeds),
+    )
+    if applied is None:
+        # 必要 ${var} 喪失 / _CandidateInvalid で無効化 → 空観測（union 集計から除外）
+        return (), False
+    opt_target, opt_registry = applied
+
+    context = context_factory() if context_factory is not None else None
+    agent, replaced = target_mod.normalize(opt_target, opt_registry, tool_mocks=tool_mocks)
+    try:
+        outcome, observation, _fired = await _run_one(
+            agent=agent,
+            case=case,
+            replaced=replaced,
+            approvals=approvals,
+            runner=DefaultRunnerAdapter(),
+            context=context,
+        )
+    except _CandidateInvalid:
+        return (), False
+
+    if outcome.interrupted:
+        return (), True
+    return tuple(step.agent for step in observation.route.steps), False
+
+
+async def _check_route_coverage(
+    *,
+    target: Any,
+    registry: AgentRegistry | None,
+    slots: dict[str, Slot],
+    seeds: dict[str, str],
+    train: Sequence[Any],
+    approvals: Callable[[dict], bool] | None,
+    tool_mocks: dict[str, dict[str, Any]] | None,
+    context_factory: Callable[[], Any] | None,
+) -> None:
+    """train 全件で seed 状態 rollout を観測し未到達 slot があれば fail-fast する（pre-flight）。
+
+    `slots` の名前集合と `train` 各 case の route_steps union を突き合わせ、差分（未到達 slot）
+    が非空なら `OptimizeError(FailureKind.CONFIG_MISSING, ..., coverage=CoverageReport(...))`
+    を送出する。raise 前に `logger.warning` に集計行を出力し、rollout で費やした API コストが
+    診断可能な形で保全されるようにする（`OptimizeError.coverage` と log の 2 段保全）。
+
+    Args:
+        target: 最適化対象。
+        registry: 現行 registry。
+        slots: 正規化済み Slot mapping。
+        seeds: seed テキスト mapping。
+        train: 学習ケース列。
+        approvals: 承認ガード（本番同値素通し）。
+        tool_mocks: ツールモック（本番同値素通し）。
+        context_factory: context 生成 factory（引数なし・本番同値素通し）。
+
+    Raises:
+        OptimizeError: 未到達 slot 集合が非空のとき `FailureKind.CONFIG_MISSING`
+            （`coverage` 添付・`logger.warning` 出力）。
+    """
+    covered: set[str] = set()
+    per_case: list[tuple[Any, tuple[str, ...]]] = []
+    interrupted = 0
+    for case in train:
+        steps, was_interrupted = await _observe_route_steps(
+            target=target,
+            registry=registry,
+            slots=slots,
+            seeds=seeds,
+            case=case,
+            approvals=approvals,
+            tool_mocks=tool_mocks,
+            context_factory=context_factory,
+        )
+        per_case.append((case, steps))
+        if was_interrupted:
+            interrupted += 1
+        if steps and not was_interrupted:
+            covered |= set(steps)
+
+    missing = set(slots.keys()) - covered
+    if not missing:
+        return
+
+    report = CoverageReport(
+        covered=frozenset(covered),
+        missing=frozenset(missing),
+        per_case=tuple(per_case),
+        interrupted_cases=interrupted,
+    )
+    logger.warning(
+        "[preflight] coverage insufficient: covered=%s, missing=%s, cases=%d, interrupted=%d",
+        sorted(covered),
+        sorted(missing),
+        len(per_case),
+        interrupted,
+    )
+    raise OptimizeError(
+        FailureKind.CONFIG_MISSING,
+        f"train 全 {len(per_case)} 件の seed 状態 rollout で slot {sorted(missing)!r} が"
+        "一度も routing されませんでした（route coverage 不足）。"
+        "以下のいずれかで対処してください:\n"
+        "  1. train ケースに未到達 slot を経由する入力を追加する\n"
+        "     （例: OptimizeCase(input=..., expected_route=[..., '<slot>']) を train へ）\n"
+        "  2. HandoffGraph の handoff edge / trigger 条件を見直し seed prompt から到達可能にする\n"
+        "  3. 意図的に到達不能な slot を最適化対象へ含めている場合は "
+        "optimize(..., skip_coverage_check=True) で本検査を無効化する\n"
+        f"  検出 slot（到達済み）: {sorted(covered)}\n"
+        f"  未到達 slot: {sorted(missing)}\n"
+        "  診断情報は error.coverage（CoverageReport）から取得できます。",
+        coverage=report,
+    )
 
 
 def _merge_observation(base: Any, nxt: Any) -> Any:

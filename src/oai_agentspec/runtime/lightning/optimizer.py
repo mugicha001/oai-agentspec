@@ -53,6 +53,7 @@ _DIRECT_CONFIG_KEYS = (
     "rounds",
     "concurrency",
     "timeout_seconds",
+    "skip_coverage_check",
     "store",
     "apo_gradient_model",
     "apo_apply_edit_model",
@@ -86,6 +87,7 @@ async def optimize(
     apo_beam_width: int | None = None,
     apo_branch_factor: int | None = None,
     tracer: Any = None,
+    skip_coverage_check: bool | None = None,
 ) -> OptimizeResult:
     """宣言物を APO で最適化し `${var}` 保持の最適化済みテキストを返す（公開窓口・FR-2）。
 
@@ -145,6 +147,10 @@ async def optimize(
             未指定で agent-lightning 既定の `AgentOpsTracer(agentops_managed=True,
             instrument_managed=True)` を構築する。AgentOps クラウドアップロードを抑止したい場合は
             `AGENTOPS_API_KEY` を本物のキーに設定しないこと（dummy キーで silent fail する）。
+        skip_coverage_check: True で pre-flight route coverage 検証を skip する
+            （既定 None は `OptimizeConfig.skip_coverage_check`（既定 False）を尊重する。
+            kwarg は `bool | None` で明示 True/False を渡せる）。動的 routing 下で seed 状態のみ
+            では判定できない構成の escape hatch。
 
     Returns:
         `${var}` 保持の最適化済みテキストを含む plain `OptimizeResult`。
@@ -152,15 +158,23 @@ async def optimize(
     Raises:
         OptimizeError: 失敗種別 `kind` を伴う構造化エラー（FR-8）。設定不在（algorithm 不正 /
             train・reward 未供給 / slot・rebind 解決不能 / registry 不在 / 直接 kwargs と config
-            の二重指定）は `FailureKind.CONFIG_MISSING`、extra 不在は
+            の二重指定 / 未到達 slot（pre-flight route coverage 不足・
+            `coverage=CoverageReport(...)` 添付））は `FailureKind.CONFIG_MISSING`、extra 不在は
             `FailureKind.EXTRA_MISSING`、Trainer / rollout / reward 実行中の失敗は
             `FailureKind.TRAINER_FAILED` で送出する。
+
+    Note:
+        pre-flight route coverage 検証（Phase 1）は seed 状態のみで実行するため、
+        動的 routing 下で seed 状態と candidate 状態で経路が変わる構成は完全には
+        カバーできません。API コストは `train × 1 rollout` の追加消費が発生します。
+        詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
     """
     direct_kwargs = {
         "apo_client": apo_client,
         "rounds": rounds,
         "concurrency": concurrency,
         "timeout_seconds": timeout_seconds,
+        "skip_coverage_check": skip_coverage_check,
         "store": store,
         "apo_gradient_model": apo_gradient_model,
         "apo_apply_edit_model": apo_apply_edit_model,
@@ -234,6 +248,26 @@ async def optimize(
         approvals=approvals,
         context_factory=context_factory,
     )
+
+    from ...spec import AgentSpec
+
+    if (
+        slots is not None
+        and not effective_config.skip_coverage_check
+        and not isinstance(target, AgentSpec)
+    ):
+        from ._rollout import _check_route_coverage
+
+        await _check_route_coverage(
+            target=target,
+            registry=registry,
+            slots=slots,
+            seeds=seeds,
+            train=train,
+            approvals=approvals,
+            tool_mocks=tool_mocks,
+            context_factory=context_factory,
+        )
 
     from ..._adapters import run_apo
 

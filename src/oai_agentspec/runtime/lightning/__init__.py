@@ -29,6 +29,7 @@ from .rewards import (
 )
 from .slots import prompt_slot, prompt_slot_factory, prompt_slots
 from .types import (
+    CoverageReport,
     FailureKind,
     OptimizeError,
     OptimizeResult,
@@ -47,6 +48,7 @@ __all__ = [
     # 失敗種別 / 構造化エラー（FR-8）
     "FailureKind",
     "OptimizeError",
+    "CoverageReport",
     # 設定型
     "OptimizeConfig",
     # reward ファクトリ

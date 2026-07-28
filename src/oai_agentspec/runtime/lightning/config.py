@@ -47,6 +47,10 @@ class OptimizeConfig:
             クラウドアップロードを抑止したい場合は `AGENTOPS_API_KEY` を本物のキーに設定しないこと
             （SDK は `os.environ.setdefault("AGENTOPS_API_KEY", "dummy")` で初期化するため、本物の
             キーが入っていない限り送信は silent fail する）。
+        skip_coverage_check: True で pre-flight route coverage 検証を skip する（既定 False で
+            有効）。動的 routing 下で seed 状態のみでは判定できない構成や、単一 slot 経路で
+            train × 1 rollout の pre-flight コストを回避したい場合の escape hatch。詳細は
+            `docs/adr/0009-lightning-preflight-coverage.md` を参照。
     """
 
     concurrency: int | None = None
@@ -59,3 +63,4 @@ class OptimizeConfig:
     apo_beam_width: int | None = None
     apo_branch_factor: int | None = None
     tracer: Any = None
+    skip_coverage_check: bool = False
