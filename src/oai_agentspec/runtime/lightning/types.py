@@ -64,15 +64,18 @@ class CoverageReport:
     Attributes:
         covered: 到達済み slot 名の union（frozenset・順序非依存）。
         missing: 未到達 slot 名（`slots.keys() - covered`・frozenset）。
-        per_case: `(case, route_steps)` の tuple 列。`route_steps=[]` / interrupted で
-            集計除外された case も `route_steps=()` として含める（診断用）。case 要素は
-            `RolloutResult.case` と型を揃えて `Any`（利用者任意型の多態性を保持）。
+        per_case: `(case, route_steps)` の tuple 列（train の全 case を順に含む）。観測が
+            空だった case は `route_steps=()` として記録される。case 要素は `RolloutResult.case`
+            と型を揃えて `Any`（利用者任意型の多態性を保持）。case 本文の accidental dump を
+            防ぐため `repr()` には含めない（`report.per_case` への明示アクセスは可）。
         interrupted_cases: `RunOutcome.interrupted=True` で途中打ち切りとなった case 数。
+            診断カウンタであり coverage 判定には使わない（interrupted case で観測できた到達も
+            `covered` に算入される）。
     """
 
     covered: frozenset[str]
     missing: frozenset[str]
-    per_case: tuple[tuple[Any, tuple[str, ...]], ...]
+    per_case: tuple[tuple[Any, tuple[str, ...]], ...] = field(repr=False)
     interrupted_cases: int
 
 

@@ -202,6 +202,30 @@ def test_coverage_report_is_frozen_with_expected_fields() -> None:
         r.covered = frozenset()  # type: ignore[misc]  # frozen なので代入不可
 
 
+def test_coverage_report_repr_omits_per_case() -> None:
+    """CoverageReport の repr は per_case を展開しない（case 本文の意図せぬ露出を防ぐ）。
+
+    per_case は利用者任意型の case 本体（PII / 機密を含みうる）をそのまま保持する診断フィールド
+    で、train 件数ぶん並ぶため repr が肥大化する。ログ / トレースバックへ自動で流れる repr から
+    除外し、明示アクセス（`report.per_case`）でのみ取得できるようにする。
+    """
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    r = CoverageReport(
+        covered=frozenset({"a"}),
+        missing=frozenset({"b"}),
+        per_case=(("secret-case-marker", ("a",)),),
+        interrupted_cases=0,
+    )
+    text = repr(r)
+    assert "secret-case-marker" not in text
+    # 他フィールドは repr に残る（診断性の維持）。
+    assert "CoverageReport" in text
+    assert "interrupted_cases=0" in text
+    # 明示アクセスでは中身が取れる。
+    assert r.per_case == (("secret-case-marker", ("a",)),)
+
+
 def test_optimize_error_accepts_and_stores_coverage() -> None:
     """OptimizeError は optional keyword-only `coverage` を受け取り self.coverage に保持する。"""
     from oai_agentspec.runtime.lightning import CoverageReport

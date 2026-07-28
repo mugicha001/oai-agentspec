@@ -49,8 +49,10 @@ async def _observe_route_steps(
     `_make_rollout` の rollout closure（reward 呼び出しを含む）を経由せず、`_apply_candidate`
     + `_target.normalize` + `_run_one` を直接組んで observation.route.steps のみ採取する。
     approvals / tool_mocks / context_factory は本番 rollout と同値で素通しし routing 挙動を
-    同じ状態で観測する（承認保留などで RunOutcome.interrupted=True になった case は
-    route_steps=() として union 集計から除外・偽陽性防止）。
+    同じ状態で観測する。observation で到達が確認できた agent 名は `RunOutcome.interrupted=True`
+    （承認保留などで未完走）でもそのまま返す — 観測された到達は常に陽性証拠であり、破棄すると
+    coverage が過小になり偽陽性 fail を作る。`interrupted` フラグは診断カウンタ用に返すのみで、
+    union 集計の可否には使わない。
 
     Args:
         target: 最適化対象（graph / AgentSpec）。
@@ -63,8 +65,15 @@ async def _observe_route_steps(
         context_factory: context 生成 factory（引数なし・本番同値素通し）。
 
     Returns:
-        `(route_steps: tuple[str, ...], interrupted: bool)`。
-        rollout 失敗 / candidate 無効 / interrupted の場合は `((), False or True)` を返す。
+        `(route_steps: tuple[str, ...], interrupted: bool)`。candidate 無効（`_apply_candidate`
+        が None / `_CandidateInvalid`）の場合のみ `((), False)`（観測なし）。interrupted の
+        場合も観測できた route_steps を返す。
+
+    Note:
+        candidate 無効以外の例外（API のレート制限・タイムアウト等）は捕捉せず伝播させ、
+        呼び出し側の `optimize()` が `TRAINER_FAILED` へ変換する。観測失敗を空観測へ
+        degrade させると `covered` が過小になり偽陽性の fail-fast を生むため、意図的に
+        握らない。
     """
     from ..._adapters import DefaultRunnerAdapter
     from . import _target as target_mod
@@ -95,9 +104,7 @@ async def _observe_route_steps(
     except _CandidateInvalid:
         return (), False
 
-    if outcome.interrupted:
-        return (), True
-    return tuple(step.agent for step in observation.route.steps), False
+    return tuple(step.agent for step in observation.route.steps), bool(outcome.interrupted)
 
 
 async def _check_route_coverage(
@@ -117,6 +124,11 @@ async def _check_route_coverage(
     が非空なら `OptimizeError(FailureKind.CONFIG_MISSING, ..., coverage=CoverageReport(...))`
     を送出する。raise 前に `logger.warning` に集計行を出力し、rollout で費やした API コストが
     診断可能な形で保全されるようにする（`OptimizeError.coverage` と log の 2 段保全）。
+
+    union 算入規則: 観測が空（`route_steps=()`）の case は union に寄与しない（空集合の union は
+    恒等）。interrupted になった case も、そこまでに観測できた到達は算入する（到達観測は常に
+    陽性証拠で、破棄は wireable な構成を fail させる偽陽性にしかならない）。`interrupted_cases`
+    は診断カウンタとしてのみ集計し、判定には使わない。
 
     Args:
         target: 最適化対象。
@@ -149,7 +161,7 @@ async def _check_route_coverage(
         per_case.append((case, steps))
         if was_interrupted:
             interrupted += 1
-        if steps and not was_interrupted:
+        if steps:
             covered |= set(steps)
 
     missing = set(slots.keys()) - covered

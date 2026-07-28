@@ -2776,7 +2776,14 @@ async def test_optimize_preflight_all_slots_reached_passes_to_run_apo(
 async def test_optimize_preflight_opt_out_via_config_bypasses_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OptimizeConfig(skip_coverage_check=True) で pre-flight を skip し未到達構成でも通る。"""
+    """OptimizeConfig(skip_coverage_check=True) で pre-flight を skip し未到達構成でも通る。
+
+    FU（W13・PR #49 レビュー指摘）: 従来は `isinstance(result, OptimizeResult)` のみで、
+    実装が「常に `_check_route_coverage` を実行し `skip_coverage_check` のときだけ
+    `OptimizeError` を握り潰す」形へ変異しても検出できなかった（train × 1 rollout の追加コストが
+    握り潰されずに発生する回帰）。`_spy_preflight` で「実行されない」こと自体を直接固定する。
+    """
+    preflight_calls = _spy_preflight(monkeypatch)
     _patch_run_apo(monkeypatch, _calling_run_apo())
 
     triage_model = _fake_handoff_model()
@@ -2816,13 +2823,19 @@ async def test_optimize_preflight_opt_out_via_config_bypasses_check(
         registry=registry,
         config=config,
     )
+    assert preflight_calls["n"] == 0  # skip 時は pre-flight（rollout コスト）を一切実行しない。
     assert isinstance(result, OptimizeResult)
 
 
 async def test_optimize_preflight_opt_out_via_kwarg_bypasses_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """optimize(skip_coverage_check=True) の kwarg 経由でも opt-out できる。"""
+    """optimize(skip_coverage_check=True) の kwarg 経由でも opt-out できる。
+
+    FU（W13・PR #49 レビュー指摘）: `_spy_preflight` で pre-flight が実行されない（rollout
+    コストが発生しない）ことを直接固定する（詳細は config= 経由版のテスト docstring 参照）。
+    """
+    preflight_calls = _spy_preflight(monkeypatch)
     _patch_run_apo(monkeypatch, _calling_run_apo())
 
     triage_model = _fake_handoff_model()
@@ -2863,28 +2876,50 @@ async def test_optimize_preflight_opt_out_via_kwarg_bypasses_check(
         apo_client=_FAKE_APO_CLIENT,
         skip_coverage_check=True,
     )
+    assert preflight_calls["n"] == 0  # skip 時は pre-flight（rollout コスト）を一切実行しない。
     assert isinstance(result, OptimizeResult)
 
 
 async def test_optimize_preflight_skipped_for_raw_seed_rebind_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """slots is None（生 seed + rebind 経路）は pre-flight を skip する。"""
+    """slots is None（生 seed + rebind 経路）は HandoffGraph target でも pre-flight を skip する。
+
+    FU（W11・PR #49 レビュー指摘）: 旧テストは target に `AgentSpec`（`_spec()`）を渡していた
+    ため `isinstance(target, HandoffGraph)` ガードで既に短絡しており、本来検証すべき
+    `slots is not None` 条件（本テストの主題）を一度も通過させずに vacuous に pass していた。
+    target を `HandoffGraph` にして `isinstance` ガードを満たした上で `slot=` に生 seed（str）+
+    `rebind=` を渡し、`slots is None` によって pre-flight が skip されることを spy で直接固定する。
+    """
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+
+    called = {"n": 0}
+
+    async def _spy(**kwargs: Any) -> None:
+        called["n"] += 1
+
+    monkeypatch.setattr(rollout_mod, "_check_route_coverage", _spy, raising=True)
     _patch_run_apo(monkeypatch, _calling_run_apo())
 
-    def _rebind(candidate: Any) -> AgentSpec:
-        return _spec(output_text="rebound expected output")
+    graph, registry, _slots = _two_slot_graph()
+
+    def _rebind(candidate: Any) -> HandoffGraph:
+        return graph
 
     result = await optimize(
-        _spec(),
+        graph,
         algorithm="apo",
         train=[{"input": "hi", "expected": "expected"}],
         val=_DEFAULT_VAL,
         reward=contains("expected"),
         slot="raw seed prompt",
         rebind=_rebind,
+        registry=registry,
         config=_apo_config(),
     )
+    assert (
+        called["n"] == 0
+    )  # slots is None（生 seed 経路）では HandoffGraph target でも skip する。
     assert isinstance(result, OptimizeResult)
 
 
@@ -2959,6 +2994,81 @@ def _two_slot_graph() -> tuple[HandoffGraph, AgentRegistry, list[Slot]]:
     return graph, registry, slots
 
 
+async def test_optimize_preflight_passes_through_context_tool_mocks_approvals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pre-flight は context_factory / tool_mocks / approvals を本番同値で素通しする（W12）。
+
+    3 引数それぞれを None へ落とす変異は、seed 状態 rollout の到達判定（route_steps の有無）を
+    変えないため既存テストをすり抜けてしまう。`context_factory` の呼び出し回数（== train 件数）・
+    `_target.normalize` へ渡る `tool_mocks`・`_run_one` へ渡る `approvals` をそれぞれ直接 spy で
+    固定する。coverage 判定自体は本題ではないため未到達（billing 未到達）で `OptimizeError` が
+    上がる構成を使い、素通しが例外発生前に確実に記録されることを確認する。
+    """
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+    from oai_agentspec.runtime.lightning import _target as target_mod
+
+    preflight_calls = _spy_preflight(monkeypatch)
+    run_apo_calls = _counting_run_apo(monkeypatch)
+
+    context_calls = {"n": 0}
+
+    def _context_factory() -> Any:
+        context_calls["n"] += 1
+        return object()
+
+    normalize_calls: list[Any] = []
+    real_normalize = target_mod.normalize
+
+    def _spy_normalize(target: Any, registry: Any, *, tool_mocks: Any = None) -> Any:
+        normalize_calls.append(tool_mocks)
+        return real_normalize(target, registry, tool_mocks=tool_mocks)
+
+    monkeypatch.setattr(target_mod, "normalize", _spy_normalize, raising=True)
+
+    run_one_approvals: list[Any] = []
+    real_run_one = rollout_mod._run_one
+
+    async def _spy_run_one(**kwargs: Any) -> Any:
+        run_one_approvals.append(kwargs.get("approvals"))
+        return await real_run_one(**kwargs)
+
+    monkeypatch.setattr(rollout_mod, "_run_one", _spy_run_one, raising=True)
+
+    graph, registry, slots = _two_slot_graph()  # 固定応答モデルのため billing への handoff は未発生
+
+    sentinel_tool_mocks = {"triage": {"some_tool": "mocked"}}
+
+    def _approvals(_pending: dict) -> bool:
+        return True
+
+    train = [
+        {"input": "route me 1", "expected": "expected"},
+        {"input": "route me 2", "expected": "expected"},
+    ]
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            train=train,
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            tool_mocks=sentinel_tool_mocks,
+            approvals=_approvals,
+            context_factory=_context_factory,
+            config=_apo_config(),
+        )
+
+    assert exc_info.value.kind == FailureKind.CONFIG_MISSING
+    assert preflight_calls["n"] == 1
+    assert run_apo_calls["n"] == 0
+    assert context_calls["n"] == len(train)
+    assert normalize_calls == [sentinel_tool_mocks] * len(train)
+    assert run_one_approvals == [_approvals] * len(train)
+
+
 def _observed(agents: tuple[str, ...], *, interrupted: bool = False) -> tuple[Any, Any]:
     """`run_with_observation` の戻り値 `(RunOutcome 相当, ObservedRun)` を組む。
 
@@ -3015,15 +3125,16 @@ async def test_optimize_preflight_empty_route_cases_excluded_others_cover(
     """空 route の case が混じっても train 全体の union が全 slot を埋めれば pre-flight は通る。
 
     coverage 判定は「case ごとに全 slot 網羅」ではなく「train 全体の union」であることを、
-    (1) 空 route の case（集計から除外）、(2) 全 slot を通る case、(3) 一部 slot のみ通る case
-    の 3 件で固定する。union でなく最終 case での上書きになると billing が未到達になり fail する。
+    (1) 空 route の case（union へ寄与しない）、(2) 全 slot を通る case、(3) 一部 slot のみ
+    通る case の 3 件で固定する。union でなく最終 case での上書きになると billing が未到達に
+    なり fail する。
     """
     preflight_calls = _spy_preflight(monkeypatch)
     run_apo_calls = _counting_run_apo(monkeypatch)
     obs_calls = _script_observations(
         monkeypatch,
         [
-            _observed(()),  # case A: 空 route（interrupted ではない）→ union 集計から除外
+            _observed(()),  # case A: 空 route（interrupted ではない）→ union へ寄与しない
             _observed(("triage", "billing")),  # case B: 全 slot を通る
             _observed(("triage",)),  # case C: 一部 slot のみ
         ],
@@ -3052,22 +3163,23 @@ async def test_optimize_preflight_empty_route_cases_excluded_others_cover(
 async def test_optimize_preflight_interrupted_case_recorded_but_others_cover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """承認保留で interrupted になる case を含んでも他 case が union を埋めれば pre-flight は通る。
+    """interrupted case でも観測できた到達は union に算入される（偽陽性防止）。
 
-    interrupted の case は routing を最後まで観測できないため union 集計から除外されるが、
-    それ自体は fail-fast の理由にならない（除外 + 他 case の union で判定）ことを固定する。
-    残り 2 件（全 slot を通る case / 一部 slot のみの case）で union が埋まる構成にし、
-    上書き集計への回帰も同時に検知する。
+    coverage 判定は「到達の union」であり、interrupted は「そこまでは routing された」という
+    肯定的観測を含む。observation を破棄すると covered が過小になり、実際には到達可能な slot を
+    未到達と誤判定する（= 偽陽性 fail-fast）方向にしか働かない。ここでは **interrupted case
+    だけが billing への到達を観測している** 構成にし、interrupted の観測を union に算入しないと
+    fail する（vacuous でない）ように固定する。
     """
     preflight_calls = _spy_preflight(monkeypatch)
     run_apo_calls = _counting_run_apo(monkeypatch)
     obs_calls = _script_observations(
         monkeypatch,
         [
-            # case A: 承認保留で中断（approvals 未指定なので中断のまま戻る）→ 集計から除外
-            _observed(("triage",), interrupted=True),
-            _observed(("triage", "billing")),  # case B: 全 slot を通る
-            _observed(("triage",)),  # case C: 一部 slot のみ
+            # case A: 承認保留で中断（approvals 未指定）。ただし中断前に triage -> billing まで
+            # routing 済みで、billing への到達を観測しているのはこの case だけ。
+            _observed(("triage", "billing"), interrupted=True),
+            _observed(("triage",)),  # case B: 正常終了だが triage のみ
         ],
     )
 
@@ -3076,7 +3188,7 @@ async def test_optimize_preflight_interrupted_case_recorded_but_others_cover(
     result = await optimize(
         target=graph,
         algorithm="apo",
-        train=[{"input": "interrupted"}, {"input": "wide"}, {"input": "narrow"}],
+        train=[{"input": "interrupted"}, {"input": "narrow"}],
         val=_DEFAULT_VAL,
         reward=contains("expected"),
         slot=slots,
@@ -3085,9 +3197,141 @@ async def test_optimize_preflight_interrupted_case_recorded_but_others_cover(
     )
 
     assert preflight_calls["n"] == 1
-    assert obs_calls["n"] == 3
+    assert obs_calls["n"] == 2
     assert run_apo_calls["n"] == 1
     assert isinstance(result, OptimizeResult)
+
+
+async def test_optimize_preflight_skipped_for_workflow_graph_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target=WorkflowGraph では pre-flight（`_check_route_coverage`）を一切実行しない。
+
+    `_target.normalize` は WorkflowGraph 全体を単一 agent（名前 `"workflow"`）へ畳むため、観測
+    できる route_steps は `["workflow"]` にしかならず、slot 名（registry spec 名）と原理的に
+    一致しない。pre-flight を適用すると必ず未到達判定になり、train 件数ぶんの rollout コストを
+    払ったうえで誤 fail する。実装は pre-flight の適用対象を HandoffGraph の allow-list に
+    限定しており、ここではその「呼ばれないこと」を直接固定する。
+    """
+    from oai_agentspec.workflow import END, START, WorkflowGraph
+
+    called = {"n": 0}
+
+    async def _spy(**kwargs: Any) -> None:
+        called["n"] += 1
+
+    from oai_agentspec.runtime.lightning import _rollout as rollout_mod
+
+    monkeypatch.setattr(rollout_mod, "_check_route_coverage", _spy, raising=True)
+    run_apo_calls = _counting_run_apo(monkeypatch)
+
+    triage_model = _RepeatModel("expected answer")
+    registry = AgentRegistry()
+    registry.register(AgentSpec(name="triage", instructions="triage seed", model=triage_model))
+
+    wf = WorkflowGraph(name="pipeline")
+    wf.add_agent_node("ask", agent="triage")
+    wf.add_edge(START, "ask")
+    wf.add_edge("ask", END)
+
+    slots = [
+        Slot(
+            name="triage",
+            seed="triage seed",
+            build=lambda c: AgentSpec(name="triage", instructions=c, model=triage_model),
+        )
+    ]
+
+    result = await optimize(
+        target=wf,
+        algorithm="apo",
+        train=[{"input": "route me", "expected": "expected"}],
+        val=_DEFAULT_VAL,
+        reward=contains("expected"),
+        slot=slots,
+        registry=registry,
+        config=_apo_config(),
+    )
+
+    assert called["n"] == 0  # WorkflowGraph target では pre-flight を実行しない。
+    assert run_apo_calls["n"] == 1
+    assert isinstance(result, OptimizeResult)
+
+
+async def test_optimize_preflight_extra_missing_before_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """extra 不在は pre-flight の rollout を 1 件も消費する前に EXTRA_MISSING で fail-fast する。
+
+    agentlightning 未導入なら最終的に `run_apo` で必ず失敗する。pre-flight を先に走らせると、
+    どうせ失敗する実行のために train 件数ぶんの実 API コストを先払いすることになる。実装は
+    pre-flight の前段で `_require_agentlightning()` を呼び、`ImportError` を
+    `OptimizeError(EXTRA_MISSING)` へ倒す。
+    """
+
+    def _missing() -> Any:
+        raise ImportError("agentlightning が必要です: pip install 'oai-agentspec[lightning]'")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._require_agentlightning", _missing, raising=True
+    )
+    run_apo_calls = _counting_run_apo(monkeypatch)
+    obs_calls = _script_observations(monkeypatch, [_observed(("triage", "billing"))])
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+    assert exc_info.value.kind == FailureKind.EXTRA_MISSING
+    # rollout（実 API コスト）を 1 件も消費していない。
+    assert obs_calls["n"] == 0
+    assert run_apo_calls["n"] == 0
+
+
+async def test_optimize_preflight_runtime_error_maps_to_trainer_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pre-flight 中の実行時例外は生のまま伝播せず OptimizeError(TRAINER_FAILED) へ変換される。
+
+    FR-8（最適化の失敗を構造化エラーへ倒す）は `run_apo` 経路だけでなく pre-flight 経路にも
+    適用される。pre-flight は実 rollout を回すため SDK / モデル由来の任意例外が発生しうる。
+    メッセージには pre-flight フェーズであることを含め、どの段階で落ちたか診断可能にする。
+    """
+    _counting_run_apo(monkeypatch)
+
+    async def _boom(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation", _boom, raising=True
+    )
+
+    graph, registry, slots = _two_slot_graph()
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await optimize(
+            target=graph,
+            algorithm="apo",
+            train=[{"input": "route me"}],
+            val=_DEFAULT_VAL,
+            reward=contains("expected"),
+            slot=slots,
+            registry=registry,
+            config=_apo_config(),
+        )
+    exc = exc_info.value
+    assert exc.kind == FailureKind.TRAINER_FAILED
+    assert "pre-flight" in exc.message.lower()
+    assert "boom" in exc.message
 
 
 async def test_optimize_preflight_interrupted_counted_in_coverage(
@@ -3238,11 +3482,13 @@ async def test_optimize_preflight_logs_warning_before_raise(
     assert any("refund" in r.getMessage() for r in caplog.records)
 
 
-async def test_optimize_preflight_per_case_records_excluded_as_empty_tuple(
+async def test_optimize_preflight_per_case_records_empty_observation_as_empty_tuple(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """route_steps=[] / interrupted で集計除外された case も per_case に route_steps=() として記録
-    される。fail 構成で per_case を全数検査する。
+    """観測が空だった case も per_case に route_steps=() として記録される。
+
+    空観測は union へ寄与しない（空集合の union は恒等）。interrupted 自体は除外条件では
+    なく、観測できた到達があれば union に算入される。fail 構成で per_case を全数検査する。
     """
     from types import SimpleNamespace
 
@@ -3254,8 +3500,8 @@ async def test_optimize_preflight_per_case_records_excluded_as_empty_tuple(
 
     _patch_run_apo(monkeypatch, _forbidden)
 
-    # 全 case で interrupted（route_steps 空）にする → 全 case が excluded、per_case に
-    # route_steps=() として記録される想定。
+    # 全 case で観測を空にする（interrupted かつ route_steps 空）→ union へ寄与せず、
+    # per_case に route_steps=() として記録される想定。
     observation = ObservedRun(route=ObservedRoute(steps=[], last_agent=""), tool_calls=[])
 
     async def _interrupted(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:

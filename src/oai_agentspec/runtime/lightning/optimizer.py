@@ -159,14 +159,19 @@ async def optimize(
         OptimizeError: 失敗種別 `kind` を伴う構造化エラー（FR-8）。設定不在（algorithm 不正 /
             train・reward 未供給 / slot・rebind 解決不能 / registry 不在 / 直接 kwargs と config
             の二重指定 / 未到達 slot（pre-flight route coverage 不足・
-            `coverage=CoverageReport(...)` 添付））は `FailureKind.CONFIG_MISSING`、extra 不在は
-            `FailureKind.EXTRA_MISSING`、Trainer / rollout / reward 実行中の失敗は
+            `coverage=CoverageReport(...)` 添付））は `FailureKind.CONFIG_MISSING`、extra 不在
+            （pre-flight 実行前の可用性検査を含む）は `FailureKind.EXTRA_MISSING`、Trainer /
+            rollout / reward 実行中の失敗および pre-flight 観測中の実行時失敗は
             `FailureKind.TRAINER_FAILED` で送出する。
 
     Note:
-        pre-flight route coverage 検証（Phase 1）は seed 状態のみで実行するため、
-        動的 routing 下で seed 状態と candidate 状態で経路が変わる構成は完全には
-        カバーできません。API コストは `train × 1 rollout` の追加消費が発生します。
+        pre-flight route coverage 検証（Phase 1）の適用対象は **`HandoffGraph` target のみ**
+        です（`slot` 指定かつ `skip_coverage_check=False` の場合）。`AgentSpec` は routing が
+        存在せず、`WorkflowGraph` は workflow 全体が単一 agent へ畳まれ内部 agent の route を
+        観測できないため、いずれも対象外（skip）です。
+        また pre-flight は seed 状態のみで実行するため、動的 routing 下で seed 状態と
+        candidate 状態で経路が変わる構成は完全にはカバーできません。API コストは
+        `train × 1 rollout` の追加消費が発生します。
         詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
     """
     direct_kwargs = {
@@ -249,25 +254,48 @@ async def optimize(
         context_factory=context_factory,
     )
 
-    from ...spec import AgentSpec
+    from ...handoffs import HandoffGraph
 
+    # pre-flight は allow-list（HandoffGraph のみ）。pre-flight が検証できるのは「slot 名 =
+    # registry spec 名 = route.steps の agent 名」が同一名前空間である経路に限られる。
+    # WorkflowGraph は `_target.normalize` が workflow 全体を単一 agent（"workflow"）へ畳むため
+    # 内部 agent の route が観測できず、検証が原理的に成立しない（必ず未到達判定になる）。
+    # AgentSpec は単一 agent で routing が存在しない。deny-list にすると将来の target 種追加で
+    # 同型の誤適用が再発するため allow-list で明示する。
     if (
         slots is not None
         and not effective_config.skip_coverage_check
-        and not isinstance(target, AgentSpec)
+        and isinstance(target, HandoffGraph)
     ):
+        from ..._adapters.lightning import _require_agentlightning
         from ._rollout import _check_route_coverage
 
-        await _check_route_coverage(
-            target=target,
-            registry=registry,
-            slots=slots,
-            seeds=seeds,
-            train=train,
-            approvals=approvals,
-            tool_mocks=tool_mocks,
-            context_factory=context_factory,
-        )
+        # FR-8: pre-flight 失敗も構造化エラーへ倒す（run_apo 経路と同じ 3 段変換）。
+        # その他 Exception のメッセージにはフェーズ識別のため pre-flight である旨を含める。
+        # `OptimizeError` は kind と原文メッセージ（coverage 添付を含む）を保つため
+        # raise-through する（この経路には pre-flight 標識は入らない）。
+        try:
+            # 実 rollout（train × 1 件の API コスト）を払う前に extra 可用性を確定させる。
+            _require_agentlightning()
+            await _check_route_coverage(
+                target=target,
+                registry=registry,
+                slots=slots,
+                seeds=seeds,
+                train=train,
+                approvals=approvals,
+                tool_mocks=tool_mocks,
+                context_factory=context_factory,
+            )
+        except OptimizeError:
+            raise
+        except ImportError as exc:
+            raise OptimizeError(FailureKind.EXTRA_MISSING, str(exc)) from exc
+        except Exception as exc:
+            raise OptimizeError(
+                FailureKind.TRAINER_FAILED,
+                f"pre-flight route coverage の観測に失敗しました: {exc}",
+            ) from exc
 
     from ..._adapters import run_apo
 

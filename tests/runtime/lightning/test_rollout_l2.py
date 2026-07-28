@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -18,7 +19,7 @@ from oai_agentspec import AgentRegistry, AgentSpec
 from oai_agentspec.prompts import PromptLayout, PromptStore
 from oai_agentspec.runtime.lightning import Slot
 from oai_agentspec.runtime.lightning import prompt_slot as _prompt_slot
-from oai_agentspec.runtime.lightning._rollout import _apply_candidate
+from oai_agentspec.runtime.lightning._rollout import _apply_candidate, _observe_route_steps
 from oai_agentspec.runtime.lightning.types import _CandidateInvalid
 
 from _helpers.fake_model import FakeModel
@@ -244,3 +245,76 @@ def test_apply_candidate_graph_route_runtime_error_propagates() -> None:
             rebind=None,
             candidate={"triage": "seed text"},
         )
+
+
+# ----------------------------------------------------------------------
+# `_observe_route_steps` の fail-closed 2 経路（pre-flight route coverage）
+# ----------------------------------------------------------------------
+
+
+async def test_observe_route_steps_applied_none_returns_empty_no_reach_claim() -> None:
+    """`_apply_candidate` が None（必要 `${var}` 喪失）を返すとき `((), False)` を返す。
+
+    誤って「全 slot 到達済み」を申告すると pre-flight が本来検出すべき未到達 slot を
+    silent に見逃す（本 PR が防ごうとしている silent no-op の再発）。
+    """
+    slot = Slot(
+        name="x",
+        seed="seed ${var} text",
+        build=lambda c: AgentSpec(name="x", instructions=c, model=FakeModel()),
+    )
+    target = AgentSpec(name="x", instructions="orig", model=FakeModel())
+
+    # seeds に seed が持つ ${var} プレースホルダが含まれない → `_reinject_vars` が None を返し
+    # `_apply_candidate` も None を返す（applied is None 経路）。
+    steps, interrupted = await _observe_route_steps(
+        target=target,
+        registry=None,
+        slots={"x": slot},
+        seeds={"x": "seed text without placeholder"},
+        case={"input": "hi"},
+        approvals=None,
+        tool_mocks=None,
+        context_factory=None,
+    )
+
+    assert (steps, interrupted) == ((), False)
+
+
+async def test_observe_route_steps_candidate_invalid_returns_empty_no_reach_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_run_one` 実行中の `_CandidateInvalid` は catch され `((), False)` を返す。
+
+    利用者 `build=` / `vars=callable` が rollout 実行時（SDK `Runner.run` 経由）に候補を無効化
+    する経路。誤って「全 slot 到達済み」を申告すると同様に未到達 slot を見逃す。
+    """
+
+    async def _raise_candidate_invalid(self: Any, agent: Any, value: Any, **kwargs: Any) -> Any:
+        raise _CandidateInvalid("boundary marker broken")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.DefaultRunnerAdapter.run_with_observation",
+        _raise_candidate_invalid,
+        raising=True,
+    )
+
+    slot = Slot(
+        name="x",
+        seed="seed text",
+        build=lambda c: AgentSpec(name="x", instructions=c, model=FakeModel()),
+    )
+    target = AgentSpec(name="x", instructions="orig", model=FakeModel())
+
+    steps, interrupted = await _observe_route_steps(
+        target=target,
+        registry=None,
+        slots={"x": slot},
+        seeds={"x": "seed text"},
+        case={"input": "hi"},
+        approvals=None,
+        tool_mocks=None,
+        context_factory=None,
+    )
+
+    assert (steps, interrupted) == ((), False)
