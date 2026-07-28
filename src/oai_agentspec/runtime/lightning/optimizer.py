@@ -187,10 +187,12 @@ async def optimize(
             （依存バージョン不整合の `TypeError` 等）を投げた場合も `TRAINER_FAILED` へ倒す。
 
     Note:
-        pre-flight route coverage 検証（Phase 1）の適用対象は **`HandoffGraph` target のみ**
-        です（`slot` 指定かつ `skip_coverage_check=False` の場合）。`AgentSpec` は routing が
-        存在せず、`WorkflowGraph` は workflow 全体が単一 agent へ畳まれ内部 agent の route を
-        観測できないため、いずれも対象外（skip）です。
+        pre-flight route coverage 検証（Phase 1）の実行条件は次の 3 つを**すべて**満たす場合
+        です: (1) target が `HandoffGraph`（allow-list。`AgentSpec` は routing が存在せず、
+        `WorkflowGraph` は workflow 全体が単一 agent へ畳まれ内部 agent の route を観測できない
+        ため対象外）、(2) `slot` が `Slot` / `{名前: Slot}` へ正規化できる（`_normalize_slots`
+        が非 None を返す。**生 seed + `rebind` 経路（`slot="..."` 等）は `slot` を指定していても
+        正規化結果が None になり skip**）、(3) `skip_coverage_check=False`。
         また pre-flight は seed 状態のみで実行するため、動的 routing 下で seed 状態と
         candidate 状態で経路が変わる構成は完全にはカバーできません。API コストは
         `train × 1 rollout` の追加消費が発生します。
