@@ -2929,11 +2929,11 @@ async def test_optimize_preflight_skipped_for_agentspec_target(
     """target=AgentSpec では pre-flight（`_check_route_coverage`）を一切実行しない。
 
     単体 AgentSpec は route が自明（起点 = 唯一の slot）で coverage 検査が構造的に無意味な一方、
-    train 件数ぶんの追加 API コストだけが乗る。実装はこの経路を pre-flight の対象外にしている
-    （`isinstance(target, AgentSpec)` ガード）。ここでは「呼ばれないこと」を直接固定し、
-    AgentSpec target にも pre-flight が波及する回帰（無駄な rollout コスト）を検知する。
-    `optimize` は `from ._rollout import _check_route_coverage` の関数内遅延 import なので、
-    `_rollout` モジュール側の属性差し替えが効く。
+    既存 rollout テスト群は `run_with_observation` の呼び出し回数を pin しており、pre-flight が
+    走ると成立しなくなる。実装は allow-list（`isinstance(target, HandoffGraph)`）で対象を限定
+    しており、`AgentSpec` は「除外されている」のではなく「allow-list に載っていないため届かない」。
+    ここでは「呼ばれないこと」を直接固定し、AgentSpec target にも pre-flight が波及する回帰
+    （無駄な rollout コスト）を検知する。
     """
     from oai_agentspec.runtime.lightning import _rollout as rollout_mod
 
@@ -3456,7 +3456,7 @@ async def test_optimize_preflight_interrupted_counted_in_coverage(
     with pytest.raises(OptimizeError) as exc_info:
         await optimize(
             target=graph,
-            train=[{"input": "x"}],
+            train=[{"input": "x"}, {"input": "y"}],
             val=_DEFAULT_VAL,
             reward=contains("e"),
             slot=[triage_slot, billing_slot, refund_slot],
@@ -3468,7 +3468,9 @@ async def test_optimize_preflight_interrupted_counted_in_coverage(
     assert exc.kind == FailureKind.CONFIG_MISSING
     assert run_apo_called["n"] == 0
     assert isinstance(exc.coverage, CoverageReport)
-    assert exc.coverage.interrupted_cases > 0
+    # train 2 件を全件 interrupted にして「件数」を固定する（1 件だけだと
+    # `interrupted += 1` を `interrupted = 1` に変える変異が生存する・外部レビュー指摘）。
+    assert exc.coverage.interrupted_cases == 2
 
 
 async def test_optimize_preflight_logs_warning_before_raise(
@@ -3614,6 +3616,10 @@ async def test_optimize_preflight_per_case_records_empty_observation_as_empty_tu
     exc = exc_info.value
     assert isinstance(exc.coverage, CoverageReport)
     assert len(exc.coverage.per_case) == len(train)
+    # per_case は「どの case が何を観測したか」の対応関係そのもの。case 要素を捨てて
+    # route_steps だけ見ると `per_case.append((None, steps))` の変異が生存する（外部レビュー
+    # 指摘・実測で確認済み）ため、case 側も入力と同一オブジェクトであることを固定する。
+    assert [case for case, _ in exc.coverage.per_case] == train
     # 全 case が interrupted で除外 → 各 per_case の route_steps は () として記録される。
     for _case_key, route_steps in exc.coverage.per_case:
         assert route_steps == ()
