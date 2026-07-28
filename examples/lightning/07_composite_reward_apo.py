@@ -42,6 +42,14 @@ AND（または重み付き平均）で合成すれば、「正しい担当へ h
 NOTE: APO は内部で追加 LLM（textual gradient + prompt edit）を使うため、利用者は `apo_client=`
 で AsyncOpenAI 互換クライアントを直接渡す。検証データ `val` は必須。
 
+NOTE: graph target のため **pre-flight route coverage が走る**（既定有効）。`optimize()` は APO へ
+委譲する前に seed 状態で `train` 全件を 1 巡 rollout し、`slot` に挙げた triage / billing / support
+が routing で 1 度も到達しないと `OptimizeError(FailureKind.CONFIG_MISSING)` で fail-fast する
+（未到達 slot の silent no-op 防止）。本例の `train` は billing 系 / support 系の双方を含むため通過
+する想定だが、そのぶん **`train` の件数だけ実 API 呼び出しが追加**される（本例では 3 件）。動的
+routing で seed 状態では判定できない構成や追加コストを避けたい場合は `skip_coverage_check=True`
+で opt-out できる。詳細は `docs/adr/0009-lightning-preflight-coverage.md` を参照。
+
 Azure OpenAI の環境変数を設定して実行:
     uv run python examples/lightning/07_composite_reward_apo.py
 
@@ -69,7 +77,7 @@ from oai_agentspec.runtime.lightning import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
-from _azure import azure_client, azure_model  # noqa: E402
+from _azure import api_style, azure_client, azure_deployment, azure_model  # noqa: E402
 
 # rollout 時の vars（`${company}` プレースホルダに展開）。最適化対象外で全 slot 共通。
 VARS = {"company": "AgentSpec Inc."}
@@ -219,6 +227,12 @@ async def main() -> None:
         slot=slots,
         registry=registry,  # グラフ最適化では registry 必須（未指定は CONFIG_MISSING）。
         apo_client=azure_client(),
+        # APO の gradient / apply-edit 用モデルは rollout と同じものへ明示的に揃える
+        # （既定 gpt-5.4-mini はプロバイダ / ゲートウェイによっては存在しないため）。
+        apo_gradient_model=azure_deployment(),
+        apo_apply_edit_model=azure_deployment(),
+        # gradient / apply-edit の API はプロバイダ設定（OPENAI_API_STYLE）に揃えて明示する。
+        apo_api=api_style(),
         # E2E 動作確認用に最小 APO 設定（1 ラウンド・1 候補）。本番では rounds / beam を増やす。
         rounds=1,
         apo_beam_width=1,

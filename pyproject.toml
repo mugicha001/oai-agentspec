@@ -110,5 +110,8 @@ fail_under = 80
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
-    "\\.\\.\\.",
+    # Protocol / スタブ本体の Ellipsis-only 行のみを除外する。アンカーなしだと
+    # 型注釈中の `tuple[str, ...]` や f-string 内の `...` にも一致し、当該行が
+    # 属するブロック全体（関数定義なら本体すべて）が計測外になる。
+    "^\\s*\\.\\.\\.\\s*$",
 ]

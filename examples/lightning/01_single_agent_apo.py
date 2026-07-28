@@ -33,7 +33,7 @@ from oai_agentspec.runtime.lightning import OptimizeCase, contains, optimize, tr
 
 # examples/ 共有ヘルパ _azure を解決するため _shared を import パスへ。
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
-from _azure import azure_client, azure_model  # noqa: E402
+from _azure import api_style, azure_client, azure_deployment, azure_model  # noqa: E402
 
 
 async def main() -> None:
@@ -69,6 +69,12 @@ async def main() -> None:
         val=val,
         reward=contains(),  # 既定 field=expected_output で OptimizeCase.expected_output を読む。
         apo_client=azure_client(),
+        # APO の gradient / apply-edit 用モデルは rollout と同じものへ明示的に揃える
+        # （既定 gpt-5.4-mini はプロバイダ / ゲートウェイによっては存在しないため）。
+        apo_gradient_model=azure_deployment(),
+        apo_apply_edit_model=azure_deployment(),
+        # gradient / apply-edit の API はプロバイダ設定（OPENAI_API_STYLE）に揃えて明示する。
+        apo_api=api_style(),
         rounds=1,
         apo_beam_width=1,
         apo_branch_factor=1,

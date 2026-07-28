@@ -7,6 +7,9 @@
 すべて `@dataclass(frozen=True)`（会話の `SendResult` / llmops の結果型と一致・Pydantic 非導入）。
 `OptimizeResult.save` は利用者指定パスへの opt-in 書込のみで `PromptStore` / ライブラリ管理領域を
 一切書き換えない（FR-9・PromptStore 非書込）。
+
+型定義に加え、失敗メッセージ整形の共有ヘルパ `_format_exception_message`（依存ゼロの純関数）を
+置く（optimizer / `_rollout` / `_adapters` の 3 箇所で使い、整形規則の drift を防ぐ）。
 """
 
 from __future__ import annotations
@@ -57,6 +60,93 @@ class FailureKind(StrEnum):
     TRAINER_FAILED = "trainer_failed"
 
 
+@dataclass(frozen=True)
+class CoverageReport:
+    """pre-flight route coverage 観測の集計（`OptimizeError.coverage` に添付・診断用・NFR-1）。
+
+    Attributes:
+        covered: 到達済み slot 名の union（frozenset・順序非依存）。到達観測は常に陽性証拠で、
+            `complete` の値によらず「実際に routing された」ことを意味する。
+        missing: 未到達 slot 名（`slots.keys() - covered`・frozenset）。**「train 全件を観測した
+            結果、一度も routing されなかった」ことの確定であるのは
+            `complete=True` かつ `invalid_cases == 0` のときに限る**。`complete=False` なら
+            「未到達」と「まだ観測していない」の和、`invalid_cases > 0` なら無効化で観測
+            できなかった case のぶん判定が欠けており、いずれも train の作り直し等の対処判断に
+            直接使ってはならない。
+        per_case: `(case, route_steps)` の tuple 列（train の全 case を順に含む）。
+            `route_steps` は **3 値**: `None` = 候補無効化（rollout の観測が得られていない・
+            `${var}` 喪失 / `vars=callable` の非 dict 戻り値 / 境界マーカー崩れ等）/
+            `()` = 実行済みだが観測が空（防御的経路）/ 非空 tuple = 到達観測。case 要素は
+            `RolloutResult.case` と型を揃えて `Any`（利用者任意型の多態性を保持）。case 本文の
+            accidental dump を防ぐため `repr()` には含めない（`report.per_case` への明示
+            アクセスは可）。
+        interrupted_cases: `RunOutcome.interrupted=True` で途中打ち切りとなった case 数。
+            診断カウンタであり coverage 判定には使わない（interrupted case で観測できた到達も
+            `covered` に算入される）。
+        complete: train 全件の**観測ループを完走したか**（既定 True）。False は観測が途中の
+            例外（timeout / モデル API エラー等）で打ち切られた部分レポートであることを表す。
+            **`complete=True` は `missing` の確定を単独では意味しない**（無効化 case があれば
+            そのぶん判定が欠ける。確定条件は `complete and invalid_cases == 0`・上記参照）。
+            `OptimizeError.kind` からも `CONFIG_MISSING`=完走 / `TRAINER_FAILED`=部分と
+            推し量れるが、kind は失敗種別の軸であり観測完了度とは別関心。レポート単体を
+            例外から切り離してログ・保存しても完了度が読めるよう、自己記述フィールドとして
+            持つ（repr にも出る）。
+        invalid_cases: 候補無効化により rollout の観測が得られなかった case 数（既定 0・
+            `per_case` の `None` エントリ数と一致）。`interrupted_cases` と同じく診断カウンタで
+            あり coverage 判定には使わない。0 より大きいとき `missing` は確定でない（上記）。
+    """
+
+    covered: frozenset[str]
+    missing: frozenset[str]
+    per_case: tuple[tuple[Any, tuple[str, ...] | None], ...] = field(repr=False)
+    interrupted_cases: int
+    complete: bool = True
+    invalid_cases: int = 0
+
+
+def _format_exception_message(exc: BaseException) -> str:
+    """例外を「型名は常に・本文は非空のときだけ」の形式で整形する（共有ヘルパ）。
+
+    `str(TimeoutError())` のように本文が空になる例外型があり、無条件に `型名: 本文` を連結すると
+    `'TimeoutError: '` とコロンで終わる情報ゼロの文字列になる。失敗メッセージを組む全境界
+    （optimizer の catch-all / `_rollout` の pre-flight 観測 / `_adapters` の APO 実行）で
+    本関数を使い、整形規則の drift を防ぐ。
+
+    Args:
+        exc: 整形対象の例外。
+
+    Returns:
+        `"型名: 本文"`（本文非空時）または `"型名"`（本文空時）。
+    """
+    body = str(exc)
+    return f"{type(exc).__name__}: {body}" if body else type(exc).__name__
+
+
+@dataclass(frozen=True)
+class OptimizePartial:
+    """APO 逐次実行が途中で失敗したときの部分成果（`OptimizeError.partial` に添付・診断用）。
+
+    複数 slot の逐次 APO では、slot i の失敗時点で slot 1..i-1 の最適化は完了しており、
+    その成果（API コストを払って得た最良テキストと履歴）を失敗とともに破棄しない。
+    `except OptimizeError` 節から `error.partial` でプログラム的に取得できる。
+
+    Attributes:
+        completed_slots: 完了済み slot の最良テキスト（`{slot 名: テキスト}`・`${var}` 再注入
+            済み）。**診断・救出用の中間表現**であり、新 shape slot では固定セグメントを含む
+            full 合成（`OptimizeResult.prompt` の契約）ではない tune 側テキストのまま。
+            そのまま instructions に使う値ではない。prompt 本文の accidental dump を防ぐため
+            `repr()` には含めない（明示アクセスは可・`CoverageReport.per_case` と同方針）。
+        history: 完了済み slot の履歴（`HistoryEntry` の列・`OptimizeResult.history` と同 schema。
+            stdlib に frozen mapping が無く `OptimizeResult.history` と型を揃えるため list）。
+        failed_slot: 失敗した slot 名。None は「全 slot の最適化は完了し、合成スコア再計算段で
+            失敗した」ことを表す（このとき `completed_slots` は全 slot を含む）。
+    """
+
+    completed_slots: dict[str, str] = field(repr=False)
+    history: list[HistoryEntry]
+    failed_slot: str | None
+
+
 class OptimizeError(Exception):
     """最適化が送出する構造化エラー（未捕捉例外でプロセスを止めないための変換先・FR-8）。
 
@@ -66,18 +156,40 @@ class OptimizeError(Exception):
     Attributes:
         kind: 失敗種別（`FailureKind`）。
         message: 人間可読のエラーメッセージ。
+        coverage: pre-flight route coverage 診断（`CoverageReport`）。pre-flight の
+            **未到達検出（`CONFIG_MISSING`・`complete=True`）と観測失敗（`TRAINER_FAILED`・
+            `complete=False`）の両経路**で非 None。他の raise 経路では None（既存呼び出しには
+            影響なし）。例外: pre-flight 中に承認安全違反（NFR-8 fail-closed）で送出される
+            `CONFIG_MISSING` は既存の kind / message を保つため `coverage=None` のまま。
     """
 
-    def __init__(self, kind: FailureKind, message: str) -> None:
+    def __init__(
+        self,
+        kind: FailureKind,
+        message: str,
+        *,
+        coverage: CoverageReport | None = None,
+        partial: OptimizePartial | None = None,
+    ) -> None:
         """最適化エラーを生成する。
 
         Args:
             kind: 失敗種別。
             message: 人間可読メッセージ。
+            coverage: pre-flight route coverage の診断情報（keyword-only・pre-flight 経路のみ）。
+            partial: APO 逐次実行の部分成果（keyword-only・複数 slot APO の途中失敗経路のみ。
+                非 None は「保全された成果がある」ことを意味し、先頭 slot 失敗等の保全対象が
+                ない失敗では None のまま）。
+
+        Note:
+            `coverage` / `partial` は keyword-only。位置引数で渡すと `TypeError`
+            （既存呼び出し互換）。
         """
         super().__init__(message)
         self.kind = kind
         self.message = message
+        self.coverage = coverage
+        self.partial = partial
 
 
 class _CandidateInvalid(Exception):

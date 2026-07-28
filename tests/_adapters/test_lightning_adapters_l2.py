@@ -1283,3 +1283,756 @@ def test_parse_score_integer() -> None:
     """整数表記（"1"）も抽出してクランプ範囲内で返す。"""
     assert _parse_score("1") == pytest.approx(1.0)
     assert _parse_score("0") == pytest.approx(0.0)
+
+
+# --- run_apo: 途中失敗時の部分成果保全（X1: slot ループ内 / X2: スコア再計算段） -----------
+
+
+def _no_extra_check(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_require_agentlightning` を no-op 化する（cold-start import の時間を外すため）。"""
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._require_agentlightning", lambda: None, raising=True
+    )
+
+
+def _entry(slot: str) -> dict[str, Any]:
+    """最小の HistoryEntry dict を作る。"""
+    return {"slot": slot, "best_score": 0.8, "best_version": 1, "placeholder_fallback": False}
+
+
+async def test_run_apo_slot_failure_preserves_completed_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """slot 2 の失敗時、slot 1 の最良テキスト（vars 再注入済み）と履歴が partial に残る。
+
+    完了済み slot の最適化は API コストを払って完了しており、後続 slot の失敗で
+    ローカル変数ごと全損すると利用者は診断も救出もできない（pre-flight の案 B と同じ動機）。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        if slot_name == "billing":
+            raise RuntimeError("boom")
+        return ("T-BEST ${company}", _entry(slot_name))
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t ${company}", "billing": "b"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+            vars_per_slot={"triage": {"company": "ACME"}},
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.TRAINER_FAILED
+    assert exc.partial is not None
+    assert exc.partial.completed_slots == {"triage": "T-BEST ACME"}
+    assert [e["slot"] for e in exc.partial.history] == ["triage"]
+    assert exc.partial.failed_slot == "billing"
+    assert "slot 2/2" in exc.message
+    assert "'billing'" in exc.message
+    assert "RuntimeError" in exc.message
+    assert "boom" in exc.message
+    assert "error.partial" in exc.message
+    assert isinstance(exc.__cause__, RuntimeError)
+
+
+async def test_run_apo_first_slot_failure_has_no_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """先頭 slot の失敗は保全対象がなく partial=None（非 None = 成果ありの契約）。
+
+    本文が空の例外（`TimeoutError()`）でも型名がメッセージに残ることも併せて固定する。
+    """
+    from oai_agentspec.runtime.lightning import OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        raise TimeoutError()
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+
+    exc = exc_info.value
+    assert exc.partial is None
+    assert "TimeoutError" in exc.message
+    assert not exc.message.endswith(": ")
+    assert "error.partial" not in exc.message
+
+
+async def test_run_apo_slot_failure_optimize_error_passes_through_with_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """slot 途中の `OptimizeError` は kind / message を保ったまま partial だけ後付けされる。
+
+    再ラップすると kind が TRAINER_FAILED へ変質し fail-closed の診断（NFR-8 の
+    CONFIG_MISSING 等）が失われる。属性後付けなら既存契約を保ちながら成果を保全できる。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        if slot_name == "billing":
+            raise OptimizeError(FailureKind.CONFIG_MISSING, "承認済みツールがモック未差し替えです")
+        return ("T-BEST", _entry(slot_name))
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t", "billing": "b"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.CONFIG_MISSING
+    assert exc.message == "承認済みツールがモック未差し替えです"
+    assert exc.partial is not None
+    assert exc.partial.completed_slots == {"triage": "T-BEST"}
+    assert exc.partial.failed_slot == "billing"
+
+
+async def test_run_apo_score_failure_preserves_all_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """全 slot 完了後のスコア再計算失敗では、全 slot の最良テキストが partial に残る。
+
+    このケースが全損の本命: 最適化そのものは全部成功しているのに、再計算の失敗で
+    成果ごと消えるのを防ぐ。`failed_slot=None` が「全 slot 完了」の標識。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        return (f"{slot_name}-BEST", _entry(slot_name))
+
+    async def _score_boom(*args: Any, **kwargs: Any) -> float:
+        raise RuntimeError("score boom")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._score_candidate", _score_boom, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t", "billing": "b"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.TRAINER_FAILED
+    assert exc.partial is not None
+    assert exc.partial.completed_slots == {"triage": "triage-BEST", "billing": "billing-BEST"}
+    assert exc.partial.failed_slot is None
+    assert "RuntimeError" in exc.message
+    assert "score boom" in exc.message
+
+
+async def test_run_apo_partial_build_failure_falls_back_to_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """partial 組み立て自体が失敗しても元例外の構造化は行われる（fail-safe・partial=None）。
+
+    `substitute_braced` は vars 値へ `str()` を適用するため、`__str__` が例外を投げる
+    利用者オブジェクトで組み立てが失敗しうる。診断のための処理を新たな失敗源にしない。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    class _BadStr:
+        def __str__(self) -> str:
+            raise ValueError("unstringable")
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        if slot_name == "billing":
+            raise RuntimeError("boom")
+        return ("T-BEST ${company}", _entry(slot_name))
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t ${company}", "billing": "b"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+            vars_per_slot={"triage": {"company": _BadStr()}},  # type: ignore[dict-item]
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.TRAINER_FAILED
+    assert exc.partial is None
+    assert "RuntimeError" in exc.message
+    assert "boom" in exc.message
+
+
+# --- _responses_complete_text: chat-only ゲートウェイへの自動 fallback ------------------------
+
+
+def _not_found_error() -> Exception:
+    """openai.NotFoundError（/responses 不在の 404）を最小構成で作る。"""
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://gw.example.com/v1/responses")
+    response = httpx.Response(404, request=request, json={"detail": "Not Found"})
+    return openai.NotFoundError("Not Found", response=response, body={"detail": "Not Found"})
+
+
+class _FakeGatewayClient:
+    """responses が 404 を返し chat.completions は成功する chat-only ゲートウェイの疑似 client。"""
+
+    def __init__(self) -> None:
+        self.responses_calls = 0
+        self.chat_calls: list[dict[str, Any]] = []
+
+        outer = self
+
+        class _Responses:
+            async def create(self, **kwargs: Any) -> Any:
+                outer.responses_calls += 1
+                raise _not_found_error()
+
+        class _Completions:
+            async def create(self, **kwargs: Any) -> Any:
+                outer.chat_calls.append(kwargs)
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="grad text"))]
+                )
+
+        class _Chat:
+            completions = _Completions()
+
+        self.responses = _Responses()
+        self.chat = _Chat()
+
+
+async def test_responses_complete_text_falls_back_to_chat_on_404() -> None:
+    """/responses が 404 の client では chat.completions へ自動 fallback して完遂する。
+
+    litellm 等の chat-only ゲートウェイを apo_client に渡した場合、Responses 固定だと
+    APO gradient が必ず 404 で死ぬ（実 API で確認済み）。「client を渡せば動く」を保つため、
+    エンドポイント不在（NotFoundError）のときだけ上流 agent-lightning 本来の chat 呼び出しへ
+    倒す。messages は元の chat-style をそのまま渡す（system 分離は不要）。
+    """
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    client = _FakeGatewayClient()
+    messages = [
+        {"role": "system", "content": "you are a critic"},
+        {"role": "user", "content": "critique this"},
+    ]
+
+    text = await _responses_complete_text(
+        client=client, model="gw-model", messages=messages, temperature=0.7
+    )
+
+    assert text == "grad text"
+    assert client.responses_calls == 1
+    assert len(client.chat_calls) == 1
+    assert client.chat_calls[0]["model"] == "gw-model"
+    assert client.chat_calls[0]["messages"] == messages
+    assert client.chat_calls[0]["temperature"] == 0.7
+
+
+async def test_responses_complete_text_fallback_is_memoized_via_provided_set() -> None:
+    """呼び出し側が渡した memo set に fallback 済みモデルが記憶され、再試行しない。
+
+    記憶の所有者は呼び出し側（`_build_apo` が APO インスタンスへ持たせる）。module-global に
+    しないことで、id 再利用・GC 追従・unhashable 対策（旧 R1-R5 の 65 行）が構造ごと不要になり、
+    一過性 404 の誤固定も 1 インスタンス（= 1 slot の APO 実行）に自動限定される。
+    """
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    client = _FakeGatewayClient()
+    memo: set[str] = set()
+    messages = [{"role": "user", "content": "x"}]
+
+    await _responses_complete_text(
+        client=client, model="m", messages=messages, temperature=0.0, unsupported_models=memo
+    )
+    await _responses_complete_text(
+        client=client, model="m", messages=messages, temperature=0.0, unsupported_models=memo
+    )
+
+    assert client.responses_calls == 1  # 1 回目のみ試行
+    assert len(client.chat_calls) == 2
+    assert memo == {"m"}
+
+
+async def test_responses_fallback_memo_is_scoped_to_provided_set() -> None:
+    """memo は渡された set の寿命に閉じる（別 set / 未渡しでは Responses を再試行する）。
+
+    module-global 記憶だと一過性の誤分類 404 がプロセス寿命まで残る（外部レビュー指摘）。
+    set 単位のスコープなら誤固定は最長でも 1 APO インスタンスの寿命で消える。
+    """
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    client = _FakeGatewayClient()
+    messages = [{"role": "user", "content": "x"}]
+
+    await _responses_complete_text(
+        client=client, model="m", messages=messages, temperature=0.0, unsupported_models=set()
+    )
+    # 別 set -> 記憶を共有せず Responses を再試行
+    await _responses_complete_text(
+        client=client, model="m", messages=messages, temperature=0.0, unsupported_models=set()
+    )
+    # memo 未渡し（None）-> 記憶なしで毎回試行
+    await _responses_complete_text(client=client, model="m", messages=messages, temperature=0.0)
+
+    assert client.responses_calls == 3
+
+
+def test_responses_fallback_has_no_module_global_cache() -> None:
+    """fallback の記憶に module-global を使わない（過剰設計の再発防止 pin）。"""
+    from oai_agentspec._adapters import lightning as ln
+
+    assert not hasattr(ln, "_responses_unsupported")
+    assert not hasattr(ln, "_responses_known_unsupported")
+    assert not hasattr(ln, "_remember_responses_unsupported")
+
+
+async def test_responses_complete_text_non_404_propagates() -> None:
+    """404 以外の失敗（認証エラー等）は fallback せず伝搬する（誤設定の隠蔽防止）。"""
+    import httpx
+    import openai
+
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    class _AuthFailClient:
+        class responses:  # noqa: N801 - 疑似 client の属性名
+            @staticmethod
+            async def create(**kwargs: Any) -> Any:
+                request = httpx.Request("POST", "https://gw.example.com/v1/responses")
+                response = httpx.Response(401, request=request, json={})
+                raise openai.AuthenticationError("bad key", response=response, body={})
+
+    with pytest.raises(openai.AuthenticationError):
+        await _responses_complete_text(
+            client=_AuthFailClient(), model="m", messages=[], temperature=0.0
+        )
+
+
+def _not_found_error_with_code(code: str) -> Exception:
+    """`error.code` を持つ 404（モデル / デプロイ不在）を作る。"""
+    import httpx
+    import openai
+
+    body = {"error": {"code": code, "message": "not found"}}
+    request = httpx.Request("POST", "https://api.example.com/v1/responses")
+    response = httpx.Response(404, request=request, json=body)
+    return openai.NotFoundError("not found", response=response, body=body["error"])
+
+
+class _ModelNotFoundClient:
+    """responses が model_not_found 404 を返す client（エンドポイントは存在する）。"""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        self.chat_calls = 0
+        outer = self
+
+        class _Responses:
+            async def create(self, **kwargs: Any) -> Any:
+                raise _not_found_error_with_code(outer.code)
+
+        class _Completions:
+            async def create(self, **kwargs: Any) -> Any:
+                outer.chat_calls += 1
+                from types import SimpleNamespace
+
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content="x"))]
+                )
+
+        class _Chat:
+            completions = _Completions()
+
+        self.responses = _Responses()
+        self.chat = _Chat()
+
+
+@pytest.mark.parametrize("code", ["model_not_found", "DeploymentNotFound"])
+async def test_responses_complete_text_model_not_found_404_propagates(code: str) -> None:
+    """モデル / デプロイ不在の 404 は fallback せず伝搬する（設定ミスを隠さない）。
+
+    404 は「/responses が無い」だけでなく「model が無い」でも返る（OpenAI: model_not_found /
+    Azure: DeploymentNotFound）。区別せず fallback すると、モデル名のタイポが
+    「chat へ倒れて別のエラー」に化け、真因が隠れる。
+    """
+    import openai
+
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    client = _ModelNotFoundClient(code)
+    with pytest.raises(openai.NotFoundError):
+        await _responses_complete_text(
+            client=client, model="typo-model", messages=[], temperature=0.0
+        )
+    assert client.chat_calls == 0
+
+
+async def test_responses_complete_text_unhashable_client_still_falls_back() -> None:
+    """hashable でない client でも fallback が成立する（記憶をスキップするだけ）。
+
+    `__eq__` を定義して `__hash__` を失った wrapper（テストダブル / dataclass proxy 等）は
+    weakref 可能でも unhashable。membership 判定が TypeError で落ちると、fallback へ
+    到達する前に死ぬ（外部レビュー指摘・実測で TypeError を確認済み）。
+    """
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    class _Unhashable(_FakeGatewayClient):
+        __hash__ = None  # type: ignore[assignment]
+
+        def __eq__(self, other: object) -> bool:
+            return self is other
+
+    client = _Unhashable()
+    text = await _responses_complete_text(client=client, model="m", messages=[], temperature=0.0)
+    assert text == "grad text"
+    assert len(client.chat_calls) == 1
+
+
+async def test_responses_complete_text_cache_registered_only_after_success() -> None:
+    """chat fallback 自体が失敗したときは記憶しない（次回は Responses を再試行する）。
+
+    成功前に登録すると、一過性の失敗でその (client, model) が永久に chat 固定になる。
+    """
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    class _BothFailFirst:
+        def __init__(self) -> None:
+            self.responses_calls = 0
+            self.chat_calls = 0
+            outer = self
+
+            class _Responses:
+                async def create(self, **kwargs: Any) -> Any:
+                    outer.responses_calls += 1
+                    raise _not_found_error()
+
+            class _Completions:
+                async def create(self, **kwargs: Any) -> Any:
+                    outer.chat_calls += 1
+                    raise RuntimeError("chat down")
+
+            class _Chat:
+                completions = _Completions()
+
+            self.responses = _Responses()
+            self.chat = _Chat()
+
+    client = _BothFailFirst()
+    memo: set[str] = set()
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="chat down"):
+            await _responses_complete_text(
+                client=client, model="m", messages=[], temperature=0.0, unsupported_models=memo
+            )
+
+    assert client.responses_calls == 2  # 記憶されていないので毎回 Responses を試す
+    assert memo == set()
+
+
+async def test_responses_complete_text_no_responses_attr_uses_chat_directly() -> None:
+    """`responses` 属性を持たない chat-only client は 404 を待たず最初から chat を使う。
+
+    最小構成の OpenAI 互換プロキシは `/responses` が 404 を返す以前に属性自体を持たない。
+    `client.responses.create` へ触ると AttributeError で fallback に到達できず落ちる。
+    """
+    from types import SimpleNamespace
+
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    class _Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="chat only"))]
+            )
+
+    class _Chat:
+        completions = _Completions()
+
+    class _ChatOnly:
+        chat = _Chat()
+
+    text = await _responses_complete_text(
+        client=_ChatOnly(), model="m", messages=[], temperature=0.0
+    )
+    assert text == "chat only"
+
+
+async def test_chat_complete_text_choice_without_message_returns_empty() -> None:
+    """choice が message を持たない互換ゲートウェイ応答でも空文字へ degrade する。"""
+    from types import SimpleNamespace
+
+    from oai_agentspec._adapters.lightning import _chat_complete_text
+
+    class _Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(choices=[SimpleNamespace(delta="stream-like")])
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    assert (
+        await _chat_complete_text(client=_Client(), model="m", messages=[], temperature=0.0) == ""
+    )
+
+
+async def test_run_apo_first_slot_import_error_maps_to_extra_missing_without_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """先頭 slot の ImportError は EXTRA_MISSING の OptimizeError になる（partial=None）。
+
+    agentlightning 本体は導入済みでも `[apo]` 系サブ依存（poml 等）が欠けていると
+    `_run_apo_single_slot` 内の遅延 import が ImportError を投げる。kind は EXTRA_MISSING
+    契約を維持し（TRAINER_FAILED に化けない）、保全対象がない先頭 slot では partial=None。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        raise ImportError("No module named 'poml'")
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.EXTRA_MISSING
+    assert "poml" in exc.message
+    assert exc.partial is None
+    assert isinstance(exc.__cause__, ImportError)
+
+
+# --- apo_api 明示ノブ（_build_apo の bind 分岐 / allow_chat_fallback 配線） -------------------
+
+
+def test_build_apo_chat_completions_does_not_bind_overrides(
+    fake_apo_factory: list[_FakeAPO],
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ARG001 - fixture 副作用
+) -> None:
+    """`apo_api="chat_completions"` では Responses override を bind しない（上流 chat 実装）。
+
+    上流 `agentlightning.APO` は素で chat.completions を使うため、非 bind = chat 動作。
+    override 2 本は必ず同時に bind / 非 bind する（片方のみは gradient と apply-edit で
+    API が食い違う不整合になる）。
+    """
+    from oai_agentspec._adapters.lightning import _build_apo
+    from oai_agentspec.runtime.lightning import OptimizeConfig
+
+    apo = _build_apo(OptimizeConfig(apo_client=_FAKE_APO_CLIENT, apo_api="chat_completions"))
+    bound = vars(apo)
+    assert "compute_textual_gradient" not in bound
+    assert "textual_gradient_and_apply_edit" not in bound
+
+
+@pytest.mark.parametrize(
+    ("apo_api", "expected_fallback"),
+    [(None, True), ("responses", False)],
+)
+def test_build_apo_binds_overrides_and_sets_fallback_flag(
+    fake_apo_factory: list[_FakeAPO],
+    monkeypatch: pytest.MonkeyPatch,  # noqa: ARG001 - fixture 副作用
+    apo_api: str | None,
+    expected_fallback: bool,
+) -> None:
+    """auto / responses 明示では override を 2 本とも bind し、fallback フラグを設定する。
+
+    auto（None）= fallback 許可、"responses" 明示 = fallback 禁止（明示したのに黙って
+    chat へ化けない fail-closed）。
+    """
+    from oai_agentspec._adapters.lightning import _build_apo
+    from oai_agentspec.runtime.lightning import OptimizeConfig
+
+    apo = _build_apo(OptimizeConfig(apo_client=_FAKE_APO_CLIENT, apo_api=apo_api))
+    bound = vars(apo)
+    assert "compute_textual_gradient" in bound
+    assert "textual_gradient_and_apply_edit" in bound
+    assert apo._oas_allow_chat_fallback is expected_fallback
+
+
+async def test_responses_complete_text_strict_mode_propagates_404_without_chat() -> None:
+    """`allow_chat_fallback=False` はエンドポイント不在 404 でも chat へ行かず伝搬・記憶なし。"""
+    import openai
+
+    from oai_agentspec._adapters import lightning as ln
+
+    client = _FakeGatewayClient()
+    memo: set[str] = set()
+    with pytest.raises(openai.NotFoundError):
+        await ln._responses_complete_text(
+            client=client,
+            model="m",
+            messages=[],
+            temperature=0.0,
+            allow_chat_fallback=False,
+            unsupported_models=memo,
+        )
+    assert client.chat_calls == []
+    assert memo == set()
+
+
+async def test_responses_complete_text_strict_mode_ignores_memo_and_attr_shortcut() -> None:
+    """`allow_chat_fallback=False` は memo ヒットも属性ショートカットも使わず Responses を呼ぶ。
+
+    同一インスタンスの先行 auto 呼び出しが memo へ記憶した後でも、明示 responses は
+    Responses を再試行する（黙って chat へ行く経路をゼロにする fail-closed）。
+    """
+    from types import SimpleNamespace
+
+    from oai_agentspec._adapters.lightning import _responses_complete_text
+
+    class _ResponsesOk:
+        def __init__(self) -> None:
+            self.responses_called = 0
+            outer = self
+
+            class _Responses:
+                async def create(self, **kwargs: Any) -> Any:
+                    outer.responses_called += 1
+                    return SimpleNamespace(output_text="resp")
+
+            self.responses = _Responses()
+
+    client = _ResponsesOk()
+    memo = {"m"}  # 先行 auto の記憶を再現
+    text = await _responses_complete_text(
+        client=client,
+        model="m",
+        messages=[],
+        temperature=0.0,
+        allow_chat_fallback=False,
+        unsupported_models=memo,
+    )
+
+    assert text == "resp"
+    assert client.responses_called == 1
+
+
+async def test_chat_complete_text_coerces_content_parts_list_to_str() -> None:
+    """content が content-parts 形式（list）でも text を連結した str を返す（`-> str` 契約）。
+
+    互換ゲートウェイは `[{"type": "text", "text": ...}]` 形式を返すことがある。list を
+    そのまま返すと下流の APO 文字列処理が原因から遠い場所で TypeError になるか、
+    list が「最適化済みプロンプト」として混入する。
+    """
+    from types import SimpleNamespace
+
+    from oai_agentspec._adapters.lightning import _chat_complete_text
+
+    class _Completions:
+        async def create(self, **kwargs: Any) -> Any:
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(
+                            content=[
+                                {"type": "text", "text": "part1 "},
+                                {"type": "text", "text": "part2"},
+                            ]
+                        )
+                    )
+                ]
+            )
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    text = await _chat_complete_text(client=_Client(), model="m", messages=[], temperature=0.0)
+    assert text == "part1 part2"
+
+
+async def test_run_apo_slot_import_error_maps_to_extra_missing_with_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """slot 途中の ImportError は EXTRA_MISSING の OptimizeError に partial 付きで包まれる。
+
+    生 raise（旧実装）では kind 契約は保てたが、(a) 完了済み slot の partial が捨てられ、
+    (b) メッセージが原因の二面性（サブ依存欠落 or rollout 内 import 失敗）を説明できなかった。
+    kind は EXTRA_MISSING を維持しつつ partial 保全と両立させる。
+    """
+    from oai_agentspec.runtime.lightning import FailureKind, OptimizeError
+
+    _no_extra_check(monkeypatch)
+
+    async def _single(*, slot_name: str, **kwargs: Any) -> tuple[str, dict[str, Any]]:
+        if slot_name == "billing":
+            raise ImportError("No module named 'poml'")
+        return ("T-BEST", _entry(slot_name))
+
+    monkeypatch.setattr(
+        "oai_agentspec._adapters.lightning._run_apo_single_slot", _single, raising=True
+    )
+
+    with pytest.raises(OptimizeError) as exc_info:
+        await run_apo(
+            seeds={"triage": "t", "billing": "b"},
+            train=[{"input": "x"}],
+            val=[{"input": "v"}],
+            rollout=_const_rollout(0.5),
+            config=OptimizeConfig(apo_client=_FAKE_APO_CLIENT),
+        )
+
+    exc = exc_info.value
+    assert exc.kind is FailureKind.EXTRA_MISSING
+    assert "poml" in exc.message
+    assert exc.partial is not None
+    assert exc.partial.completed_slots == {"triage": "T-BEST"}
+    assert isinstance(exc.__cause__, ImportError)

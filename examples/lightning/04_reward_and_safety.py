@@ -41,7 +41,7 @@ from oai_agentspec import AgentSpec, function_tool
 from oai_agentspec.runtime.lightning import OptimizeCase, optimize, tool_match, train_val_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "_shared"))
-from _azure import azure_client, azure_model  # noqa: E402
+from _azure import api_style, azure_client, azure_deployment, azure_model  # noqa: E402
 
 
 @function_tool(needs_approval=True)
@@ -79,6 +79,12 @@ async def main() -> None:
         # approve 認可は (agent_name, tool_name) 単位（未登録ツールの approve は失敗）。
         tool_mocks={"account-agent": {"delete_account": "deleted (mock)"}},
         apo_client=azure_client(),
+        # APO の gradient / apply-edit 用モデルは rollout と同じものへ明示的に揃える
+        # （既定 gpt-5.4-mini はプロバイダ / ゲートウェイによっては存在しないため）。
+        apo_gradient_model=azure_deployment(),
+        apo_apply_edit_model=azure_deployment(),
+        # gradient / apply-edit の API はプロバイダ設定（OPENAI_API_STYLE）に揃えて明示する。
+        apo_api=api_style(),
         # E2E 動作確認用に最小 APO 設定（1 ラウンド・1 候補）。本番では rounds / beam を増やす。
         rounds=1,
         apo_beam_width=1,
