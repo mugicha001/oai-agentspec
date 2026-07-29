@@ -128,7 +128,7 @@ APO は最適化対象を利用者指定の「チューナブルなプロンプ�
   - [ ] WHEN `result.save(path)` が書き込む THEN 利用者が渡したパスにのみ書き、`PromptStore` のテンプレートやライブラリ管理領域を一切書き換えない（PromptStore 非書込・モデル重み非保持と整合）。
   - [ ] IF `result.save(path)` のパスが書込不能 / 不正である THEN 明確なエラー（書込先の問題を示す）を送出する（fail-closed）。
   - [ ] WHEN 利用者が結果を plain dict として扱う THEN 任意で `result.to_dict()` 相当（結果を plain dict として取得しログ / 外部保存に使える・シグネチャは暫定）を提供してよい。
-  - [ ] WHEN 利用者が slot（`prompt_slot` / `prompt_slot_factory` の戻り値、単一の静的 str、または `{名前: slot}` の mapping）を渡す THEN slot は常に `slot=` キーワードで渡し、`optimize` の第1引数は最適化対象（`AgentSpec` / `WorkflowGraph` / `HandoffGraph`）とする（FR-1 と整合・slot を第1引数にしない）。`prompt_slot` 利用時は `build` から rebind が自動導出されるため `rebind` を別途渡す必要はない（rebind の冗長排除・生 seed 経路でのみ rebind を明示）。
+  - [ ] WHEN 利用者が slot（`prompt_slot` / `prompt_slot_factory` で生成した `Slot`、単一の静的 str、または `{名前: slot}` の mapping）を渡す THEN slot は常に `slot=` キーワードで渡し、`optimize` の第1引数は最適化対象（`AgentSpec` / `WorkflowGraph` / `HandoffGraph`）とする（FR-1 と整合・slot を第1引数にしない）。`prompt_slot` 利用時は `build` から rebind が自動導出されるため `rebind` を別途渡す必要はない（rebind の冗長排除・生 seed 経路でのみ rebind を明示）。
   - [ ] WHEN 生の `slot` / `rebind` / `reward` callable を直接渡す THEN ヘルパを経由せずに従来どおり受理し、ヘルパとパワーユーザー経路が併存する。
   - [ ] WHEN ヘルパ（reward ファクトリ / `prompt_slot` / `prompt_slot_factory`）が `PromptStore` に触れる THEN 既存 `PromptStore`（`src/oai_agentspec/prompts.py`）のクラス・メソッド・役割を一切変更せず、公開メソッドの読み取りに限定する（依存方向 `runtime/lightning → core(prompts)` の一方向を守り、core は lightning を逆参照しない）。
 
@@ -398,7 +398,7 @@ result = optimize(
     workflow_graph,
     algorithm="apo",
     registry=registry,        # 必要 spec を register 済みの AgentRegistry を同伴（FR-1・既定 build の spec 解決元）
-    slot=slots,               # prompt_slot_factory / prompt_slot の戻り値（build から rebind 自動導出・vars 再注入）、単一 str、または {名前: slot}
+    slot=slots,               # prompt_slot_factory / prompt_slot で生成した Slot（build から rebind 自動導出・vars 再注入）、単一 str、または {名前: slot}
     train=train,
     val=val,
     reward=contains("expected"),

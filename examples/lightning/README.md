@@ -336,7 +336,7 @@ def composite_reward(r: RolloutResult) -> float:
   - `vars` のみ defaults / overrides の双方が `dict` のときにマージし、それ以外の kwarg は
     overrides が defaults を置換する（合成規則の詳細は ADR 0008）。
 
-`Slot`（`prompt_slot` / `prompt_slot_factory` の戻り値）は `build` を内包するため、フレームワークが各
+`Slot`（`prompt_slot` / `prompt_slot_factory` が生成する値）は `build` を内包するため、フレームワークが各
 スロットの `build` から rebind を自動導出する（手書き rebind は生 seed 経路のときだけ必要）。
 
 `optimize(..., context_factory=lambda: MyContext())` を渡すと rollout ごとに新鮮な実行時 context
