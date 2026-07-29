@@ -19,7 +19,7 @@ registry は read-only で扱い変更しない。プロンプト・評価ケー
      - [pre-flight route coverage（graph target・既定有効）](#pre-flight-route-coveragegraph-target既定有効)
    - [`OptimizeCase`（推奨データ型）](#optimizecase推奨データ型)
    - [報酬ファクトリ](#報酬ファクトリ)
-   - [スロットヘルパ（`prompt_slot` / `prompt_slots`）](#スロットヘルパprompt_slot--prompt_slots)
+   - [スロットヘルパ（`prompt_slot` / `prompt_slot_factory`）](#スロットヘルパprompt_slot--prompt_slot_factory)
    - [置換変数（`${var}`）の扱い](#置換変数varの扱い)
    - [データ分割（`train_val_split`）](#データ分割train_val_split)
    - [結果（`OptimizeResult`）と保存](#結果optimizeresultと保存)
@@ -104,7 +104,7 @@ asyncio.run(main())
 |---|---|---|
 | まずは単一 agent の prompt を最適化したい | `01_single_agent_apo.py` | `OptimizeCase` + `contains()` + `apo_client` |
 | `PromptStore` 合成プロンプトを最適化したい（既定 build / `${var}` 保持） | `02_prompt_slot_apo.py` | `prompt_slot` |
-| ハンドオフ含む系全体（`HandoffGraph`）を最適化したい | `03_graph_apo.py` | `prompt_slots` |
+| ハンドオフ含む系全体（`HandoffGraph`）を最適化したい | `03_graph_apo.py` | `prompt_slot_factory` |
 | 期待ツールを ground truth にしつつ承認必須の危険ツールを安全に回したい | `04_reward_and_safety.py` | `tool_match()` + `tool_mocks` + `approvals` |
 | 危険操作を必ず承認ゲートへ回すプロンプトを学習させたい（HITL） | `06_approval_match_apo.py` | `approval_match()` |
 | 出力 / ツール / 経路 / 最終 agent を 1 ケースに集約して複合 reward で学習 | `07_composite_reward_apo.py` | `OptimizeCase` 全観点 + 複合 reward |
@@ -134,7 +134,7 @@ uv run python examples/lightning/05_failure_handling.py   # これは環境変�
 | `val` | 最良候補の選定 / 汎化スコアに使う入力ケース群（**必須**・APO の beam search に必要） |
 | `reward` | rollout の `RolloutResult` から報酬を返す callable（同期 / async・ファクトリ可） |
 | `slot` | 最適化対象スロット（`Slot` / 生 seed str / `{名前: Slot}` mapping）。省略で静的 `AgentSpec` の `instructions` を既定スロットにする |
-| `rebind` | 生 seed 経路で候補から宣言物を組み直す関数（`prompt_slot` / `prompt_slots` 利用時は `build` から自動導出のため不要） |
+| `rebind` | 生 seed 経路で候補から宣言物を組み直す関数（`prompt_slot` / `prompt_slot_factory` 利用時は `build` から自動導出のため不要） |
 | `registry` | 横断対象 / 既定 build の specs 供給経路（`HandoffGraph` 必須） |
 | `tool_mocks` | rollout 副作用を安全化する agent スコープのモック dict |
 | `approvals` | 承認自動解決ポリシー（`tool_mocks` と併用） |
@@ -304,7 +304,7 @@ def composite_reward(r: RolloutResult) -> float:
             + last_agent_match()(r)) / 4
 ```
 
-### スロットヘルパ（`prompt_slot` / `prompt_slots`）
+### スロットヘルパ（`prompt_slot` / `prompt_slot_factory`）
 
 合成プロンプトの seed 取得・固定部分との再合成・候補適用 rebind・build 宣言を畳む。`PromptStore`
 の公開メソッドを**読み取るのみ**で一切改変しない。
@@ -324,15 +324,19 @@ def composite_reward(r: RolloutResult) -> float:
   - `build` 省略時の既定 build は registry 登録 `AgentSpec` を複製し `instructions` だけ候補で
     差し替える（registry 必須・未解決は fail-closed）。tools / handoffs / model 等は登録 spec から
     複製され、利用者は再宣言不要。
-- `prompt_slots(store, registry, agents=[...], *, base=None, parts=(), tune=None, vars=None)` -> `{名前: Slot}`
-  - 列挙したエージェント分を一括生成（各 agent 名で新 shape の `agent=` slot を生成）。
+- `prompt_slot_factory(store, registry=None, **defaults)` -> `Callable[..., Slot]`
+  - `prompt_slot` の共通既定値（`base` / `parts` / `layout` / `tune` / `vars` / `build`）を束ね、
+    `make(agent: str, **overrides) -> Slot` を返す。`overrides` は `prompt_slot` の全 kwarg を素通す。
+  - 複数エージェント分は `make_slot = prompt_slot_factory(store, registry, base="main")` の後、
+    `slots = {name: make_slot(name) for name in [...]}` のように呼び出し側で mapping にする。
+    per-agent の差分（`parts` / `tune` 等）を付けるなら `[make_slot("triage", parts=[...]), ...]`
+    の列でもよい（`03_graph_apo.py` の形。`optimize(slot=)` が `Slot.name` をキーに正規化する）。
     `optimize(graph, slot=slots, registry=registry)` に渡すと rebind 自動導出と合わせてグラフ全体
-    APO が実質 2 行で書ける。**未掲載のエージェントは固定**。
-  - `tune` は agent 名ごとのセレクタ mapping（`{"billing": ["main", "billing"]}` 等）。`None`
-    のときは全 slot で agent セグメントのみ最適化（従来動作）。`layout` は非対応（必要なら
-    `prompt_slot` を個別に呼ぶ）。
+    APO が実質数行で書ける。**呼んでいないエージェントは固定**。
+  - `vars` のみ defaults / overrides の双方が `dict` のときにマージし、それ以外の kwarg は
+    overrides が defaults を置換する（合成規則の詳細は ADR 0008）。
 
-`Slot`（`prompt_slot` / `prompt_slots` の戻り値）は `build` を内包するため、フレームワークが各
+`Slot`（`prompt_slot` / `prompt_slot_factory` の戻り値）は `build` を内包するため、フレームワークが各
 スロットの `build` から rebind を自動導出する（手書き rebind は生 seed 経路のときだけ必要）。
 
 `optimize(..., context_factory=lambda: MyContext())` を渡すと rollout ごとに新鮮な実行時 context

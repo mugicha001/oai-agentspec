@@ -1,10 +1,12 @@
-"""ハンドオフを含む系全体を `prompt_slots` でまとめて最適化する例（実 API）。
+"""ハンドオフを含む系全体を `prompt_slot_factory` でまとめて最適化する例（実 API）。
 
-`prompt_slots` は列挙したエージェント分の `Slot` を一括生成し `{名前: Slot}` mapping を返す。これを
-`optimize(graph, slot=slots, registry=registry)` に渡すと、各スロットの `build` から rebind が
-自動導出され、手書きの rebind / build なしでグラフ全体 APO が実質 2 行で書ける。最適化対象は
-`agents=[...]` で列挙したエージェントのみで、未掲載のエージェント（ここでは support）のプロンプトは
-固定される。`registry` はクローンされて差し替えられるため、利用者の registry は汚れない。
+`prompt_slot_factory(store, registry, base=..., vars=...)` は per-agent で共通する既定値
+（`store` / `registry` / `base` / `vars`）を束ねた `make_slot(agent, **overrides)` を返す。これを
+エージェントごとに呼んでリストへ集め `optimize(graph, slot=slots, registry=registry)` に渡すと、
+各スロットの `build` から rebind が自動導出され、手書きの rebind / build なしでグラフ全体 APO が
+実質数行で書ける。最適化対象は `make_slot` を呼んだエージェントのみで、呼んでいないエージェント
+（ここでは support）のプロンプトは固定される。`registry` はクローンされて差し替えられるため、
+利用者の registry は汚れない。
 
 APO は agentlightning 0.3 では単一プロンプト最適化のため、複数スロット mapping はライブラリが
 順次 APO へ通す（前のスロットの最良で次のスロットの seed コンテキストを更新）。APO 計算用クライ

@@ -2,7 +2,7 @@
 
 ## 何を解決するか
 
-`AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning に委譲し、reward 関数で採点しながら textual gradient + beam search で自動改善します。プロンプトを「slot」として抽出（`prompt_slot` / `prompt_slots`）し、`optimize()` に reward と評価ケースを渡すだけで学習ループが回ります。
+`AgentSpec` / `HandoffGraph` / `WorkflowGraph` のプロンプトを Agent Lightning に委譲し、reward 関数で採点しながら textual gradient + beam search で自動改善します。プロンプトを「slot」として抽出（`prompt_slot`）し、`optimize()` に reward と評価ケースを渡すだけで学習ループが回ります。
 
 本 extra は APO（プロンプト最適化）のみを提供します。`optimize()` に `algorithm="rl"` を渡すと未対応として明確なエラーで案内されます。
 
@@ -20,12 +20,11 @@
 | `judge(rubric, model)` | LLM-as-judge | 意味的品質 |
 | 複合 reward | 上記の重み付き合成（利用者側で組む） | 系全体の総合最適化 |
 | `prompt_slot` | 単一 spec の slot 抽出 | 単一 agent APO |
-| `prompt_slots` | 複数 spec 一括 | グラフ全体 APO・全 agent 同一構成で per-agent 差分が `tune` だけ |
-| `prompt_slot_factory` | 共通既定値を束ねた slot 生成 callable | per-agent で `base` / `parts` / `vars` が違う、または `layout` / `build` が要る |
+| `prompt_slot_factory` | 共通既定値を束ねた slot 生成 callable | 複数 agent 一括生成（グラフ全体 APO）・per-agent で `base` / `parts` / `vars` / `layout` / `build` が違う |
 
 ## 使い方
 
-- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, CoverageReport, OptimizePartial, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slots, prompt_slot_factory, train_val_split)`
+- import: `from oai_agentspec.runtime.lightning import (optimize, OptimizeConfig, OptimizeCase, OptimizeResult, Slot, RolloutResult, FailureKind, OptimizeError, CoverageReport, OptimizePartial, contains, exact, tool_match, approval_match, route_match, last_agent_match, judge, prompt_slot, prompt_slot_factory, train_val_split)`
 - extras: `pip install oai-agentspec[lightning]`（`agentlightning[apo]`）
 - 依存 env: 学習に使う Model の env
 
@@ -94,7 +93,7 @@ slot = prompt_slot(
 )
 ```
 
-`agent` を省略した場合、layout 内に `agent:X` 参照がちょうど 1 つあれば X が spec 解決名（`Slot.name`）になる（0 個または複数は `OptimizeError(CONFIG_MISSING)`）。`prompt_slots` は `layout` 非対応で、layout が必要なエージェントは `prompt_slot` を個別に呼んで slot mapping を組み立てる。
+`agent` を省略した場合、layout 内に `agent:X` 参照がちょうど 1 つあれば X が spec 解決名（`Slot.name`）になる（0 個または複数は `OptimizeError(CONFIG_MISSING)`）。
 
 ### per-agent の差分だけを上書きする
 
@@ -197,7 +196,7 @@ result = await optimize(
 
 - `vars` は静的注入用の dict（既存契約不変）。`prompt_slot(vars=<dict>)` はここに入る。
 - `vars_fn` は `prompt_slot(vars=<callable>)` を渡したときの保持先。callable のとき `vars` は空 dict になり、既定 build が生成する動的 instructions が rollout ごとに `vars_fn(context)` を評価して注入する。
-- `segments` は `prompt_slot` / `prompt_slots` が自動設定する構成順の構造情報（`SlotSegment` 要素の列）で、rollout 合成と `OptimizeResult` の full 合成が同一 SSoT ヘルパで参照する。custom build・手書き `Slot` では空のまま「run_apo 返却をそのまま尊重する」経路を通る。
+- `segments` は `prompt_slot` が自動設定する構成順の構造情報（`SlotSegment` 要素の列）で、rollout 合成と `OptimizeResult` の full 合成が同一 SSoT ヘルパで参照する。custom build・手書き `Slot` では空のまま「run_apo 返却をそのまま尊重する」経路を通る。
 - `SlotSegment`（frozen: `ref`（`base:main` 等の qualified 参照）/ `text`（`${var}` 保持の本文）/ `tune`（最適化対象フラグ））は内部構造で、公開契約（`__all__`）には含めない（利用者が手書きする対象ではない）。
 
 ### `OptimizeResult`（frozen）
@@ -227,13 +226,6 @@ result = await optimize(
 - `vars: dict | Callable[[Any], dict] | None` — compose と同一型。dict は静的注入、callable は `Slot.vars_fn` に保持され rollout ごとに評価注入される（成果物は `${var}` 保持）。
 - `build: Callable[[str], AgentSpec] | None` — 候補テキストから `AgentSpec` を組む関数。省略時は既定 build（registry 登録 spec を複製し instructions を差し替え・vars=callable のとき動的 instructions 生成）。
 
-### `prompt_slots(store, registry, agents, *, base=None, parts=(), tune=None, vars=None)`
-
-- `agents: Sequence[str]` — 各名前を新 shape の `agent=` として slot を生成する（base / parts / vars は全 slot 共通）。
-- `tune: dict[str, str | Sequence[str]] | None` — agent 名ごとのセレクタ。`None` のときは各 slot で agent セグメントのみ最適化（従来動作）。`mapping` のキーが `agents` に含まれない場合は fail-closed。
-- `vars: dict | Callable[[Any], dict] | None` — 全 slot 共通（`prompt_slot` と同一型）。
-- `layout` は非対応（layout が必要なら `prompt_slot` を個別に呼ぶ）。
-
 fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 
 - `tune` の `Sequence` が空 / 重複要素を含む（plain と qualified の表記違いで同一セグメントを指す場合を含む）/ 構成に存在しない名前を含む / plain 名が複数のセグメント名前空間に一致して一意に定まらない（FR-1）
@@ -255,6 +247,13 @@ fail-closed 検証（`OptimizeError(FailureKind.CONFIG_MISSING)`）:
 - 未知キー（typo）や `defaults` への `agent` 混入は、ファクトリ生成時ではなく `make()` 呼び出し時に Python の
   `TypeError` になる（ライブラリ側の許可キーリスト検査は持たない）。
 - ファクトリは常に `agent=` を渡すため、`layout` のみによる `Slot.name` の暗黙解決は使えない。
+
+複数エージェントの一括生成は、ファクトリと dict comprehension を組み合わせて `{名前: slot}` の mapping を作る。
+
+```python
+make_slot = prompt_slot_factory(store, registry, base="main")
+slots = {name: make_slot(name) for name in ["triage", "billing"]}
+```
 
 ### `train_val_split(data, *, val_ratio=0.2, seed=0, shuffle=True)`
 
@@ -292,14 +291,14 @@ except OptimizeError as exc:
 ## 判断軸
 
 - 期待出力が決定的 → **`contains` / `exact`**、意味的品質 → **`judge`**、tool / handoff / 承認は該当 reward
-- 単一 agent の改善は **`prompt_slot`**、グラフ全体は **`prompt_slots`**
+- 単一 agent の改善は **`prompt_slot`**、グラフ全体は **`prompt_slot_factory`** + dict comprehension
 - 学習 rollout は API コスト源。`OptimizeConfig` で試行回数を制御し `train_val_split` で汎化確認
 
 ## Route coverage 検証（pre-flight）
 
 `target` が `HandoffGraph` で `slot` を指定した場合、`optimize()` は `run_apo` へ委譲する前に seed 状態の pre-flight rollout を `train` 全件に対して実行し、`ObservedRun.route.steps` の agent 名 union と `slot` 集合を突き合わせて未到達 slot を検出します（既定有効・`skip_coverage_check=False`）。pre-flight は `RolloutResult` を構築せず reward も呼びません。
 
-`Slot.name` は registry の spec 名（= `route.steps` に現れる agent 名）と一致している必要があります。名前が一致しない slot は構造的に必ず未到達判定になります（`prompt_slot` / `prompt_slots` / `prompt_slot_factory` 経由なら registry 解決名が入るため発生しません）。
+`Slot.name` は registry の spec 名（= `route.steps` に現れる agent 名）と一致している必要があります。名前が一致しない slot は構造的に必ず未到達判定になります（`prompt_slot` / `prompt_slot_factory` 経由なら registry 解決名が入るため発生しません）。
 
 ### 検証内容
 
