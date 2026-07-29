@@ -222,7 +222,7 @@ async def test_mixed_slot_dict_raises_config_missing() -> None:
 
 
 async def test_empty_slot_dict_raises_config_missing() -> None:
-    """slot={} は最適化対象が無い不正設定で CONFIG_MISSING（prompt_slots(agents=[]) 等を阻止）。
+    """slot={} は最適化対象が無い不正設定で CONFIG_MISSING（空 mapping を渡した場合等を阻止）。
 
     空 mapping を許すと prompt={} で誤った成功になるため fail-closed する（Codex P2 回帰防止）。
     """
@@ -2162,9 +2162,9 @@ async def test_optimize_new_shape_result_diff_is_recomputed(
 async def test_optimize_new_shape_multi_slot_dict_recompose_per_slot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """複数 slot（HandoffGraph + `prompt_slots`）で run_apo が dict 型 `OptimizeResult` を返す
-    経路の per-slot 再合成を検証する（`_recompose_new_shape_results` の isinstance(prompt, dict)
-    分岐の regression guard）。
+    """複数 slot（HandoffGraph + `prompt_slot_factory`）で run_apo が dict 型
+    `OptimizeResult` を返す経路の per-slot 再合成を検証する
+    （`_recompose_new_shape_results` の isinstance(prompt, dict) 分岐の regression guard）。
 
     全 slot について `result.prompt[name]` / `result.seed[name]` が固定セグメント込みの full
     合成テキストになり、`result.diff[name]` が `unified_diff_labeled` の統一ラベルで再計算される
@@ -2172,7 +2172,7 @@ async def test_optimize_new_shape_multi_slot_dict_recompose_per_slot(
     silent 通過する regression を検出する。
     """
     from oai_agentspec.prompts import PromptLayout, PromptStore
-    from oai_agentspec.runtime.lightning import prompt_slots
+    from oai_agentspec.runtime.lightning import prompt_slot_factory
 
     # 2 agent 用のローカルストア（_store_new_shape は triage のみのため）。
     agents_dir = tmp_path / "agents"
@@ -2192,9 +2192,8 @@ async def test_optimize_new_shape_multi_slot_dict_recompose_per_slot(
     graph.apply(registry)
     registry.validate()
 
-    slots = prompt_slots(
-        store, registry, agents=["triage", "second"], base="main", vars={"org": "AgentSpec"}
-    )
+    make_slot = prompt_slot_factory(store, registry, base="main", vars={"org": "AgentSpec"})
+    slots = {name: make_slot(name) for name in ("triage", "second")}
 
     async def _fake(
         *,

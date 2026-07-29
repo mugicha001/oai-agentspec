@@ -101,7 +101,7 @@ async def optimize(
     """宣言物を APO で最適化し `${var}` 保持の最適化済みテキストを返す（公開窓口・FR-2）。
 
     第 1 引数は最適化対象の宣言物（`AgentSpec` / `WorkflowGraph` / `HandoffGraph`）。スロットは
-    常に `slot=` キーワードで渡す（FR-9）。`slot` が `prompt_slot` / `prompt_slots` の戻り値
+    常に `slot=` キーワードで渡す（FR-9）。`slot` が `prompt_slot` / `prompt_slot_factory` の戻り値
     （`Slot` / `{名前: Slot}`）のときは各スロットの `build` から rebind を自動導出する（手書き
     rebind 不要）。生 seed（str / `{名前: str}`）のときは `rebind`（単一候補 / 候補 mapping を
     受けて宣言物を組み直す関数）を明示する。`val` は agent-lightning APO の beam search が
@@ -287,8 +287,8 @@ async def optimize(
             FailureKind.CONFIG_MISSING,
             "最適化対象スロットの seed が解決できません（slot= を渡してください）。"
             "AgentSpec の既定スロットは target が静的 AgentSpec のときのみ自動導出されます。"
-            "HandoffGraph / WorkflowGraph では prompt_slot / prompt_slots の戻り値か、"
-            "生 seed（str / {名前: str}）を slot= に明示してください",
+            "HandoffGraph / WorkflowGraph では prompt_slot / prompt_slot_factory で生成した "
+            "Slot か、生 seed（str / {名前: str}）を slot= に明示してください",
         )
 
     rollout = _make_rollout(

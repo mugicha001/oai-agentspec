@@ -1,9 +1,9 @@
-"""L1: スロットヘルパ `prompt_slot` / `prompt_slots`（PromptStore / AgentRegistry 読み取り）。
+"""L1: スロットヘルパ `prompt_slot`（PromptStore / AgentRegistry 読み取り）。
 
 `prompt_slot` の seed 取得（`${var}` 保持）・既定 build（registry 登録 spec 複製で instructions
 差し替え・tools 等保持・元 spec 不変）・固定部分（base / parts）合成・vars 保持（seed 非展開）・
-registry 未解決の fail-closed ValueError・`build=` 明示経路（registry 不要）・`prompt_slots` の
-一括生成を網羅する。PromptStore は実ファイル（tmp_path）から読み取る（実 LLM 非依存）。
+registry 未解決の fail-closed ValueError・`build=` 明示経路（registry 不要）を網羅する。
+PromptStore は実ファイル（tmp_path）から読み取る（実 LLM 非依存）。
 ファイル I/O を伴うため `@pytest.mark.unit` だが外部実通信はしない。
 """
 
@@ -21,7 +21,6 @@ from oai_agentspec.runtime.lightning import (
     Slot,
     prompt_slot,
     prompt_slot_factory,
-    prompt_slots,
 )
 
 from _helpers.fake_model import FakeModel
@@ -271,34 +270,8 @@ def test_prompt_slot_prefers_agents_layout_over_flat(tmp_path: Path) -> None:
 
 
 # ----------------------------------------------------------------------
-# prompt_slots: 一括生成
+# prompt_slot: fixed var 検査（既定 build / custom build）
 # ----------------------------------------------------------------------
-
-
-def test_prompt_slots_generates_mapping(tmp_path: Path) -> None:
-    """prompt_slots は列挙エージェント分の Slot を `{名前: Slot}` mapping で返す。"""
-    slots = prompt_slots(_store(tmp_path), _registry(), ["triage", "billing"])
-    assert set(slots) == {"triage", "billing"}
-    assert all(isinstance(s, Slot) for s in slots.values())
-    assert slots["triage"].seed == "Triage prompt ${tone}"
-    assert slots["billing"].seed == "Billing prompt"
-
-
-def test_prompt_slots_applies_common_vars_and_fixed(tmp_path: Path) -> None:
-    """prompt_slots は base / parts / vars を全 slot 共通で適用する。"""
-    slots = prompt_slots(
-        _store(tmp_path),
-        _registry(),
-        ["triage"],
-        base="main",
-        parts=["style"],
-        vars={"tone": "x", "org": "AgentSpec"},
-    )
-    slot = slots["triage"]
-    assert slot.vars == {"tone": "x", "org": "AgentSpec"}
-    built = slot.build("CAND")
-    # base の `${org}` は build 時に再注入される。
-    assert built.instructions == "BASE AgentSpec\n\nSTYLE part\n\nCAND"
 
 
 def test_prompt_slot_missing_fixed_var_raises_config_missing(tmp_path: Path) -> None:
@@ -323,123 +296,6 @@ def test_prompt_slot_custom_build_skips_fixed_var_check(tmp_path: Path) -> None:
     # vars に 'org' を渡さないが custom build なので CONFIG_MISSING にならない。
     slot = prompt_slot(_store(tmp_path), agent="bot", base="main", parts=["style"], build=_build)
     assert slot.segments == ()
-
-
-def test_prompt_slots_unregistered_spec_raises_on_build(tmp_path: Path) -> None:
-    """prompt_slots の既定 build も未登録 spec は build 時に fail-closed の ValueError。"""
-    reg = AgentRegistry()
-    reg.register(AgentSpec(name="triage", instructions="o", model=FakeModel()))
-    # billing は store には在るが registry には未登録。
-    slots = prompt_slots(_store(tmp_path), reg, ["triage", "billing"])
-    with pytest.raises(ValueError, match="未登録"):
-        slots["billing"].build("x")
-
-
-# ----------------------------------------------------------------------
-# prompt_slots: 新 shape 追随（RED: Issue #40 T9・agent= 経由の一括生成 + tune mapping +
-# vars=callable・layout 非対応・本テスト作成時点で未実装。実装は後段。）
-# ----------------------------------------------------------------------
-
-
-def test_prompt_slots_new_shape_returns_dict_of_slots(tmp_path: Path) -> None:
-    """`prompt_slots` は各 agent 名を新 shape の `agent=` として `prompt_slot` を呼び、
-    `{名前: Slot}` の mapping を返す（各 Slot は `segments` 非空・`vars_fn` は None）。"""
-    slots = prompt_slots(
-        _store_new_shape(tmp_path),
-        _registry(),
-        ["triage", "billing"],
-        base="main",
-        vars={"org": "AgentSpec"},
-    )
-    assert set(slots) == {"triage", "billing"}
-    for name, slot in slots.items():
-        assert isinstance(slot, Slot)
-        assert slot.name == name
-        assert slot.segments != ()
-        assert slot.vars_fn is None
-
-
-def test_prompt_slots_new_shape_each_slot_has_agent_segment_tune_by_default(
-    tmp_path: Path,
-) -> None:
-    """`tune` 省略時は各 slot で agent セグメントのみ `tune=True`（他は `tune=False`）。"""
-    slots = prompt_slots(
-        _store_new_shape(tmp_path),
-        _registry(),
-        ["triage", "billing"],
-        base="main",
-        vars={"org": "AgentSpec"},
-    )
-    for name, slot in slots.items():
-        tuned = {seg.ref: seg.tune for seg in slot.segments}
-        assert tuned[f"agent:{name}"] is True
-        assert tuned["base:main"] is False
-
-
-def test_prompt_slots_with_tune_mapping(tmp_path: Path) -> None:
-    """`tune=dict` を渡すと agent ごとに個別の tune セレクタが適用される。"""
-    slots = prompt_slots(
-        _store_new_shape(tmp_path),
-        _registry(),
-        ["triage", "billing"],
-        base="main",
-        vars={"org": "AgentSpec"},
-        tune={"triage": ["main", "triage"], "billing": "billing"},
-    )
-    triage_tuned = {seg.ref: seg.tune for seg in slots["triage"].segments}
-    assert triage_tuned == {"base:main": True, "agent:triage": True}
-    billing_tuned = {seg.ref: seg.tune for seg in slots["billing"].segments}
-    assert billing_tuned == {"base:main": False, "agent:billing": True}
-
-
-def test_prompt_slots_with_tune_partial_mapping(tmp_path: Path) -> None:
-    """`tune=dict` に一部の agent しか指定しない場合、未指定の agent は既定
-    （agent セグメントのみ tune）にフォールバックする。"""
-    slots = prompt_slots(
-        _store_new_shape(tmp_path),
-        _registry(),
-        ["triage", "billing"],
-        base="main",
-        vars={"org": "AgentSpec"},
-        tune={"triage": ["main", "triage"]},
-    )
-    billing_tuned = {seg.ref: seg.tune for seg in slots["billing"].segments}
-    assert billing_tuned == {"base:main": False, "agent:billing": True}
-
-
-def test_prompt_slots_fail_tune_key_not_in_agents(tmp_path: Path) -> None:
-    """`tune` mapping のキーが `agents` に含まれない場合は fail-closed の CONFIG_MISSING。"""
-    with pytest.raises(OptimizeError) as exc:
-        prompt_slots(
-            _store_new_shape(tmp_path),
-            _registry(),
-            ["triage"],
-            tune={"unknown": "x"},
-        )
-    assert exc.value.kind == FailureKind.CONFIG_MISSING
-
-
-def test_prompt_slots_with_vars_callable(tmp_path: Path) -> None:
-    """`vars=callable` を渡すと全 slot で `vars_fn` が設定され `vars` は空 dict に統一される。"""
-    slots = prompt_slots(
-        _store_new_shape(tmp_path),
-        _registry(),
-        ["triage", "billing"],
-        base="main",
-        vars=lambda ctx: {"org": ctx.company},
-    )
-    for slot in slots.values():
-        assert slot.vars_fn is not None
-        assert slot.vars == {}
-
-
-def test_prompt_slots_legacy_call_unchanged(tmp_path: Path) -> None:
-    """既存呼び出し `prompt_slots(store, registry, ["triage"])` が現状動作を維持する。"""
-    slots = prompt_slots(_store(tmp_path), _registry(), ["triage"])
-    assert set(slots) == {"triage"}
-    slot = slots["triage"]
-    assert slot.name == "triage"
-    assert slot.seed == "Triage prompt ${tone}"
 
 
 # ----------------------------------------------------------------------
