@@ -83,12 +83,13 @@ def _normalize_slots(
 
     if isinstance(slot, dict):
         if not slot:
-            # 空 dict は最適化対象が無い不正設定（`prompt_slots(agents=[])` 等で起きうる・
-            # 空のまま最適化を進めると prompt={} で返り誤った成功になるため fail-closed）。
+            # 空 dict は最適化対象が無い不正設定（factory の呼び出し対象を 0 件にする等で
+            # 起きうる・空のまま最適化を進めると prompt={} で返り誤った成功になるため
+            # fail-closed）。
             raise OptimizeError(
                 FailureKind.CONFIG_MISSING,
                 "slot の dict が空です（最適化対象スロットがありません）。"
-                "prompt_slots(agents=[...]) に少なくとも 1 つのエージェント名を指定するか、"
+                "prompt_slot_factory で生成した Slot を少なくとも 1 つ含む mapping を渡すか、"
                 "slot=prompt_slot(...) で単一スロットを渡してください",
             )
         slot_values = [isinstance(v, Slot) for v in slot.values()]

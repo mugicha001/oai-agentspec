@@ -1,12 +1,11 @@
-"""APO の使いやすさヘルパ（`prompt_slot` / `prompt_slots` / `prompt_slot_factory`・seed 取得 +
-既定 build 内包）。
+"""APO の使いやすさヘルパ（`prompt_slot` / `prompt_slot_factory`・seed 取得 + 既定 build 内包）。
 
 `prompt_slot` は `PromptStore` の公開メソッド（`get` / `compose`）を**読み取るのみ**で seed
 （vars 未展開・`${var}` 保持）と固定部分（base / parts）を取得し、候補テキストから `AgentSpec` を
 構築する `build` を内包した `Slot` を返す。`build` 省略時の既定 build は registry 登録 `AgentSpec`
 を複製して `instructions` のみ候補で差し替える（tools / handoffs / model 等は登録 spec から複製・
-利用者は再宣言不要）。registry 未解決かつ build 省略は fail-closed エラー。`prompt_slots` は列挙
-エージェント分の `Slot` を一括生成する。
+利用者は再宣言不要）。registry 未解決かつ build 省略は fail-closed エラー。`prompt_slot_factory` は
+共通既定値を束ねて agent ごとの差分だけで `Slot` を生成する callable を返す。
 
 seed の解決は `PromptLayout` を尊重する: 既定で `store.compose(agent=tune, vars=None)`（`agents`
 サブディレクトリの `agent:<tune>` セグメントとして解決）を優先し、見つからなければ `store.get(tune)`
@@ -112,7 +111,8 @@ def _new_default_build(
     if registry is None:
         raise ValueError(
             f"prompt_slot の既定 build には registry が必須です（slot {name!r}）。"
-            "optimize / prompt_slots に registry を渡すか build= を明示してください"
+            "optimize / prompt_slot / prompt_slot_factory に registry を渡すか build= を明示"
+            "してください"
         )
 
     def build(candidate: str) -> AgentSpec:
@@ -649,75 +649,6 @@ def _new_shape_slot(
         segments=slot_segments,
         vars_fn=vars_fn,
     )
-
-
-def prompt_slots(
-    store: PromptStore,
-    registry: AgentRegistry,
-    agents: Sequence[str],
-    *,
-    base: str | None = None,
-    parts: Sequence[str] = (),
-    tune: dict[str, str | Sequence[str]] | None = None,
-    vars: dict[str, Any]  # noqa: A002 - prompt_slot の引数名に追従
-    | Callable[[Any], dict[str, Any]]
-    | None = None,
-) -> dict[str, Slot]:
-    """列挙エージェント分の新 shape `Slot` を一括生成し `{名前: Slot}` の mapping を返す（論点 F）。
-
-    各 agent 名について `prompt_slot(store, registry, agent=name, base=base, parts=parts,
-    tune=<agent 個別セレクタ>, vars=vars)` を呼び、新 shape の `Slot`（`segments` 保持）を生成する。
-    生成 mapping を `optimize(graph, slot=slots, ...)` に渡せば rebind 自動導出と合わせてグラフ全体
-    APO が実質 2 行で書ける。最適化対象は列挙したエージェントのみ（未掲載のプロンプトは固定）。
-    `PromptStore` は公開 `compose` / `get` を読み取るのみ・registry は読み取り複製のみ（非改変）。
-
-    tune の扱い（論点 F）:
-        - `tune=None`: 各 slot で agent セグメントのみ最適化（`prompt_slot` の `tune=None` 既定）。
-        - `tune=dict`: mapping キーが `agents` に含まれない場合は `OptimizeError(CONFIG_MISSING)`
-          で fail-closed。未指定 agent は `tune=None`（agent セグメントのみ最適化）に縮退する。
-
-    `layout` は非対応（`prompt_slot` は持つが列挙一括のため受け付けない・論点 A2）。
-
-    Args:
-        store: プロンプトストア（読み取り専用）。
-        registry: 既定 build の spec 解決元（必須・各 slot 共通）。
-        agents: 最適化対象とするエージェント名の列。
-        base: 構成セグメントの base:<name>（全 slot 共通）。
-        parts: 構成セグメントの part:<name> の列（全 slot 共通）。
-        tune: agent ごとの最適化対象セレクタの mapping（`{agent 名: セレクタ}`）。None は全 slot
-            で agent セグメントのみ最適化。
-        vars: `${var}` 置換値（全 slot 共通・最適化対象外・rollout 再注入）。dict / None のほか
-            `Callable[[context], dict]` を渡すと動的 vars 生成となる（`prompt_slot` と同契約）。
-
-    Returns:
-        `{エージェント名: Slot}` の mapping。
-
-    Raises:
-        OptimizeError: `tune` mapping のキーが `agents` に含まれない場合
-            （`FailureKind.CONFIG_MISSING`・fail-closed）。
-        KeyError: いずれかの対象セグメントが store で解決できない場合。
-        ValueError: いずれかの対象 spec が registry に未登録の場合（既定 build の fail-closed）。
-    """
-    if tune is not None:
-        extra_keys = set(tune.keys()) - set(agents)
-        if extra_keys:
-            raise OptimizeError(
-                FailureKind.CONFIG_MISSING,
-                f"prompt_slots: tune のキー {sorted(extra_keys)!r} が agents "
-                f"{sorted(agents)!r} に含まれません",
-            )
-    return {
-        name: prompt_slot(
-            store,
-            registry,
-            agent=name,
-            base=base,
-            parts=parts,
-            tune=tune.get(name) if tune else None,
-            vars=vars,
-        )
-        for name in agents
-    }
 
 
 def _merge_slot_kwargs(defaults: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:

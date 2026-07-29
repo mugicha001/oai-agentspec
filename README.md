@@ -473,7 +473,7 @@ PromptLayout(base="base", parts="parts", agents="agents")
 | `examples/llmops/README.md` | LLMOps 評価の使い方（観点別採点・統合 verdict・Langfuse 連携） |
 | `examples/lightning/01_single_agent_apo.py` | 単一 `AgentSpec` + `contains()` の最小 APO 例 |
 | `examples/lightning/02_prompt_slot_apo.py` | `prompt_slot` で `PromptStore` 合成プロンプトを APO |
-| `examples/lightning/03_graph_apo.py` | `prompt_slots` + `HandoffGraph` でグラフ全体 APO |
+| `examples/lightning/03_graph_apo.py` | `prompt_slot_factory` + `HandoffGraph` でグラフ全体 APO |
 | `examples/lightning/04_reward_and_safety.py` | `tool_match` + `tool_mocks` / `approvals` で危険ツールを安全に APO |
 | `examples/lightning/05_failure_handling.py` | `OptimizeError` / `FailureKind` の判別（offline） |
 | `examples/lightning/06_approval_match_apo.py` | `approval_match` で承認ゲート発火を APO 学習 |
