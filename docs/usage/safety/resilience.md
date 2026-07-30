@@ -143,17 +143,35 @@ except MaxTurnsExceeded as exc:
 
 lib に `to_input_list()` 相当のヘルパは提供しません。第一選択は SDK `Session`（会話全体をセッションに委ねる。`README.md` の会話 Helper 節を参照）です。`Session` を使わず着地直後の履歴だけを再構成したい場合は、`run_data` を持つ SDK 例外（`RunBudgetExceeded` は `run_data` を持たないため対象外）に限り、SDK の `ItemHelpers.input_to_new_input_list` / `item.to_input_item()` を利用者コード側で組み合わせます。
 
+継続例には**安全制御に由来しない例外**（`MaxTurnsExceeded` 等）を選びます。ガードレール Tripwire を継続に使ってはいけない理由は下記「ガードレール Tripwire の着地」を参照してください。
+
 ```python
-from agents import ItemHelpers, InputGuardrailTripwireTriggered
+from agents import ItemHelpers, MaxTurnsExceeded
 
 try:
     result = await failsafe_call(policy, lambda: Runner.run(agent, msg))
-except InputGuardrailTripwireTriggered as exc:
-    landed = FailsafeResult.from_exception(exc, final_output="対応できません。", last_agent=RUNNING_AGENT)
+except MaxTurnsExceeded as exc:
+    landed = FailsafeResult.from_exception(exc, final_output="対話が長くなりすぎました。",
+                                           last_agent=RUNNING_AGENT)
     if exc.run_data is not None:
         history = ItemHelpers.input_to_new_input_list(exc.run_data.input)
+        history += [item.to_input_item() for item in exc.run_data.new_items]
         # history + landed.last_agent で次の Runner.run(...) を再開する
+        # 継続回数はアプリ側で上限を持つ（lib は再試行を提供しない）
 ```
+
+#### ガードレール Tripwire の着地
+
+入力ガードレール Tripwire（`InputGuardrailTripwireTriggered`）を着地させる場合、**`exc.run_data.input` をそのまま再投入しないでください**。これはガードレールが拒否した入力そのものです。再投入すると次の 2 つが起きます。
+
+- 同一 agent へ再投入すると再び trip し、着地 -> 再投入のループになる（トークン・課金を消費し続ける）
+- `last_agent` が段 2（`fallback_last_agent`）の別 agent へ落ちている場合、**そのガードレールを持たない agent へ拒否済み入力が到達し、安全制御を素通りする**
+
+Tripwire を着地させるときは次の 3 点を守ってください。
+
+- 拒否された入力を継続に使わない（継続しない、または拒否された item を除いた履歴だけを使う）
+- 継続する設計にするなら、アプリ側で試行回数の上限を持つ（lib は再試行機構を提供しません）
+- 着地を `matched_type` で分岐し、通常応答と区別して監査する（`log_on_apply` の warning か `on_apply` で必ず痕跡を残す）
 
 ## パラメータ一覧
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
@@ -251,7 +269,7 @@ except InputGuardrailTripwireTriggered as exc:
 - `handlers` の値位置には着地値 / callable / `FailsafeHandler` のみを置く。Agent 実体を置くと (a) それが `final_output` として利用者へ返り、(b) `handlers` は policy repr に出るため機微が露出する。`last_agent` を指定したいなら `FailsafeHandler` を使う
 - `FailsafeResult` / `RunBudgetExceeded` を監査バッファ等で長期保持すると `last_agent` 経由で Agent と参照グラフが解放されない（`exc.__traceback__ = None` でも解放されない）。長期保持するならメタデータへ落としてから
 - fallback callable の**戻り値**に `RUNNING_AGENT` / `FailsafeHandler` を返さない。build-time 検証は宣言位置のみを見るため、callable の戻り値経由では sentinel / handler がそのまま `final_output` に載る
-- `RUNNING_AGENT` を指定したのに `last_agent` が常に `None` になる原因は 2 通りある。(a) 例外が実行文脈を運んでいない（`run_data` も `last_agent` 属性も持たない。組み込み例外・`Runner` 外で送出された例外が該当）。この場合は**ログが一切出ない**（読み出しが正常に「無い」と返るだけ）。(b) 読み出し自体が例外を送出した。この場合のみ `logger.debug`（`exc_info=True`）に記録される。`oai_agentspec.resilience` logger を debug にして何も出ないなら (a) であり、具体の agent を指定するか `fallback_last_agent` を使う
+- `RUNNING_AGENT` を指定したのに `last_agent` が常に `None` になる原因は 3 通りある。(a) 例外が実行文脈を運んでいない（`run_data` も `last_agent` 属性も持たない。組み込み例外・`Runner` 外で送出された例外が該当）。この場合は**ログが一切出ない**（読み出しが正常に「無い」と返るだけ）。(b) 読み出し自体が例外を送出した。この場合のみ `logger.debug`（`exc_info=True`）に記録される。(c) 例外側が運んでいた値が `RUNNING_AGENT` そのものだった（自作例外の `last_agent` 属性に sentinel を入れた場合）。`RUNNING_AGENT` は指定値であって解決結果ではないため、解決不能として次の読み取り先・次の段へ落ちる。`oai_agentspec.resilience` logger を debug にして何も出ないなら (a) か (c) であり、具体の agent を指定するか `fallback_last_agent` を使う
 - thunk が**同期的に**送出した例外は着地しない（`awaitable` を await する前に伝播する）。`lambda: build_input_then_run(...)` のように thunk 内で同期バリデーションを走らせる形では、宣言済みの例外型でも素通りする。着地させたい処理は awaitable の内側（`async def` の中）に置く
 - `FailsafePolicy` は `frozen=True` だが `hash()` できない（`handlers` が `mappingproxy` のため `TypeError`）。`set` の要素・`dict` のキー・`functools.lru_cache` の引数には使えない。`ModelRetryPolicy` / `RunBudgetPolicy` は hash 可能で、この点だけ非対称
 

@@ -2039,13 +2039,13 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   `final_output` に載る誤りを防ぐ）を渡した場合を build-time `ValueError` で拒否する。
 - `failsafe_call(policy: FailsafePolicy, thunk: Callable[[], Awaitable[T]]) -> T | FailsafeResult` が
   唯一の実行関数。フロー:
-  1. `handlers` が空なら `await thunk()` をそのまま返す（捕捉ゼロ・完全透過）
-  2. `awaitable = thunk()` を **try の外**で呼び出す。thunk が呼び出し不可（coroutine オブジェクトの
-     直渡し等）の場合、この呼び出し自体が Python ランタイム由来の `TypeError` になる
-  3. `awaitable` が `inspect.isawaitable` を満たさない場合、実装が明示的に
-     `TypeError("thunk must return an awaitable, got ...")` を送出する。2 と 3 のいずれの
-     `TypeError` も try の外で発生するため、`handlers` に `TypeError` を宣言していても着地せず
-     fail-fast する
+  1. `awaitable = thunk()` を **try の外**で 1 回だけ呼び出す。thunk が呼び出し不可（coroutine
+     オブジェクトの直渡し等）の場合、この呼び出し自体が Python ランタイム由来の `TypeError` になる
+  2. `awaitable` が `inspect.isawaitable` を満たさない場合、実装が明示的に
+     `TypeError("thunk must return an awaitable, got ...")` を送出する。1 と 2 のいずれの
+     `TypeError` も try の外・`handlers` の宣言有無より前で発生するため、`handlers` に `TypeError`
+     を宣言していても着地せず fail-fast する（`handlers` が空でも同じメッセージで fail-fast する）
+  3. `handlers` が空なら `await awaitable` の結果をそのまま返す（捕捉ゼロ・完全透過）
   4. `await awaitable` のみを try 内に置き、正常完了時は結果をそのまま返す（ラップしない）
   5. `except Exception` で捕捉し、`handlers` の**挿入順**に `isinstance` で最初に一致したキー
      （first-match。MRO 上の最 specific マッチは行わない）を採用。未一致は `raise`（`from` なし）で
@@ -2083,10 +2083,14 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   指定しなければ解決は一切走らず `last_agent` は `None`（自動導出はしない）。
 - **解決順**（`_derive_last_agent`）: `exc.run_data.last_agent` -> `exc.last_agent`（いずれも
   `getattr` の duck typing）。SDK 例外は `run_data`（`RunErrorDetails` 相当）経由、lib 独自例外
-  （`RunBudgetExceeded`）・利用者定義例外は `last_agent` 属性経由で読める。読み出し全体を
-  `try/except Exception` で防御し、属性アクセス自体が失敗しても着地（`FailsafeResult` の返却・
-  warning・`on_apply`）は成立させ、`logger.debug(exc_info=True)` に記録して解決不能扱いにする。
-  各読み取り先の採否も `is None` 判定のため、falsy な値も正当な解決結果として採用する。
+  （`RunBudgetExceeded`）・利用者定義例外は `last_agent` 属性経由で読める。防御は**読み取り先ごとに
+  独立して**行い、属性アクセス自体が失敗しても着地（`FailsafeResult` の返却・warning・`on_apply`）は
+  成立させる。失敗した段は `logger.debug(exc_info=True)` に記録して**次の読み取り先へ進む**
+  （一方の失敗が他方を飛ばさない）。全段が失敗または未取得のときのみ解決不能とする。解決値が
+  `RUNNING_AGENT` そのものだった場合（利用者定義例外が sentinel を保持していた等）も解決不能として
+  扱い、sentinel が着地結果に載ることはない。
+  各読み取り先の採否は `is None` / `is RUNNING_AGENT` の同一性判定のみで行うため、空文字や 0 の
+  ような falsy な値も正当な解決結果として採用する。
 - **段の遷移**: 段 1 が無指定、または `RUNNING_AGENT` だが解決不能なら段 2 へ。段 2 でも決まら
   なければ `None`。
 - `RUNNING_AGENT` そのものが `FailsafeResult.last_agent` に載ることはない（`failsafe_call` /
