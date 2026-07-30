@@ -189,14 +189,18 @@ def _derive_last_agent(exc: Exception) -> Any:
     `logger.debug(exc_info=True)` に記録して次の段へ進む。すべての段が失敗
     （または None）なら解決不能として None を返す。
 
-    各読み取り先の採否は `is None` で判定するため、空文字や 0 のような falsy な値も
-    正当な `last_agent` として採用される。
+    各読み取り先の採否は `is None` / `is RUNNING_AGENT` の同一性のみで判定するため、
+    空文字や 0 のような falsy な値も正当な `last_agent` として採用される。`RUNNING_AGENT`
+    は「例外から解決せよ」という指定用の sentinel であって解決結果ではないため、例外側が
+    それを運んでいた場合は解決不能として次の読み取り先へ進む（sentinel が着地結果の
+    `last_agent` に載ることはない）。
 
     Args:
         exc: 着地対象の例外インスタンス。
 
     Returns:
-        解決した `last_agent`（不透明値）。解決できない場合は None。
+        解決した `last_agent`（不透明値）。解決できない場合は None
+        （`RUNNING_AGENT` そのものは決して返らない）。
     """
     for read in (_read_run_data_last_agent, _read_last_agent_attr):
         try:
@@ -208,7 +212,7 @@ def _derive_last_agent(exc: Exception) -> Any:
                 exc_info=True,
             )
             continue
-        if candidate is not None:
+        if candidate is not None and candidate is not RUNNING_AGENT:
             return candidate
 
     return None

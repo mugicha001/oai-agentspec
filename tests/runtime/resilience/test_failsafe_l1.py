@@ -36,8 +36,16 @@ pin する。決定は 2 段:
   （ユーザー定義サブクラスは従来どおり許容する）。
 - `thunk` 受理契約の検査位置: handlers が空でも lib のメッセージで fail-fast する。
 - `FailsafeResult` の直接構築にも `from_exception` と同一の入力検証が効く。
+- 例外側が運ぶ値が `RUNNING_AGENT` そのものだった場合は解決不能として扱い、次の
+  読み取り先 / 次の段へ落ちる（指定用 sentinel が着地結果に載らない）。
+- 監査の独立性: `log_on_apply=False` でも `on_apply` は従来どおり発火する。
+- async な `on_apply` の例外も握り潰され、async な fallback callable の例外は素通しする。
+- `thunk` の呼び出しは handlers 非空の正常系・着地経路でも 1 回だけで、`thunk` 本体が
+  同期的に送出した例外は着地対象にならない。
 
-外部依存 (agents / openai) なし（SDK 例外はテスト内定義の fake で模す）。
+外部依存 (agents / openai) なし（SDK 例外はテスト内定義の fake で模す）。SDK 実型に対する
+構造契約（`AgentsException.run_data` / `RunErrorDetails.last_agent`）の pin は
+`tests/_adapters/test_resilience_exception_contract_l2.py` が担う。
 """
 
 from __future__ import annotations
@@ -2652,3 +2660,314 @@ def test_from_exception_は直接構築の検証と二重に弾かれない() ->
     assert default_type.matched_type is SdkRunDataError
     assert explicit_type.matched_type is Exception
     assert explicit_type.last_agent is AGENT_FROM_RUN_DATA
+
+
+# ---------------------------------------------------------------------------
+# V1: 例外側の RUNNING_AGENT は解決不能として扱う（sentinel は結果に載らない）
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_例外属性のRUNNING_AGENTは解決値にならず段2へ落ちる() -> None:
+    """例外の `last_agent` が sentinel そのものなら解決不能扱いで、段 2 の具体 agent が使われる。"""
+    exc = BudgetLikeError("boom", last_agent=RUNNING_AGENT)
+    policy = FailsafePolicy(
+        handlers={BudgetLikeError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)},
+        fallback_last_agent=AGENT_POLICY_FALLBACK,
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent is AGENT_POLICY_FALLBACK
+    assert result.last_agent is not RUNNING_AGENT
+
+
+async def test_failsafe_call_例外属性のRUNNING_AGENTで段2未指定ならNone() -> None:
+    """解決不能かつ段 2 未指定なら None になり、sentinel が着地結果に漏れない。"""
+    exc = BudgetLikeError("boom", last_agent=RUNNING_AGENT)
+    policy = FailsafePolicy(
+        handlers={BudgetLikeError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)}
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent is None
+
+
+async def test_failsafe_call_run_dataのRUNNING_AGENTは次の読み取り先へ進む() -> None:
+    """1 つ目の読み取り先が sentinel なら採らず、2 つ目（`exc.last_agent`）から解決する。"""
+    exc = HybridError("boom", run_data=_FakeRunData(RUNNING_AGENT), last_agent=AGENT_FROM_ATTRIBUTE)
+    policy = FailsafePolicy(
+        handlers={HybridError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)}
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent is AGENT_FROM_ATTRIBUTE
+    assert result.last_agent is not RUNNING_AGENT
+
+
+async def test_failsafe_call_run_dataのRUNNING_AGENTで例外属性が無ければ段2へ落ちる() -> None:
+    """`run_data` の値が sentinel で他の読み取り先も無ければ、段 2 の具体 agent が使われる。"""
+    exc = SdkRunDataError("boom", run_data=_FakeRunData(RUNNING_AGENT))
+    policy = FailsafePolicy(
+        handlers={SdkRunDataError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)},
+        fallback_last_agent=AGENT_POLICY_FALLBACK,
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent is AGENT_POLICY_FALLBACK
+
+
+async def test_failsafe_call_双方の読み取り先がRUNNING_AGENTならNone() -> None:
+    """両方の読み取り先が sentinel なら解決不能として None になる。"""
+    exc = HybridError("boom", run_data=_FakeRunData(RUNNING_AGENT), last_agent=RUNNING_AGENT)
+    policy = FailsafePolicy(
+        handlers={HybridError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)}
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent is None
+
+
+async def test_failsafe_call_sentinelを飛ばした先のfalsyな解決値は採用される() -> None:
+    """除外は sentinel との同一性のみで行う（飛ばした先の falsy な具体値は従来どおり採る）。"""
+    exc = HybridError("boom", run_data=_FakeRunData(RUNNING_AGENT), last_agent=0)
+    policy = FailsafePolicy(
+        handlers={HybridError: FailsafeHandler(fallback="landed", last_agent=RUNNING_AGENT)},
+        fallback_last_agent=AGENT_POLICY_FALLBACK,
+    )
+
+    result = await failsafe_call(policy, _thunk_raising(exc))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.last_agent == 0
+    assert result.last_agent is not AGENT_POLICY_FALLBACK
+
+
+def test_from_exception_例外属性のRUNNING_AGENTは解決値にならずNoneになる() -> None:
+    """`from_exception` でも sentinel は結果に載らず（段 2 が無いため）None になる。"""
+    exc = BudgetLikeError("boom", last_agent=RUNNING_AGENT)
+
+    result = FailsafeResult.from_exception(exc, final_output="landed", last_agent=RUNNING_AGENT)
+
+    assert result.last_agent is None
+    assert result.last_agent is not RUNNING_AGENT
+
+
+def test_from_exception_run_dataのRUNNING_AGENTは次の読み取り先へ進む() -> None:
+    """`from_exception` の解決も sentinel を採らず、2 つ目の読み取り先へ進む。"""
+    exc = HybridError("boom", run_data=_FakeRunData(RUNNING_AGENT), last_agent=AGENT_FROM_ATTRIBUTE)
+
+    result = FailsafeResult.from_exception(exc, final_output="landed", last_agent=RUNNING_AGENT)
+
+    assert result.last_agent is AGENT_FROM_ATTRIBUTE
+
+
+# ---------------------------------------------------------------------------
+# V5: log_on_apply と on_apply は独立（ログ抑止でも監査コールバックは発火する）
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_log_on_apply_Falseでもon_applyは発火する(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """機微を伏せるための `log_on_apply=False` は `on_apply` の呼び出しを止めない。"""
+    seen: list[FailsafeResult] = []
+
+    def _on_apply(result: FailsafeResult) -> None:
+        seen.append(result)
+
+    policy = FailsafePolicy(handlers={MyError: "landed"}, log_on_apply=False, on_apply=_on_apply)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        result = await failsafe_call(policy, _thunk_raising(MyError("boom")))
+
+    assert isinstance(result, FailsafeResult)
+    assert _records_of(caplog, logging.WARNING) == []
+    assert len(seen) == 1
+    assert seen[0] is result
+
+
+async def test_failsafe_call_log_on_apply_Falseでもon_apply例外はerrorログに残る(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """warning の抑止は監査経路の失敗記録（error ログ）までは抑止しない。"""
+
+    def _on_apply(result: FailsafeResult) -> None:
+        raise RuntimeError("callback failed")
+
+    policy = FailsafePolicy(handlers={MyError: "landed"}, log_on_apply=False, on_apply=_on_apply)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        result = await failsafe_call(policy, _thunk_raising(MyError("boom")))
+
+    assert isinstance(result, FailsafeResult)
+    assert _records_of(caplog, logging.WARNING) == []
+    errors = _records_of(caplog, logging.ERROR)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+
+
+# ---------------------------------------------------------------------------
+# V4: async な on_apply の例外も握り潰される（await が監査の try の内側にある）
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_async_on_applyの例外はerrorログで握り潰される(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """await 中に送出する `on_apply` でも例外は漏れず、着地結果の返却は継続する。"""
+
+    async def _on_apply(result: FailsafeResult) -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("async callback failed")
+
+    policy = FailsafePolicy(handlers={MyError: "landed"}, on_apply=_on_apply)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        result = await failsafe_call(policy, _thunk_raising(MyError("boom")))
+
+    assert isinstance(result, FailsafeResult)
+    assert result.final_output == "landed"
+    errors = _records_of(caplog, logging.ERROR)
+    assert len(errors) == 1
+    assert errors[0].exc_info is not None
+    assert f"matched_type={MyError.__name__}" in errors[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
+# V6: thunk の呼び出しは handlers 非空の正常系・着地経路でも 1 回だけ
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_handlers非空の正常完了でもthunkの呼び出しは1回だけ() -> None:
+    """受理契約検査と本体 await で thunk が二重に呼ばれない（副作用の二重実行の退行検出）。"""
+    calls: list[str] = []
+
+    def _thunk():  # noqa: ANN202
+        calls.append("called")
+
+        async def _inner() -> str:
+            return "ok"
+
+        return _inner()
+
+    result = await failsafe_call(FailsafePolicy(handlers={MyError: "landed"}), _thunk)
+
+    assert result == "ok"
+    assert calls == ["called"]
+
+
+async def test_failsafe_call_着地経路でもthunkの呼び出しは1回だけ() -> None:
+    """着地する経路（宣言例外の送出）でも thunk の呼び出しは 1 回に留まる。"""
+    calls: list[str] = []
+    exc = MyError("boom")
+
+    def _thunk():  # noqa: ANN202
+        calls.append("called")
+
+        async def _inner() -> str:
+            raise exc
+
+        return _inner()
+
+    result = await failsafe_call(FailsafePolicy(handlers={MyError: "landed"}), _thunk)
+
+    assert isinstance(result, FailsafeResult)
+    assert result.exception is exc
+    assert calls == ["called"]
+
+
+# ---------------------------------------------------------------------------
+# V7: async な fallback callable 自身の例外は素通しする（着地は成立しない）
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_async_fallback自身の例外はそのまま伝播する(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """await 中に送出する fallback でも着地は成立せず、例外は素通しし監査も発火しない。"""
+    fallback_exc = RuntimeError("async fallback failed")
+    called: list[str] = []
+
+    async def _fb(received: Exception) -> str:
+        await asyncio.sleep(0)
+        raise fallback_exc
+
+    def _on_apply(result: FailsafeResult) -> None:
+        called.append("on_apply")
+
+    policy = FailsafePolicy(handlers={MyError: _fb}, on_apply=_on_apply)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        with pytest.raises(RuntimeError) as excinfo:
+            await failsafe_call(policy, _thunk_raising(MyError("boom")))
+
+    assert excinfo.value is fallback_exc
+    assert called == []
+    assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
+
+
+async def test_failsafe_call_handler経由のasync_fallback例外もそのまま伝播する(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`FailsafeHandler` で包んでも async fallback の例外の扱いは同一（素通し・監査なし）。"""
+    fallback_exc = RuntimeError("async fallback failed")
+    called: list[str] = []
+
+    async def _fb(received: Exception) -> str:
+        await asyncio.sleep(0)
+        raise fallback_exc
+
+    def _on_apply(result: FailsafeResult) -> None:
+        called.append("on_apply")
+
+    policy = FailsafePolicy(
+        handlers={MyError: FailsafeHandler(fallback=_fb, last_agent=AGENT_PER_EXCEPTION)},
+        on_apply=_on_apply,
+    )
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        with pytest.raises(RuntimeError) as excinfo:
+            await failsafe_call(policy, _thunk_raising(MyError("boom")))
+
+    assert excinfo.value is fallback_exc
+    assert called == []
+    assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
+
+
+# ---------------------------------------------------------------------------
+# V9: thunk が同期送出した例外は着地対象外（await 中の例外のみ着地させる）
+# ---------------------------------------------------------------------------
+
+
+async def test_failsafe_call_thunkが同期送出した宣言例外は着地せず伝播する(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """awaitable を返す前に送出する thunk は宣言済みの型でも着地せず、素通しする。"""
+    exc = MyError("boom")
+    called: list[str] = []
+
+    def _sync_raising() -> Any:
+        raise exc
+
+    def _on_apply(result: FailsafeResult) -> None:
+        called.append("on_apply")
+
+    policy = FailsafePolicy(handlers={MyError: "landed"}, on_apply=_on_apply)
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        with pytest.raises(MyError) as excinfo:
+            await failsafe_call(policy, _sync_raising)
+
+    assert excinfo.value is exc
+    assert excinfo.value.__cause__ is None
+    assert called == []
+    assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
