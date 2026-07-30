@@ -304,6 +304,10 @@ def test_異常系_トークン上限超過でRunBudgetExceededをraise() -> Non
     assert exc.context["agent_name"] == "agent_x"
     assert exc.context["llm_calls"] >= 1
     assert exc.elapsed_seconds >= 0
+    # Failsafe で RUNNING_AGENT を指定した際の解決元（run_data を持たない例外の
+    # 読み取り先）。表示用の context["agent_name"] とは別に、実行中 agent の同一
+    # オブジェクトを載せる。
+    assert exc.last_agent is agent
 
 
 def test_正常系_トークン上限と同値では超過しない() -> None:
@@ -336,6 +340,14 @@ def test_異常系_経過時間上限超過でRunBudgetExceededをraise(
         _run_coro(hooks.on_llm_end(ctx, agent, resp))
     assert exc_info.value.context["exceeded"] == "max_elapsed_seconds"
     assert exc_info.value.elapsed_seconds == pytest.approx(1.5)
+    # 時間超過経路でも実行中 agent の同一オブジェクトが last_agent に載る。
+    assert exc_info.value.last_agent is agent
+
+
+def test_正常系_RunBudgetExceededはlast_agent未指定ならNone() -> None:
+    """`last_agent` 無しの構築も従来どおり通り、属性は None（後方互換の機械検証）。"""
+    exc = RunBudgetExceeded("boom", usage=None, elapsed_seconds=0.0, context={})
+    assert exc.last_agent is None
 
 
 def test_正常系_経過時間が上限と同値では超過しない(monkeypatch: pytest.MonkeyPatch) -> None:
