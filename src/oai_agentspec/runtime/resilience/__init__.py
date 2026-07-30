@@ -1,33 +1,45 @@
 """Resilience 系宣言型の公開窓口（`oai-agentspec[resilience]` extra・agents 非依存の窓口）。
 
-宣言型 `ModelRetryPolicy` / `RunBudgetPolicy`（いずれも `agents` に依存しない）、
-build 関数 2 種（`build_model_retry` / `build_run_budget_hooks`）、および SDK 生型 10 種
-（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再エクスポートする。
+宣言型 `ModelRetryPolicy` / `RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` /
+`FailsafeResult`、sentinel `RUNNING_AGENT`、関数 `failsafe_call`（いずれも `agents` に
+依存しない）、build 関数 2 種（`build_model_retry` / `build_run_budget_hooks`）、および
+SDK 生型 10 種（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再エクスポートする。
 
 例外 `RunBudgetExceeded` は本窓口からは撤去済み（Breaking Change）。正規の取得経路は
 `oai_agentspec.exceptions`（lib 独自例外 9 種の統一窓口）を参照する。
 
-`_types` は追加の外部依存を持たない（`agents` / `pydantic` などを import しない）
-ため**直 import** で `__all__` へ載せる。intent 窓口は pydantic 依存のため全シンボルを
-PEP 562 で遅延化しているが、本窓口では依存を持たないシンボルは直 import としてよい
-（差分理由）。`build_*` と SDK 生型 10 種は SDK への上向き参照を持つため、`__getattr__` で
-`_adapters.resilience` 経由の**遅延取得**とし、窓口の import 自体は `agents` を発火させない
-（NFR-1 の隔離を利用者側の import タイミングでも維持）。
+`_types` / `_failsafe` は追加の外部依存を持たない（`agents` / `pydantic` などを
+import しない）ため**直 import** で `__all__` へ載せる。intent 窓口は pydantic 依存の
+ため全シンボルを PEP 562 で遅延化しているが、本窓口では依存を持たないシンボルは直
+import としてよい（差分理由）。`build_*` と SDK 生型 10 種は SDK への上向き参照を持つ
+ため、`__getattr__` で `_adapters.resilience` 経由の**遅延取得**とし、窓口の import 自体
+は `agents` を発火させない（NFR-1 の隔離を利用者側の import タイミングでも維持）。
+
+`_DIRECT_SYMBOLS` は直 import 済みシンボルの再解決フォールバック用にシンボル名から
+所属モジュール名（`_types` / `_failsafe`）への対応を dict で持つ（複数モジュールに
+分散するため）。`_DEFERRED_SYMBOLS` は取得元が `_adapters.resilience` 単一のため
+frozenset のままでよく、両者は非対称。
 
 窓口 import 自体は `resilience` extra 未導入でも壊れない（extra は追加依存ゼロ）。
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import Any
 
+from ._failsafe import RUNNING_AGENT, FailsafeHandler, FailsafePolicy, FailsafeResult, failsafe_call
 from ._types import ModelRetryPolicy, RunBudgetPolicy
 
 __all__ = [
+    "FailsafeHandler",
+    "FailsafePolicy",
+    "FailsafeResult",
     "ModelRetryBackoffSettings",
     "ModelRetryNormalizedError",
     "ModelRetryPolicy",
     "ModelRetrySettings",
+    "RUNNING_AGENT",
     "RetryDecision",
     "RetryPolicyContext",
     "RunBudgetPolicy",
@@ -37,6 +49,7 @@ __all__ = [
     "RunErrorHandlers",
     "build_model_retry",
     "build_run_budget_hooks",
+    "failsafe_call",
     "retry_policies",
 ]
 
@@ -59,10 +72,18 @@ _DEFERRED_SYMBOLS = frozenset(
     }
 )
 
-# 直 import 済みシンボル（`_types` 由来・agents 非依存）。通常は module import 時に
-# `globals()` に載っており `__getattr__` に来ないが、テスト等で `pop` された場合の
-# 再解決のためのフォールバック。
-_DIRECT_SYMBOLS = frozenset({"ModelRetryPolicy", "RunBudgetPolicy"})
+# 直 import 済みシンボル名からその所属モジュール名（`_types` / `_failsafe`）への対応。
+# 通常は module import 時に `globals()` に載っており `__getattr__` に来ないが、
+# テスト等で `pop` された場合の再解決のためのフォールバック。
+_DIRECT_SYMBOLS: dict[str, str] = {
+    "ModelRetryPolicy": "_types",
+    "RunBudgetPolicy": "_types",
+    "FailsafeHandler": "_failsafe",
+    "FailsafePolicy": "_failsafe",
+    "FailsafeResult": "_failsafe",
+    "failsafe_call": "_failsafe",
+    "RUNNING_AGENT": "_failsafe",
+}
 
 
 def __getattr__(name: str) -> Any:
@@ -86,10 +107,9 @@ def __getattr__(name: str) -> Any:
         value = getattr(_resilience, name)
     elif name in _DIRECT_SYMBOLS:
         # 通常は module import 時に globals() に載っているため本 branch には来ない。
-        # `pop` されたケース（テスト等）のフォールバックとして _types から再解決する。
-        from . import _types
-
-        value = getattr(_types, name)
+        # `pop` されたケース（テスト等）のフォールバックとして所属モジュールから再解決する。
+        module = importlib.import_module(f".{_DIRECT_SYMBOLS[name]}", __package__)
+        value = getattr(module, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value

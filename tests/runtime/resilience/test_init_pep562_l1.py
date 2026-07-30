@@ -1,10 +1,13 @@
 """L1: `runtime.resilience.__init__` の公開窓口契約（直 import + PEP 562 遅延）。
 
 intent 窓口（`tests/runtime/intent/test_init_pep562_l1.py`）を直接の踏襲元とする。
-resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存
-ゼロのため module import 時点で直 import 済みであり、`build_*` ヘルパと SDK 生型 10 種
-のみ `__getattr__` で `_adapters.resilience` 経由の遅延取得になる。lib 独自例外
-`RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`（本窓口からは撤去済み）。
+resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy` /
+`FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`）・sentinel `RUNNING_AGENT` と
+関数 `failsafe_call` は外部依存ゼロのため module import 時点で直 import 済みであり、
+`build_*` ヘルパと SDK 生型 10 種のみ `__getattr__` で `_adapters.resilience` 経由の
+遅延取得になる。
+lib 独自例外 `RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`
+（本窓口からは撤去済み）。
 """
 
 from __future__ import annotations
@@ -14,10 +17,15 @@ import pytest
 pytestmark = pytest.mark.unit
 
 
-# lib 独自 4 種。うち直 import は宣言型 2、遅延は build_* 2。
+# lib 独自 9 種。うち直 import は宣言型 5 + 関数 1 + sentinel 1、遅延は build_* 2。
 _DIRECT_SYMBOLS = {
     "ModelRetryPolicy",
     "RunBudgetPolicy",
+    "FailsafeHandler",
+    "FailsafePolicy",
+    "FailsafeResult",
+    "failsafe_call",
+    "RUNNING_AGENT",
 }
 _LAZY_BUILD_SYMBOLS = {
     "build_model_retry",
@@ -41,15 +49,15 @@ _EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 14 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 19 件で設計仕様通りのメンバ集合と一致する。"""
     from oai_agentspec.runtime import resilience as mod
 
     assert set(mod.__all__) == _EXPECTED_ALL
-    assert len(mod.__all__) == 14
+    assert len(mod.__all__) == 19
 
 
 def test_declaration_symbols_are_directly_imported() -> None:
-    """宣言型は外部依存ゼロのため module import 時点で `__dict__` に載る（直 import）。"""
+    """直 import 対象（宣言型 + 関数 + sentinel）は module import 時点で `__dict__` に載る。"""
     from oai_agentspec.runtime import resilience as mod
 
     for name in _DIRECT_SYMBOLS:
@@ -93,7 +101,7 @@ def test_lazy_sdk_raw_types_resolve_and_cache() -> None:
 
 
 def test_all_symbols_are_resolvable_via_getattr() -> None:
-    """`__all__` の全 14 シンボルが `getattr` で解決可能（漏れがない）。"""
+    """`__all__` の全 19 シンボルが `getattr` で解決可能（漏れがない）。"""
     from oai_agentspec.runtime import resilience as mod
 
     for name in mod.__all__:
@@ -111,7 +119,7 @@ def test_getattr_unknown_attribute_raises() -> None:
 
 
 def test_dir_includes_all_symbols_even_before_access() -> None:
-    """`dir()` は未 import 状態でも `__all__` の全 14 シンボルを含む。"""
+    """`dir()` は未 import 状態でも `__all__` の全 19 シンボルを含む。"""
     from oai_agentspec.runtime import resilience as mod
 
     listing = set(mod.__dir__())
@@ -124,3 +132,59 @@ def test_run_budget_exceeded_is_removed_from_window() -> None:
 
     with pytest.raises(AttributeError):
         mod.__getattr__("RunBudgetExceeded")
+
+
+async def test_failsafe_call_is_usable_via_window_import() -> None:
+    """`failsafe_call` は窓口経由の import でも呼び出せる（直 import シンボルの疎通確認）。"""
+    from oai_agentspec.runtime.resilience import FailsafePolicy, failsafe_call
+
+    async def _thunk() -> str:
+        return "ok"
+
+    policy = FailsafePolicy()
+    result = await failsafe_call(policy, _thunk)
+
+    assert result == "ok"
+
+
+async def test_failsafe_handler_is_usable_via_window_import() -> None:
+    """`FailsafeHandler` は窓口経由の import でも `handlers` の値位置で機能する。"""
+    from oai_agentspec.runtime.resilience import FailsafeHandler, FailsafePolicy, failsafe_call
+
+    class _WindowError(Exception):
+        """本 pin 専用の例外型。"""
+
+    async def _thunk() -> str:
+        raise _WindowError("boom")
+
+    policy = FailsafePolicy(handlers={_WindowError: FailsafeHandler(fallback="landed")})
+    result = await failsafe_call(policy, _thunk)
+
+    assert result.final_output == "landed"
+
+
+async def test_running_agent_is_usable_via_window_import() -> None:
+    """`RUNNING_AGENT` は窓口経由の import でも `fallback_last_agent` の解決に使える。"""
+    from oai_agentspec.runtime.resilience import RUNNING_AGENT, FailsafePolicy, failsafe_call
+
+    class _WindowError(Exception):
+        """本 pin 専用の例外型。"""
+
+    class _FakeRunData:
+        """`exc.run_data.last_agent` を模す最小 fake（`agents` は import しない）。"""
+
+        def __init__(self, last_agent: object) -> None:
+            self.last_agent = last_agent
+
+    agent = object()
+
+    async def _thunk() -> str:
+        exc = _WindowError("boom")
+        exc.run_data = _FakeRunData(agent)  # type: ignore[attr-defined]
+        raise exc
+
+    policy = FailsafePolicy(handlers={_WindowError: "landed"}, fallback_last_agent=RUNNING_AGENT)
+    result = await failsafe_call(policy, _thunk)
+
+    assert result.final_output == "landed"
+    assert result.last_agent is agent

@@ -191,9 +191,13 @@ class _BudgetHooks(RunHooksBase[Any, Any]):
     ) -> None:
         """累積 usage / 経過時間を判定し、超過時は `RunBudgetExceeded` を送出する。
 
+        送出する `RunBudgetExceeded` へ実行中の agent を `last_agent` として添付する
+        （Failsafe で `RUNNING_AGENT` を指定した際の解決元になる）。
+
         Args:
             context: SDK `RunContextWrapper`。`context.usage.total_tokens` を参照する。
-            agent: 呼び出した Agent。エラー context の `agent_name` に載せる。
+            agent: 呼び出した Agent。エラー context の `agent_name`（表示用の文字列）と、
+                例外フィールド `last_agent`（継続実行用のオブジェクト参照）に載せる。
             response: SDK `ModelResponse`。usage 欠損検知に使用（判定には使わない）。
 
         Raises:
@@ -235,6 +239,7 @@ class _BudgetHooks(RunHooksBase[Any, Any]):
                     "llm_calls": self._llm_calls,
                     "exceeded": "max_total_tokens",
                 },
+                last_agent=agent,
             )
         if (
             self._policy.max_elapsed_seconds is not None
@@ -250,6 +255,7 @@ class _BudgetHooks(RunHooksBase[Any, Any]):
                     "llm_calls": self._llm_calls,
                     "exceeded": "max_elapsed_seconds",
                 },
+                last_agent=agent,
             )
 
 

@@ -25,6 +25,11 @@ class RunBudgetExceeded(Exception):
             hooks インスタンスが初回 `on_llm_start` で計測開始した基準時刻からの差分。
         context: 追加のコンテキスト情報（`agent_name` / `llm_calls` / `exceeded`）。
             `exceeded` は超過した上限名（`"max_total_tokens"` または `"max_elapsed_seconds"`）。
+        last_agent: 例外送出時点で実行中だった agent（SDK `Agent` インスタンス相当・
+            不透明値）。Failsafe で `RUNNING_AGENT` を指定した際の解決元になる。
+            取得できない文脈では `None`。表示用の `context["agent_name"]`（文字列）とは役割が
+            異なり、こちらは継続実行（再度 `Runner.run` へ渡す等）のためのオブジェクト
+            参照を保持する。
     """
 
     def __init__(
@@ -34,6 +39,7 @@ class RunBudgetExceeded(Exception):
         usage: Any,
         elapsed_seconds: float,
         context: dict[str, Any],
+        last_agent: Any = None,
     ) -> None:
         """例外を初期化する。
 
@@ -42,8 +48,10 @@ class RunBudgetExceeded(Exception):
             usage: 累積 usage（SDK `Usage` 相当の不透明値）。
             elapsed_seconds: 累積経過秒。
             context: agent 名・LLM 呼び出し回数・超過した上限名を含む辞書。
+            last_agent: 例外送出時点で実行中だった agent（不透明値）。既定は `None`。
         """
         super().__init__(message)
         self.usage = usage
         self.elapsed_seconds = elapsed_seconds
         self.context = context
+        self.last_agent = last_agent
