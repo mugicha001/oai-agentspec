@@ -1904,19 +1904,24 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
 依存はライブラリ本体に一切追加しない（sklearn は examples 実行時のみ `[dependency-groups]` の `examples`
 グループで導入する）。
 
-## Resilience（Model Retry と Run Budget・`runtime/resilience`）
+## Resilience（Model Retry / Run Budget / Failsafe・`runtime/resilience`）
 
-Model 呼び出しの一時失敗リトライと run 全体の予算超過制御の宣言型を `runtime/resilience` に置く。
-宣言型 2 種（frozen dataclass）を SDK ネイティブ機構（`ModelSettings.retry` / `Runner.run(hooks=...)`）へ
-コンパイルするのみで、lib 独自の実行ループ・公開の実行 API を持たない（build-don't-run）。例外は SDK の
-伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]` extra で opt-in 導入し、extra は
-追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア `__all__`・`AgentSpec` の
-フィールド集合は不変。設計判断の検討経緯は `docs/adr/0002-resilience-declarative-compilation.md` を参照。
+Model 呼び出しの一時失敗リトライ・run 全体の予算超過制御・任意例外の宣言的着地の宣言型を
+`runtime/resilience` に置く。宣言型 3 種（frozen dataclass）を SDK ネイティブ機構
+（`ModelSettings.retry` / `Runner.run(hooks=...)`）へコンパイルする、または SDK に依存しない純粋な
+着地関数（Failsafe）を提供するのみで、lib 独自の実行ループ・再試行・`Runner` 参照を持たない
+（build-don't-run）。`failsafe_call` は利用者が渡す thunk を 1 回 await する薄い結線であり、
+build-don't-run の逸脱として `./CLAUDE.md` に明記された 2 関数のうちの 1 つ（もう 1 つは
+`runtime/intent` の `fit_ml_estimator`）。例外は SDK の伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]`
+extra で opt-in 導入し、extra は追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア
+`__all__`・`AgentSpec` のフィールド集合は不変。設計判断の検討経緯は
+`docs/adr/0002-resilience-declarative-compilation.md`（Model Retry / Run Budget）・
+`docs/adr/0012-failsafe-declarative-landing.md`（Failsafe）を参照。
 
 ### 配置と依存方向
 
-- `runtime/resilience/`: 宣言型（`_types.py`）・例外（`_errors.py`）・公開窓口（`__init__.py`）。
-  `agents` 非依存の宣言層
+- `runtime/resilience/`: 宣言型（`_types.py`）・例外（`_errors.py`）・Failsafe（`_failsafe.py`）・
+  公開窓口（`__init__.py`）。`agents` 非依存の宣言層
 - `_adapters/resilience.py`: SDK 結線の単一窓口。`build_model_retry` / `build_run_budget_hooks` と
   内部 `_BudgetHooks(RunHooksBase)` を持ち、`from agents` はここに閉じる
 - 依存は `runtime/resilience` からコア（`_adapters` / `constants`）への上向き単方向のみ。コア
@@ -1993,6 +1998,126 @@ import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
 
 詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md` を参照。
 
+### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `FailsafeResult` / `RUNNING_AGENT`）
+
+Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudgetExceeded`・`ToolTimeoutError` 等）を、
+呼び出し箇所ごとの try/except でなく、宣言 1 回 + 単一 async 関数で着地値へ丸める機構。
+`_failsafe.py` は `agents` を import しない（例外型は利用者が `handlers` のキーとして持ち込む）。
+設計判断の検討経緯は `docs/adr/0012-failsafe-declarative-landing.md`（宣言的着地の採用）・
+`docs/adr/0013-failsafe-last-agent-resolution.md`（`last_agent` の決定モデル）を参照。
+
+- `FailsafePolicy`（frozen dataclass）は `handlers: Mapping[type[Exception], Any]`（例外型 ->
+  固定着地値・`Callable[[Exception], Any]`・または `FailsafeHandler`）・`log_on_apply: bool = True`・
+  `on_apply: Callable[[FailsafeResult], Any] | None = None`（sync/async 両対応・戻り値は無視）・
+  `fallback_last_agent: Any = field(default=None, repr=False)`（決定モデルの段 2。下記）を持つ。
+  `__post_init__` は次の順で処理する:
+  1. `handlers` を `dict(self.handlers)` で正規化する（反復（`__iter__`）と添字アクセス
+     （`keys()` / `__getitem__`）で異なる内容を返す独自 `Mapping` を渡されても、以降の検証と
+     最終格納が同じ dict を参照するため迂回できない）
+  2. 正規化した各エントリを走査し、キーを 3 段検証する（違反は build-time `ValueError`）:
+     (a) キーが例外クラスでない（`issubclass(key, BaseException)` を満たさない）
+     (b) キーが `Exception` / `BaseException` / `KeyboardInterrupt` / `SystemExit` /
+     `asyncio.CancelledError` / `GeneratorExit` / `ExceptionGroup` そのもの（無差別捕捉・BaseException 系・
+     集約例外の宣言を禁止）
+     (c) キーが `Exception` のサブクラスでない `BaseException` 系
+     加えて、値が `RUNNING_AGENT` そのものなら `ValueError`（sentinel は `last_agent` の
+     指定値であり、着地値位置（`handlers` の値）に直接置く誤宣言を防ぐ。正しい書き方は
+     `FailsafeHandler(fallback=..., last_agent=RUNNING_AGENT)`）
+  3. `on_apply` が `None` でも callable でもない場合は build-time `ValueError`
+  4. 検証済みの正規化済み dict を `MappingProxyType` へ差し替えて格納し不変化する（検証対象と
+     格納対象が同一の dict のため、渡した元 dict の事後変更・`policy.handlers[k] = v` の直接
+     代入のいずれも構築済み policy には反映されない）。この差し替えの副作用として
+     `FailsafePolicy` 自体の `copy.deepcopy` / `dataclasses.asdict` は `TypeError` になる
+     （`mappingproxy` は pickle 不可）。複製が必要な場合は
+     `FailsafePolicy(dict(policy.handlers), ...)` で明示的に再構築する。
+  空 `handlers`（no-op）は許容する（`RunBudgetPolicy` と同じ「意図的無効化は許容・矛盾のみ拒否」思想）。
+- `FailsafeHandler`（frozen dataclass）は `handlers` の値位置に置ける opt-in の宣言で、
+  `fallback: Any` と `last_agent: Any = field(default=None, repr=False)`（決定モデルの段 1。下記）を
+  持つ。`fallback` の解決規則は素の値と完全に同一（値そのものが着地値、callable なら捕捉例外を
+  単一引数に呼んだ戻り値）。`__post_init__` は `fallback` に `FailsafeHandler`（ネスト。内側の
+  宣言がそのまま着地値になる誤りを防ぐ）または `RUNNING_AGENT`（指定用 sentinel が着地値として
+  `final_output` に載る誤りを防ぐ）を渡した場合を build-time `ValueError` で拒否する。
+- `failsafe_call(policy: FailsafePolicy, thunk: Callable[[], Awaitable[T]]) -> T | FailsafeResult` が
+  唯一の実行関数。フロー:
+  1. `handlers` が空なら `await thunk()` をそのまま返す（捕捉ゼロ・完全透過）
+  2. `awaitable = thunk()` を **try の外**で呼び出す。thunk が呼び出し不可（coroutine オブジェクトの
+     直渡し等）の場合、この呼び出し自体が Python ランタイム由来の `TypeError` になる
+  3. `awaitable` が `inspect.isawaitable` を満たさない場合、実装が明示的に
+     `TypeError("thunk must return an awaitable, got ...")` を送出する。2 と 3 のいずれの
+     `TypeError` も try の外で発生するため、`handlers` に `TypeError` を宣言していても着地せず
+     fail-fast する
+  4. `await awaitable` のみを try 内に置き、正常完了時は結果をそのまま返す（ラップしない）
+  5. `except Exception` で捕捉し、`handlers` の**挿入順**に `isinstance` で最初に一致したキー
+     （first-match。MRO 上の最 specific マッチは行わない）を採用。未一致は `raise`（`from` なし）で
+     素通し
+  6. 一致したキーの値が `FailsafeHandler` ならその `fallback` を取り出し `last_agent`（決定モデルの
+     段 1）として扱う。素の値・callable ならそれ自体を fallback とし、段 1 は無指定（None）とする。
+     fallback が callable なら `fallback(exc)` を呼び `inspect.isawaitable` なら await する
+     （sync/async 両対応）。callable でない場合はその値をそのまま着地値とする。fallback 呼び出し自体が
+     例外を送出した場合はラップせずそのまま伝播する（`log_on_apply` / `on_apply` は発火しない）
+  7. `last_agent` を決定モデル（下記）で確定し、着地値・捕捉例外・マッチ型・`last_agent` から
+     `FailsafeResult` を構築して返す。`policy.log_on_apply`（既定 True）なら
+     `constants.RESILIENCE_LOGGER_NAME` へ `logger.warning(..., exc_info=True)`
+  8. `policy.on_apply` が設定されていれば `FailsafeResult`（`last_agent` 込み）を渡して呼ぶ
+     （sync/async 両対応）。`on_apply` 自体が送出した例外は `logger.error(..., exc_info=True)`
+     で握り潰し着地は継続する
+
+#### `last_agent` の決定モデル
+
+着地結果から「もともと実行中だったエージェント」を参照できるようにする決定モデル。2 段 +
+`RUNNING_AGENT` による opt-in 解決で構成する（`docs/adr/0013-failsafe-last-agent-resolution.md`）。
+
+1. **段 1（例外ごとの指定）**: `FailsafeHandler.last_agent`
+2. **段 2（全体規定）**: `FailsafePolicy.fallback_last_agent`
+
+各段の値は具体の agent（不透明値。`AgentRegistry` から取得した `Agent` をそのまま渡せる）または
+`RUNNING_AGENT`。既定 None は「その段の指定なし」を意味する。判定は `is None` / `is RUNNING_AGENT`
+の同一性のみで行う（`or` 連鎖や truthiness 判定は使わない。空文字や 0 のような falsy な具体値も
+正当な値として採用するため）。
+
+- **`RUNNING_AGENT`**: 「実際に動いていた Agent を使う」ことを表す公開 sentinel
+  （`_RunningAgentSentinel` の単一インスタンス）。`repr()` は `"RUNNING_AGENT"`。`__reduce__` により
+  `copy` / `deepcopy` / pickle 往復でも同一インスタンスを保つ（複製後も `is RUNNING_AGENT` 判定が
+  外れないため）。
+- **解決は opt-in**: `RUNNING_AGENT` を置いた段でのみ、例外から `last_agent` を解決する。何も
+  指定しなければ解決は一切走らず `last_agent` は `None`（自動導出はしない）。
+- **解決順**（`_derive_last_agent`）: `exc.run_data.last_agent` -> `exc.last_agent`（いずれも
+  `getattr` の duck typing）。SDK 例外は `run_data`（`RunErrorDetails` 相当）経由、lib 独自例外
+  （`RunBudgetExceeded`）・利用者定義例外は `last_agent` 属性経由で読める。読み出し全体を
+  `try/except Exception` で防御し、属性アクセス自体が失敗しても着地（`FailsafeResult` の返却・
+  warning・`on_apply`）は成立させ、`logger.debug(exc_info=True)` に記録して解決不能扱いにする。
+  各読み取り先の採否も `is None` 判定のため、falsy な値も正当な解決結果として採用する。
+- **段の遷移**: 段 1 が無指定、または `RUNNING_AGENT` だが解決不能なら段 2 へ。段 2 でも決まら
+  なければ `None`。
+- `RUNNING_AGENT` そのものが `FailsafeResult.last_agent` に載ることはない（`failsafe_call` /
+  `FailsafeResult.from_exception` の経路では解決済みの値か `None` のみが載る。`FailsafeResult` を
+  直接構築する場合は決定モデルを経由しないため渡した値がそのまま載る）。
+- **build-time 誤配置ガード**: `RUNNING_AGENT` を着地値位置（`final_output` になる位置）に置くと
+  `ValueError` になる。対象は `FailsafeHandler.fallback` と `FailsafePolicy.handlers` の値位置
+  （`FailsafeHandler` で包まない素の宣言。`handlers={E: RUNNING_AGENT}` は拒否・
+  `FailsafeHandler(fallback=..., last_agent=RUNNING_AGENT)` が正しい書き方）の 2 箇所。
+
+- `FailsafeResult`（frozen dataclass）は `final_output: Any`・`exception: Exception`・
+  `matched_type: type[Exception]`・`last_agent: Any = field(default=None, repr=False)` を持つ。
+  `RunResult.final_output` と同名属性（structural 互換）でアクセスでき、呼び出し元は戻り値が
+  `RunResult` / `FailsafeResult` のどちらでも `.final_output` で一様にアクセスできる（共通基底
+  クラスは導入しない）。
+- `FailsafeResult.from_exception(exception, *, final_output, matched_type=None, last_agent=None)`
+  classmethod は `failsafe_call` の外側（利用者が自前の except で捕捉した場合）から同じ結果型・
+  同じ `last_agent` の意味へ手動着地するファクトリ。`matched_type` 既定は `type(exception)`
+  （手動着地には宣言キーが無いため送出型を採る）。`last_agent` は決定モデルの段 1 相当のみ
+  （policy を受け取らないため段 2 は持たない）で、`RUNNING_AGENT` を指定すれば `failsafe_call` と
+  同一の解決を試みる。監査（`log_on_apply` の warning・`on_apply`）は発火しない（記録するかは
+  呼び出し側の except 節の責務）。build-time 検証: `exception` が `Exception` インスタンスでない、
+  または `matched_type` が `None` でも `Exception` サブクラスでもない場合は `ValueError`。
+- **repr マスク**: `FailsafeResult.last_agent` / `FailsafeHandler.last_agent` /
+  `FailsafePolicy.fallback_last_agent` はいずれも `field(repr=False)` で宣言し、値（機微な
+  システムプロンプト・資格情報を含みうる不透明値）が `repr()` に出ない。`==` と
+  `dataclasses.fields()` のフィールド集合・順序には影響しない（属性としては従来どおり参照でき、
+  比較にも従来どおり含まれる）。
+- SDK ネイティブ `RunErrorHandlers`（`MaxTurnsExceeded` / `ModelRefusalError` 限定の isinstance
+  dispatch）とは独立に動作する。SDK 側が先に処理した例外は Failsafe には伝播しない。
+
 ### 実行モード
 
 - `Runner.run`: 超過時に即 raise
@@ -2000,15 +2125,21 @@ import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
   されない）。`ModelRetryPolicy` / `RunBudgetPolicy` とも streaming で透過的に効く
 - `Runner.run_sync`: 対応（内部で `run` を呼ぶため透過的に効く）
 - Realtime（`RealtimeRunner` / `RealtimeSession`）は非対応
+- `failsafe_call` は `Runner.run`（非 streaming の `Awaitable` を返す thunk）のみを対象とする。
+  streaming（`run_streamed`）・sync（`run_sync`）専用の着地ヘルパーは提供しない。streaming 例外は
+  従来どおり利用者が `stream_events()` 消費時に捕捉する必要がある。Realtime（`RealtimeRunner` /
+  `RealtimeSession`）は非対応
 
 ### 公開窓口と配置
 
 公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
-PEP 562 遅延再エクスポートで、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy`）は外部依存ゼロのため
-直 import、`build_model_retry` / `build_run_budget_hooks` と SDK 生型は `__getattr__` で
-`_adapters.resilience` 経由の遅延取得とし、窓口 import 時に `agents` を発火させない（extra 未導入
-耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は `oai_agentspec.exceptions`
-（統一窓口）。
+`__all__` は 19 件で、外部依存ゼロのシンボル 7 件（宣言型 5 種 `ModelRetryPolicy` /
+`RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`、関数 1 種
+`failsafe_call`、sentinel 1 種 `RUNNING_AGENT`）は module import 時点で直 import 済み、残り 12 件
+（`build_model_retry` / `build_run_budget_hooks` の 2 種と SDK 生型 10 種）は `__getattr__` で
+`_adapters.resilience` 経由の PEP 562 遅延取得とし、窓口 import 時に `agents` を発火させない
+（extra 未導入耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は
+`oai_agentspec.exceptions`（統一窓口）。
 
 SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
 `ModelRetrySettings` / `ModelRetryBackoffSettings` / `retry_policies` / `RetryDecision` /
