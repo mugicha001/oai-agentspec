@@ -11,6 +11,7 @@ from oai_agentspec import (
     IntegrityError,
     RegistryFrozenError,
 )
+from oai_agentspec.next_turn import NextTurnPolicy, NextTurnRule, apply_next_turn_policy
 from oai_agentspec.protocols import AgentBuilder
 
 from _helpers.fake_builder import FakeAgent, FakeAgentBuilder
@@ -600,3 +601,54 @@ def test_clone_transform_spec_mutation_preserved() -> None:
     assert cloned._specs["a"].tools == ["original", "added_by_transform"]  # noqa: SLF001
     # 元 registry は影響を受けない（_copy_spec 1 回目で独立コピーされているため）。
     assert reg._specs["a"].tools == ["original"]  # noqa: SLF001
+
+
+# ----------------------------------------------------------------------
+# Next-Turn Agent Override: 到達時ハンドオフ禁止の結線（既定挙動不変の側）
+#
+# 実 SDK 型（`Handoff` への昇格・`is_enabled` ゲート）を伴う結線の pin は
+# `tests/_adapters/test_next_turn_registry_l2.py`（integration）が担う。ここでは
+# フェイク builder のまま観測できる「合成が入らない経路」を固定する。
+# ----------------------------------------------------------------------
+def make_handoff_registry() -> AgentRegistry:
+    """triage -> billing -> tech のハンドオフ構成を持つフェイク registry を作る。"""
+    reg, _ = make_registry()
+    reg.register(AgentSpec(name="triage", instructions="t", handoffs=["billing"]))
+    reg.register(AgentSpec(name="billing", instructions="b", handoffs=["tech"]))
+    reg.register(AgentSpec(name="tech", instructions="x"))
+    return reg
+
+
+def test_next_turn_禁止を宣言しない宣言では素のAgent直appendが維持される() -> None:
+    """次ターン指定のみの宣言では合成を設置せず、handoff は従来どおり Agent 実体の直 append。"""
+    reg = make_handoff_registry()
+
+    derived = apply_next_turn_policy(
+        NextTurnPolicy(rules={"billing": NextTurnRule(next_agent="triage")}), reg
+    )
+
+    assert derived.get("triage").handoffs == [derived.get("billing")]
+    assert isinstance(derived.get("triage").handoffs[0], FakeAgent)
+
+
+def test_next_turn_禁止を宣言しても元registryの結線は素のまま() -> None:
+    """合成は派生 registry にのみ設置され、元 registry の結線は従来経路のまま。"""
+    reg = make_handoff_registry()
+
+    apply_next_turn_policy(
+        NextTurnPolicy(rules={"billing": NextTurnRule(no_handoff_on_arrival=True)}), reg
+    )
+
+    assert reg.get("triage").handoffs == [reg.get("billing")]
+    assert isinstance(reg.get("triage").handoffs[0], FakeAgent)
+    assert isinstance(reg.get("billing").handoffs[0], FakeAgent)
+
+
+def test_next_turn_判定表を持たないregistryのcloneは従来どおり() -> None:
+    """合成を設置していない registry の clone は、これまでどおり素の直 append を維持する。"""
+    reg = make_handoff_registry()
+
+    cloned = reg.clone()
+
+    assert cloned.get("triage").handoffs == [cloned.get("billing")]
+    assert isinstance(cloned.get("triage").handoffs[0], FakeAgent)
