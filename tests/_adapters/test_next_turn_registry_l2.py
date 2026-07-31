@@ -395,6 +395,29 @@ async def test_動的エッジで判定表に載らない候補へ解決して�
     )
 
 
+async def test_動的エッジ経由で到達した静的エッジの記録も実際に成立する() -> None:
+    """record と gate が同一エッジで同時合成される billing->tech エッジの record 側を見る。
+
+    billing は到達元不問の包括禁止（gate 対象）、tech は `source="billing"` の限定禁止
+    （record 対象）のため、`billing -> tech` エッジには `_next_turn_config` の
+    `if record:` と `if gate:` が両方成立し、記録の前置とゲートの合成が同一エッジへ
+    同時適用される。billing への動的到達後に `billing -> tech` を発火させ、tech への
+    到達が実際に記録され、tech の出辺（`tech -> triage`）が無効化されることを確認する。
+    """
+    derived = apply_next_turn_policy(
+        _DYNAMIC_POLICY, _make_dynamic_registry(lambda ctx, input_json: "billing")
+    )
+    ctx: RunContextWrapper[Any] = RunContextWrapper(context=None)
+
+    await _arrive(derived.get("triage").handoffs[0], ctx)
+
+    assert await _is_enabled(derived.get("tech").handoffs[0], ctx, derived.get("tech")) is True
+
+    await _arrive(derived.get("billing").handoffs[0], ctx)
+
+    assert await _is_enabled(derived.get("tech").handoffs[0], ctx, derived.get("tech")) is False
+
+
 async def test_動的エッジでも記録は利用者on_handoffより先に行われる() -> None:
     """利用者コールバックの時点で到達が記録済み（ゲートが False になっている）ことを見る。"""
     seen: list[bool] = []
