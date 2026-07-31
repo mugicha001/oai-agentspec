@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING, Any
 
 from ._registry_core import build_two_pass, collect_reachable
 from ._validation import validate_instructions_callable
-from .spec import AgentSpec
+from .spec import AgentSpec, HandoffConfig
 
 if TYPE_CHECKING:
     from ._adapters import Agent
+    from ._adapters.next_turn import NextTurnWiring
     from .protocols import AgentBuilder
-    from .spec import HandoffConfig
 
 AgentFactory = Callable[["AgentRegistry"], "Agent"]
 
@@ -56,6 +56,10 @@ class AgentRegistry:
         # freeze 後は変更操作（register / register_factory / update / unregister /
         # _update_handoffs）を遮断する。clone() で得た新 registry はこのフラグを引き継がない。
         self._frozen: bool = False
+        # Next-Turn Agent Override（到達時ハンドオフ禁止）の結線一式（判定表 + 記録ストア）。
+        # `_install_next_turn_state`（`apply_next_turn_policy` 専用の内部プリミティブ）を
+        # 通した registry だけが値を持ち、既定は「合成なし＝従来経路と同一」。
+        self._next_turn: NextTurnWiring | None = None
 
     # ------------------------------------------------------------------
     # 登録
@@ -135,7 +139,33 @@ class AgentRegistry:
                 cloned.register(spec)
             else:
                 cloned.register_factory(name, self._factories[name])
+        # Next-Turn Agent Override の結線一式（判定表 + 到達記録ストア）は共有継承する
+        # （記録は wrapper キーで run 分離されるため共有で安全。継承しないと clone 経由で
+        # 到達時ハンドオフ禁止が静かに脱落する）。
+        if self._next_turn is not None:
+            cloned._install_next_turn_state(self._next_turn)
         return cloned
+
+    def _install_next_turn_state(self, wiring: NextTurnWiring) -> None:
+        """到達時ハンドオフ禁止の結線一式を設置する内部プリミティブ。
+
+        ユーザーは `apply_next_turn_policy`（`next_turn.py`）経由で利用する。設置後は
+        `_wire` / `_build_dynamic_handoff` が判定表に載るエッジにだけ合成を行う
+        （判定表に載らないエッジは従来経路のまま）。
+
+        Args:
+            wiring: 判定表（流入エッジ集合 / ゲート対象名集合）と到達記録ストアの一式
+                （`_adapters` の `NextTurnWiring`）。
+
+        Raises:
+            RegistryFrozenError: ``freeze()`` 後の呼び出し。
+        """
+        self._ensure_unfrozen("_install_next_turn_state")
+        self._next_turn = wiring
+        # 設置前に構築済みの Agent は合成前の結線を持つため破棄する（次回 get() で再構築）。
+        # 現行の唯一の呼び出し元（`apply_next_turn_policy` -> clone 直後 / clone の継承）では
+        # `_built` は常に空のため no-op だが、プリミティブ単体の整合性のため残す。
+        self._built.clear()
 
     @property
     def entry_name(self) -> str | None:
@@ -182,7 +212,9 @@ class AgentRegistry:
 
         for dst in spec.handoffs:
             target = self._require(dst, spec.name, "handoff")
-            config = spec.handoff_options.get(dst)
+            # 判定表に載るエッジだけ合成済み config へ差し替える（載らないエッジは素通し＝
+            # per-edge 設定が無ければ従来どおり Agent 実体の直 append を維持する）。
+            config = self._next_turn_config(spec.name, dst, spec.handoff_options.get(dst))
             if config is not None:
                 agent.handoffs.append(_adapters.make_handoff(target, config))
             else:
@@ -197,6 +229,74 @@ class AgentRegistry:
                     sub_agent, tool_name=tool_name, tool_description=tool_description
                 )
             )
+
+    def _next_turn_config(
+        self, src: str, dst: str, config: HandoffConfig | None
+    ) -> HandoffConfig | None:
+        """静的エッジ 1 本に到達時ハンドオフ禁止の合成を適用した config を返す。
+
+        判定表に載らないエッジでは引数の config をそのまま返すため、per-edge 設定を持た
+        ないエッジは従来どおり Agent 実体の直 append 経路に残る。載るエッジでは
+        （per-edge 設定が無くても）`HandoffConfig` を組んで `make_handoff` 経由の
+        `Handoff` へ昇格させる（SDK は直 append 経路の handoff を毎ステップ内部生成する
+        ため、合成の差し込み口が無い）。
+
+        合成は元 config を書き換えず `dataclasses.replace` で新インスタンスを作る
+        （config は元 registry の spec と共有されうるため）。
+
+        記録を前置するエッジの利用者宣言は `_adapters` の
+        `validate_recorded_edge_declaration` で build 時に検証する（SDK 固有の規則と例外型の
+        知識は `_adapters` に閉じる。コア層は `agents` を直接参照しない）。
+
+        Args:
+            src: エッジの所有側（遷移元）エージェント名。
+            dst: エッジの遷移先エージェント名。
+            config: 利用者宣言の per-edge 設定（未宣言なら None）。
+
+        Returns:
+            合成済みの `HandoffConfig`。判定表に載らないエッジでは引数の config のまま。
+
+        Raises:
+            UserError: 記録を前置するエッジで `input_type` があるのに利用者宣言の
+                `on_handoff` が無い場合（SDK の `handoff()` と同じ例外型）。
+        """
+        wiring = self._next_turn
+        if wiring is None:
+            return config
+        record = (src, dst) in wiring.arrivals
+        gate = src in wiring.gated
+        if not record and not gate:
+            return config
+
+        from . import _adapters
+
+        base = config if config is not None else HandoffConfig()
+        changes: dict[str, Any] = {}
+        if record:
+            _adapters.validate_recorded_edge_declaration(src, dst, base)
+            changes["on_handoff"] = _adapters.make_arrival_recorder(
+                wiring.store, dst, base.on_handoff, base.input_type is not None
+            )
+        if gate:
+            changes["is_enabled"] = _adapters.make_arrival_gate(wiring.store, src, base.is_enabled)
+        return dataclasses.replace(base, **changes)
+
+    def _record_next_turn_arrival(self, context: Any, src: str, dst: str) -> None:
+        """動的エッジの到達を、判定表に載る `(src, dst)` のときだけ記録する。
+
+        静的エッジの記録は `on_handoff` への前置合成で行うが、動的エッジは遷移先が実行時に
+        決まるため、遷移先が確定する `on_invoke` の内側で記録する（到達の意味論は同一）。
+
+        Args:
+            context: SDK が渡す run のコンテキスト wrapper（記録キー）。
+            src: エッジの所有側（遷移元）エージェント名。
+            dst: resolver が選んだ遷移先エージェント名。
+        """
+        wiring = self._next_turn
+        if wiring is None:
+            return
+        if (src, dst) in wiring.arrivals:
+            wiring.store.record(context, dst)
 
     def _build_dynamic_handoff(self, spec: AgentSpec, dyn: Any) -> Any:
         """DynamicHandoff から、候補名を解決する on_invoke_handoff 付き Handoff を作る。
@@ -217,7 +317,17 @@ class AgentRegistry:
                     f"agent {spec.name!r} の dynamic handoff resolver が候補外の名前を"
                     f"返しました: {chosen!r}（候補: {sorted(candidates)}）"
                 )
-            return self._require(chosen, spec.name, "dynamic handoff")
+            target = self._require(chosen, spec.name, "dynamic handoff")
+            # 到達記録は遷移先が確定してから行う（利用者 `on_handoff` は make_dynamic_handoff
+            # 側で on_invoke の後に発火するため、静的エッジと同じ「記録 -> 利用者」順になる）。
+            self._record_next_turn_arrival(context, spec.name, chosen)
+            return target
+
+        # X の全出辺にゲートを AND 合成する（静的エッジと同一の判定表・同一の意味論）。
+        is_enabled = dyn.is_enabled
+        wiring = self._next_turn
+        if wiring is not None and spec.name in wiring.gated:
+            is_enabled = _adapters.make_arrival_gate(wiring.store, spec.name, dyn.is_enabled)
 
         return _adapters.make_dynamic_handoff(
             tool_name=dyn.tool_name,
@@ -226,7 +336,7 @@ class AgentRegistry:
             on_handoff=dyn.on_handoff,
             input_type=dyn.input_type,
             input_filter=dyn.input_filter,
-            is_enabled=dyn.is_enabled,
+            is_enabled=is_enabled,
             options=dyn.options,
         )
 

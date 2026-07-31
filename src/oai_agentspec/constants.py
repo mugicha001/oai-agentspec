@@ -51,3 +51,9 @@ TOOL_UNSET: Final[object] = object()
 # 利用者は ``logging.getLogger(RESILIENCE_LOGGER_NAME)`` で観測性基盤に接続する。
 # ``INTEGRITY_LOGGER_NAME`` と同型の運用（ドット区切りの階層 logger 名）。
 RESILIENCE_LOGGER_NAME: Final[str] = "oai_agentspec.resilience"
+
+# Next-Turn Agent Override: 判定材料の防御的読み取り失敗（debug）と、build 時に結線の到達性を
+# 保証できない宣言の警告（warning）を記録する logger 名（固定）。
+# 読み取り失敗は安全側（None / 空列 / 当該アイテムのスキップ）へ倒したうえで debug に落とすため、
+# 利用者は ``logging.getLogger(NEXT_TURN_LOGGER_NAME)`` を debug 有効化して原因を追う。
+NEXT_TURN_LOGGER_NAME: Final[str] = "oai_agentspec.next_turn"
