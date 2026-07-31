@@ -26,23 +26,24 @@
 4. [core/tools.md](./core/tools.md)
 5. [core/handoffs.md](./core/handoffs.md)
 6. [core/multi_agent.md](./core/multi_agent.md)
-7. [core/workflow.md](./core/workflow.md)
-8. [safety/resilience.md](./safety/resilience.md)
-9. [safety/guardrails.md](./safety/guardrails.md)
-10. [safety/governance.md](./safety/governance.md)
-11. [safety/integrity.md](./safety/integrity.md)
-12. [ops/intent.md](./ops/intent.md)
-13. [ops/llmops.md](./ops/llmops.md)
-14. [ops/lightning.md](./ops/lightning.md)
-15. [runtime/realtime.md](./runtime/realtime.md)
-16. [runtime/conversation.md](./runtime/conversation.md)
-17. [runtime/serve_and_cli.md](./runtime/serve_and_cli.md)
+7. [core/next_turn.md](./core/next_turn.md)
+8. [core/workflow.md](./core/workflow.md)
+9. [safety/resilience.md](./safety/resilience.md)
+10. [safety/guardrails.md](./safety/guardrails.md)
+11. [safety/governance.md](./safety/governance.md)
+12. [safety/integrity.md](./safety/integrity.md)
+13. [ops/intent.md](./ops/intent.md)
+14. [ops/llmops.md](./ops/llmops.md)
+15. [ops/lightning.md](./ops/lightning.md)
+16. [runtime/realtime.md](./runtime/realtime.md)
+17. [runtime/conversation.md](./runtime/conversation.md)
+18. [runtime/serve_and_cli.md](./runtime/serve_and_cli.md)
 
 ## extras 一覧
 
 | extra | 追加依存 | 有効化される機能 |
 |---|---|---|
-| （なし） | - | `AgentSpec` / `AgentRegistry` / `HandoffGraph` / `WorkflowGraph` / `PromptStore` / `ToolRegistry` / `lockdown` / Realtime 宣言 |
+| （なし） | - | `AgentSpec` / `AgentRegistry` / `HandoffGraph` / `NextTurnPolicy` / `WorkflowGraph` / `PromptStore` / `ToolRegistry` / `lockdown` / Realtime 宣言 |
 | `conversation` | 追加依存なし | `ConversationService` 等の公開窓口分離（opt-in 表現） |
 | `serve` | `fastapi` / `uvicorn` | `oai-agentspec serve`（FastAPI サーバ入口・dev 用途） |
 | `cli` | `httpx` / `websockets` / `rich` | `oai-agentspec chat`（別プロセス CLI） |
@@ -60,6 +61,7 @@
 
 - 静的 handoff で足りる → [core/handoffs](./core/handoffs.md)
 - 実行時に振り分け先を決めたい → [core/multi_agent](./core/multi_agent.md)
+- ハンドオフ後の次ターン開始エージェントを宣言で固定したい → [core/next_turn](./core/next_turn.md)
 - 決定論的に順次実行したい → [core/workflow](./core/workflow.md)
 - 会話履歴を扱いたい → [runtime/conversation](./runtime/conversation.md)
 - レイテンシ最小の音声 → [runtime/realtime](./runtime/realtime.md)

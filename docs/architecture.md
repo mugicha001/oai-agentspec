@@ -108,6 +108,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
 | `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
+| `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
@@ -133,10 +134,13 @@ __all__ = [
     "HandoffConfig",
     "HandoffEdge",
     "HandoffGraph",
+    "NextTurnPolicy",  # 次ターン: 上書きルール束（詳細は「Next-Turn Agent Override」節）
+    "NextTurnRule",    # 次ターン: 1 ルール（次ターン指定 / 到達時ハンドオフ禁止 / 到達元条件）
     "NodeFn",        # 型: FUNCTION ノードの (msg, ctx) -> 出力
     "NodeHook",      # 型: ノード前後フック
     "NodeResults",
     "Router",        # 型: 条件エッジ router (msg, ctx) -> 判定キー
+    "SandboxAgentSpec",  # サンドボックス実行の宣言（詳細は「Sandbox」節）
     "PromptStore",
     "PromptLayout",
     "PromptTemplate",
@@ -144,10 +148,13 @@ __all__ = [
     "ToolSpec",      # Tool メタデータ宣言 dataclass
     "WorkflowGraph",
     "function_tool",         # HITL: 承認必須ツール宣言用（_adapters 再エクスポート・コア公開）
+    "apply_next_turn_policy", # 次ターン: 名前整合検証 + 到達時ハンドオフ禁止を結線した派生 registry
     "default_input_filter", # ヘルパー
     "dynamic_prompt", # ヘルパー
     "from_specs",
     "lockdown",                       # runtime インテグリティ防御の起動点
+    "next_turn_agent",                # 次ターン: 解決 + registry 解決 + last_agent フォールバック
+    "resolve_next_agent",             # 次ターン: 上書き先の名前 or None（上書きなし）
     "IntegrityCheck",                 # 型: Callable[[], None]
     "IntegrityError",                 # 例外（Exception 継承・基底）
     "PromptTemplateIntegrityError",   # 例外（IntegrityError 継承）
@@ -552,6 +559,131 @@ frozen / unfrozen の混在継承を許可しないため構造統合せず、6 
 ユニットテスト（`tests/test_handoff_config.py::test_handoff_config_and_dynamic_handoff_share_field_names`）
 で機械的に保証する。
 
+## Next-Turn Agent Override（次ターン開始エージェントの宣言的上書き）
+
+「ハンドオフ遷移を経てエージェント X が回答を終えたら、次ターンは Y から開始する」という上書きルールを
+ハンドオフグラフと同じ宣言レベルで固定し、run 完了結果から次ターンの開始エージェントを副作用なく解決する。
+あわせて「ハンドオフで X に到達したターンでは X の全 handoff を無効化し、X 自身に回答を終えさせる」到達時
+ハンドオフ禁止をルール単位の opt-in で提供する。lib は宣言・build-time 検証・薄い結線と解決に徹し、次ターンの
+`Runner.run` 呼び出しは利用者コードが行う（build-don't-run）。設計判断の検討経緯は
+`docs/adr/0014-next-turn-agent-override.md` を参照。
+
+### 配置と依存方向
+
+- `next_turn.py`（コア直下・`agents` 非依存）: 宣言型（`NextTurnRule` / `NextTurnPolicy`）・解決関数
+  （`resolve_next_agent`）・組み立てヘルパ（`next_turn_agent`）・結線関数（`apply_next_turn_policy`）。
+  `await` も `Runner` 参照も持たない宣言 + 純関数であり、handoff 宣言と同じ宣言層に属する
+- `_adapters/next_turn.py`: SDK 結線の単一窓口。run 完了結果からの観測抽出（`extract_turn_observation`）・
+  到達記録ストア・記録 `on_handoff` 合成・`is_enabled` ゲート合成を持ち、`from agents` はここに閉じる
+- `next_turn.py` から `_adapters` への参照は `registry.py` と同じく関数内遅延 import とし、参照箇所を
+  限定する。公開シンボルは `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` /
+  `apply_next_turn_policy` の 5 つ
+
+### 宣言 -> 解決 -> 継続のデータフロー
+
+```
+宣言 NextTurnPolicy
+  │ apply_next_turn_policy(policy, registry)   [build 時にすべて確定]
+  │   ├─ 名前整合検証（registry の登録名集合と突合・不在名は ValueError）
+  │   ├─ registry.clone()（元 registry を汚染しない派生 registry）
+  │   ├─ 判定表の静的展開: {(遷移元, X) -> 到達時ハンドオフ禁止か}
+  │   └─ 派生 registry の結線フックへ合成を設置
+  ▼
+派生 AgentRegistry
+  │ 利用者の Runner.run（到達で記録・ステップ毎にゲート評価）
+  ▼
+RunResult ─ extract_turn_observation ─▶ plain 観測（最終回答者名 / (遷移元, 遷移先) 列）
+  │                                        │ resolve_next_agent
+  │                                        ▼
+  │                                    次ターン開始名（str）または上書きなし（None）
+  │                                        │ next_turn_agent（registry 解決 / last_agent フォールバック）
+  ▼                                        ▼
+利用者が次ターンの Runner.run(next_agent, ...) を呼ぶ
+```
+
+`NextTurnPolicy.rules` は「回答者名 X -> 単一ルール または ルールの列」の Mapping で、値位置は
+`NextTurnRule` / `NextTurnRule` の列 / 次ターン指定のみの str 略記の多態を取る。build 時に `dict(...)` で
+正規化・検証し `MappingProxyType` へ差し替えて不変化する（`FailsafePolicy.handlers` と同一方針）。
+`NextTurnRule` は次ターン指定（`next_agent`）・到達時ハンドオフ禁止の opt-in（`no_handoff_on_arrival`）・
+到達元条件（`source`）を持ち、次ターン指定と禁止のいずれも持たない宣言・同一 X のルール列内の到達元重複・
+包括ルール 2 件以上・空列は build-time `ValueError` で fail-fast する。
+
+### 発動ルールの選定規則
+
+X のエントリから発動ルールを選ぶ規則は解決（`resolve_next_agent`）と到達時ハンドオフ禁止で同一である。
+
+1. 到達の遷移元と一致する `source` を持つルール（第一候補）
+2. `source` を持たない包括ルール（第二候補）
+3. どちらも無ければ発動ルールなし
+
+`resolve_next_agent` は「ターン内にハンドオフ遷移が 1 件以上観測される」かつ「最終回答者名が X」の AND
+条件が成立したときのみ発動ルールを探し、その最後の到達の遷移元で上記規則を適用する。発動ルールが次ターン
+指定を持たない（禁止のみの）場合は「上書きなし」（`None`）を返す。`next_turn_agent` は「上書きなし」の
+ときに `result.last_agent` をそのまま返し、`last_agent` も取得できないときのみ `None`（開始エージェント
+決定不能）を返す。上書き先 Y が registry に未登録なら registry の `KeyError` をそのまま伝播する。
+
+### 到達時ハンドオフ禁止の意味論と実現形
+
+意味論は「ハンドオフで X に到達した以降、当該ターン中は X からの handoff 遷移が実行されない」ことまでで、
+無効化は全 handoff 一括であり、handoff 以外のツール呼び出し・応答生成は不変である。X をターン開始
+エージェントとして直接使う場合は発動しない（直接開始した X に同一ターン内のハンドオフで再到達した場合は、
+その到達以降について発動する）。LLM の応答内容・session 履歴は制御しない。
+
+実現形はエージェント実体を一切複製・書き換えせず、build 時に確定した判定表と SDK 公式拡張点への合成で
+構成する。
+
+- **記録**: 判定表に載る流入エッジ（`src -> X`）の `HandoffConfig.on_handoff` に到達記録の追記を前置
+  合成する。利用者宣言の `on_handoff` があれば「記録 -> 利用者 `on_handoff`」の chain とし、合成 callable の
+  arity はエッジの `input_type` 有無に合わせて 1 引数形 / 2 引数形を build 時に選択する（SDK の署名検証に
+  合わせるため）。SDK が生成した `Handoff` オブジェクトの事後書き換えは行わない
+- **ゲート**: X の全出辺の `is_enabled` に記録参照ゲートを AND 合成する（記録済みなら `False`、そうで
+  なければ既存 `is_enabled` の評価へ委譲）。ゲートは closure が捕捉した X の名前で判定する
+- **昇格**: 判定表に載るエッジのうち Agent 実体を直接 append する経路のものは、build 時に `make_handoff`
+  経由の `Handoff` オブジェクトへ昇格させる（SDK は直 append 経路の handoff を毎ステップ内部生成するため
+  合成の差し込み口が無い）。`make_handoff` は指定フィールドのみを渡すため既定挙動は変わらない
+- **registry 側の契約**: 静的エッジ結線と動的エッジ生成の 2 フックで per-edge 合成を行い、`clone` は判定表と
+  記録ストアを共有継承する（記録は run 単位に分離されるため共有で安全・継承しないと clone 経由で禁止が
+  静かに脱落する）。合成の設置は freeze ガード付きの内部プリミティブ経由で、frozen な元 registry にも
+  `apply_next_turn_policy` を適用できる（設置後に freeze するため、派生 registry の freeze 状態は元から
+  引き継がれる）。いずれも private で、宣言しない限り合成は設置されず従来経路と同一である
+- **spec 登録の要求**: ファクトリ登録は `get()` が戻り値をそのまま返して結線（`_wire`）を通らず合成の
+  差し込み口が無いため、到達時ハンドオフ禁止が確実に効かない 2 形（禁止対象 X 自身がファクトリ登録 /
+  禁止を宣言したルールが `source` でファクトリ登録名を明示指定）を `apply_next_turn_policy` が build 時に
+  `ValueError` で拒否する。包括ルールの到達元候補にファクトリ登録が含まれるだけの場合は、候補の展開が
+  登録名全体への over-approximation でありエッジの実在を宣言から判定できないため拒否せず、
+  `logger.warning`（`NEXT_TURN_LOGGER_NAME`）で警告して適用は通す。次ターン指定のみのルールは対象外
+
+### 到達記録は run 内一時状態である
+
+到達記録ストアは `RunContextWrapper` インスタンスをキーとする弱参照マップ（`_adapters` 内部・非公開）で、
+`apply_next_turn_policy` の呼び出しごとに独立生成される（モジュールグローバル状態を持たない）。SDK は run
+開始時に wrapper を 1 回だけ生成し、handoff 実行と handoff 有効性評価の双方へ同一インスタンスを渡すため、
+記録と参照はキーで一致し、並行 run は構造的に分離される。run 終了後は弱参照により解放される。
+
+したがってこの記録は **run 内の一時状態であり、ターン間・run 間の継続状態ではない**。次 run には記録が
+存在せず、禁止が当該ターンを越えて持続する経路が構造的に存在しないため、「ステートレスなコア」「lib は継続 /
+再開状態を持たない」という原則と両立する。禁止が発動したターンの `result.last_agent` も元のエージェント実体
+そのものであり、`next_turn_agent` のフォールバック経由でも利用者による生の `last_agent` 継続でも、次ターンは
+元の handoff 構成で動作する。
+
+記録の追記とゲートの参照は SDK が呼ぶ公式 callback の内側で行う読み書きのみであり、`await` も `Runner` 参照も
+独自の実行ループも持たない（hooks 合成と同種の薄い結線）。このため build-don't-run の逸脱には当たらず、
+逸脱として列挙する関数（`runtime/intent` の `fit_ml_estimator` と `runtime/resilience` の `failsafe_call`）の
+一覧には追加しない。
+
+### 防御的読み取りと制限
+
+- 判定材料（`last_agent` / handoff アイテムの遷移元・遷移先）の読み取りは属性の有無で判定し `type` リテラルに
+  依存しない。属性欠落に加えて属性アクセス自体が送出する例外も捕捉し、安全側（`resolve_next_agent` は
+  「上書きなし」・`next_turn_agent` のフォールバックは `None`）へ倒して `logger.debug` に記録する
+  （Failsafe の `last_agent` 解決と同一方針）
+- SDK 前提（run ごとの wrapper 新規生成・記録と参照の間のインスタンス同一性・handoff 有効性のステップ毎
+  評価・無効 handoff のモデル非提示）は SDK バージョン耐性トリップワイヤの監視対象に含める
+- `RunContextWrapper` インスタンスを利用者が自作して複数 run で再利用する形は非対応（記録が run を跨ぐ）。
+  HITL 承認再開（resume）時の上書き・`RealtimeRunner` / `RealtimeSession` はスコープ外
+- 次ターン開始エージェント Y 側の handoff 構成には制限を掛けない。次ターンで再び X へハンドオフされた
+  場合も、X 到達時に禁止が再度働く
+
 ## ワークフロー
 
 ワークフロー機能は実験的（experimental）であり、インターフェース・挙動は今後変わる可能性がある。
@@ -754,7 +886,9 @@ checkpoint）も持たない。
   （条件 fan-out でリスト返しした時点）の両方で明示的に拒否する（fail-fast）。session はノード単位の
   `run_options` では設定できない（グラフ既定でのみ握り、並列ガードの判定軸を一本化する）。
 - マルチターン継続は `RunResult` 駆動とし、lib は継続 / 再開状態を持たない。利用者は
-  `Runner.run(result.last_agent, result.to_input_list() + 新入力, context=...)` で継続する。経路C の
+  `Runner.run(result.last_agent, result.to_input_list() + 新入力, context=...)` で継続する。この開始
+  エージェント選択を宣言で上書きする手段は「Next-Turn Agent Override（次ターン開始エージェントの宣言的
+  上書き）」節を参照。経路C の
   ワークフローは外から見て 1 Agent であるため `last_agent` はワークフロー Agent 自身を指し、次ターンは
   ワークフローの再実行になる（途中再開はしない）。
 - ステートレスなコア（registry / workflow）と、会話状態（SDK `Session`）を保持する会話サービス（上位の
