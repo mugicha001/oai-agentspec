@@ -354,7 +354,9 @@ def _validate_prohibition_wiring(
     登録済みの全名に対する静的な over-approximation であり、その factory 登録が X への
     handoff を実際に持つとは限らない（factory の中身は build するまで分からないため、
     エッジの有無を宣言から判定できない）。無関係な factory 登録があるだけで禁止の宣言全体を
-    落とすのは過剰なため、`logger.warning` で 1 回警告して適用は通す。
+    落とすのは過剰なため、`logger.warning` で 1 回警告して適用は通す。この警告が名指しする
+    禁止対象は、当該 factory 登録を遷移元に持つ流入エッジの遷移先だけに絞る（到達元限定の
+    ルールで禁止が付かない X は、他の遷移元経由で禁止が効いていても名指ししない）。
 
     検証対象は禁止の実現に spec 登録が必要な名前だけで、次ターン指定のみのルール
     （`registry.get(Y)` で解決するだけ）は factory 登録でも従来どおり通す。
@@ -394,14 +396,16 @@ def _validate_prohibition_wiring(
     # explicit は上の raise で既に落ちているため、ここでは常に空（差集合は不要）。
     implicit = {src for src, _ in arrivals} & factories
     if implicit:
+        affected = sorted({dst for src, dst in arrivals if src in implicit})
         logger.warning(
             "next-turn policy: 包括ルールの到達元候補にファクトリ登録のエージェント %s が"
-            "含まれます（禁止対象: %s）。これらのエージェントが実際に禁止対象へ handoff する"
-            "場合、到達記録を合成できないためそのターンの禁止は効きません。確実に効かせるには"
-            "当該エージェントを AgentSpec 登録へ変更するか、ルールの source で到達元を "
-            "spec 登録のエージェントに限定してください",
+            "含まれます（当該ファクトリ登録からの到達で効かなくなりうる禁止対象: %s）。"
+            "これらのエージェントが実際に禁止対象へ handoff する場合、到達記録を合成できない"
+            "ためそのターンの禁止は効きません。確実に効かせるには当該エージェントを "
+            "AgentSpec 登録へ変更するか、ルールの source で到達元を spec 登録のエージェントに"
+            "限定してください",
             sorted(implicit),
-            sorted(gated),
+            affected,
         )
 
 
