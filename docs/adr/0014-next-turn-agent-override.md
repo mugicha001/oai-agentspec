@@ -220,8 +220,9 @@ build-don't-run の逸脱には当たらず、逸脱一覧（現行 2 関数）�
 - SDK 前提（run ごとの wrapper 新規生成・記録と参照の間のインスタンス同一性・到達ターン内での
   ステップ毎再評価・streaming 同経路・無効 handoff のモデル非提示・agent-as-tool 子 wrapper の非干渉）の
   強制手段: `tests/_adapters/` 配下の SDK 前提 pin テスト（バージョン耐性トリップワイヤ）。
-- registry フック（判定表に基づく per-edge 合成・素 append の Handoff 昇格・`clone` 継承・freeze ガード）の
-  強制手段: `tests/test_registry.py` の該当テスト。
+- registry フック（判定表に基づく per-edge 合成・素 append の Handoff 昇格・`clone` 継承・
+  設置プリミティブの freeze ガードと `_built` 破棄）の強制手段:
+  `tests/_adapters/test_next_turn_registry_l2.py`（合成を設置しない既定経路は `tests/test_registry.py`）。
 - SDK 隔離の強制手段: SDK 隔離 grep（`grep -rnE "(from agents|import agents)" src/oai_agentspec/ |
   grep -v _adapters` が空であること）。
 - 上記のうちテストで表現する保証は `docs/QUALITY-GUARANTEES.md` に source = ADR-0014 として登録する。

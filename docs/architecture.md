@@ -637,10 +637,15 @@ X のエントリから発動ルールを選ぶ規則は解決（`resolve_next_a
   arity はエッジの `input_type` 有無に合わせて 1 引数形 / 2 引数形を build 時に選択する（SDK の署名検証に
   合わせるため）。SDK が生成した `Handoff` オブジェクトの事後書き換えは行わない
 - **ゲート**: X の全出辺の `is_enabled` に記録参照ゲートを AND 合成する（記録済みなら `False`、そうで
-  なければ既存 `is_enabled` の評価へ委譲）。ゲートは closure が捕捉した X の名前で判定する
+  なければ既存 `is_enabled` の評価へ委譲）。ゲートは closure が捕捉した X の名前で判定する。委譲は SDK の
+  `get_handoffs` と同じ規則で行い、`bool` はその値を採り、それ以外は `(ctx, agent)` で呼び出す。したがって
+  bool でも callable でもない誤宣言は SDK と同じく run 時の `TypeError` になる（合成が SDK の検証を隠さない）
 - **昇格**: 判定表に載るエッジのうち Agent 実体を直接 append する経路のものは、build 時に `make_handoff`
   経由の `Handoff` オブジェクトへ昇格させる（SDK は直 append 経路の handoff を毎ステップ内部生成するため
-  合成の差し込み口が無い）。`make_handoff` は指定フィールドのみを渡すため既定挙動は変わらない
+  合成の差し込み口が無い）。`make_handoff` は指定フィールドのみを渡すため宣言に対する既定挙動は変わらない。
+  ただし昇格したエッジの `Handoff` は build 時にスナップショットされる（直 append 経路は毎ステップ再生成
+  されるため、build 後に SDK の `Agent` オブジェクトを直接書き換えた場合の反映有無が両経路で異なる。
+  宣言の変更は `registry.update` を通す）
 - **registry 側の契約**: 静的エッジ結線と動的エッジ生成の 2 フックで per-edge 合成を行い、`clone` は判定表と
   記録ストアを共有継承する（記録は run 単位に分離されるため共有で安全・継承しないと clone 経由で禁止が
   静かに脱落する）。合成の設置は freeze ガード付きの内部プリミティブ経由で、frozen な元 registry にも
@@ -681,6 +686,9 @@ X のエントリから発動ルールを選ぶ規則は解決（`resolve_next_a
   評価・無効 handoff のモデル非提示）は SDK バージョン耐性トリップワイヤの監視対象に含める
 - `RunContextWrapper` インスタンスを利用者が自作して複数 run で再利用する形は非対応（記録が run を跨ぐ）。
   HITL 承認再開（resume）時の上書き・`RealtimeRunner` / `RealtimeSession` はスコープ外
+- 判定表は `apply_next_turn_policy` 時点の登録名で静的展開するため、適用後に派生 registry へ登録した
+  エージェントからの到達は禁止の対象外になる（昇格も記録も入らない）。ファクトリ登録が build 時
+  `ValueError` で拒否されるのと異なり合図が無いため、policy の適用は全登録の完了後に行う
 - 次ターン開始エージェント Y 側の handoff 構成には制限を掛けない。次ターンで再び X へハンドオフされた
   場合も、X 到達時に禁止が再度働く
 
