@@ -1249,3 +1249,45 @@ def test_apply_next_turn_policy_spec登録のみなら禁止を宣言できる()
     wiring = derived._next_turn
     assert wiring is not None
     assert wiring.gated == frozenset({"billing"})
+
+
+def test_apply_next_turn_policy_警告はその到達元から効かない禁止対象だけを名指しする(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """警告が名指しするのは、当該ファクトリ登録を遷移元とする流入エッジの禁止対象だけ。
+
+    ファクトリ登録 tech から流入するエッジは `(tech, billing)` のみで、`(tech, triage)` は
+    存在しない（triage への到達元は billing / triage のみ）。tech の到達記録を合成できない
+    ことで実際に禁止が効かなくなりうるのは billing だけであり、triage の禁止は tech とは
+    無関係に spec 登録の遷移元経由で効く。したがって警告に triage を含めてはならない
+    （禁止対象の全体 = gated をそのまま列挙すると、無関係な triage まで名指しして
+    利用者に不要な調査を強いる）。
+    """
+    registry = _make_registry_with_factory("tech")
+    policy = NextTurnPolicy(
+        rules={
+            "billing": NextTurnRule(no_handoff_on_arrival=True),
+            "triage": [
+                NextTurnRule(next_agent="billing", source="tech"),
+                NextTurnRule(no_handoff_on_arrival=True),
+            ],
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger=NEXT_TURN_LOGGER_NAME):
+        derived = apply_next_turn_policy(policy, registry)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "tech" in message
+    assert "billing" in message
+    assert "triage" not in message
+    # 引数レベルでも固定する（部分一致だけだと余分な要素の混入を「triage が無い」に
+    # 依存して検出する形になるため）。
+    assert warnings[0].args == (["tech"], ["billing"])
+
+    # 警告の対象を絞っても、禁止対象そのもの（gated）は狭めない。
+    wiring = derived._next_turn
+    assert wiring is not None
+    assert wiring.gated == frozenset({"billing", "triage"})
