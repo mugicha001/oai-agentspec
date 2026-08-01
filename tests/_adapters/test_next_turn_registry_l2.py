@@ -165,6 +165,58 @@ def test_元registryの結線は昇格しない() -> None:
     assert registry.get("billing").handoffs[0] is registry.get("tech")
 
 
+def _keep_all(data: Any) -> Any:
+    """per-edge の `input_filter`（run では呼ばれないため identity で足りる）。"""
+    return data
+
+
+_PER_EDGE = HandoffConfig(
+    description="次担当へ引き継ぐ",
+    tool_name="to_next",
+    input_filter=_keep_all,
+    options={"nest_handoff_history": True},
+)
+"""on_handoff / is_enabled 以外の全 per-edge フィールドを埋めた設定（保持を pin する対象）。
+
+`dataclasses.replace(base, **changes)` は on_handoff / is_enabled だけを差し替える設計の
+ため、この 4 フィールドが変異で落ちても既存スイートは検知できない（`/pr-review` が実測）。
+"""
+
+
+async def test_記録を前置しても他のper_edge設定は保持される() -> None:
+    """判定表に載る流入エッジでも、記録合成は記録対象外の per-edge フィールドを保つ。"""
+    registry = _make_registry(triage_options={"billing": _PER_EDGE})
+    derived = apply_next_turn_policy(_PROHIBIT_BILLING, registry)
+    edge = derived.get("triage").handoffs[0]
+
+    assert isinstance(edge, Handoff)
+    assert edge.tool_description == "次担当へ引き継ぐ"
+    assert edge.tool_name == "to_next"
+    assert edge.input_filter is _keep_all
+    assert edge.nest_handoff_history is True
+
+    ctx: RunContextWrapper[Any] = RunContextWrapper(context=None)
+    await _arrive(edge, ctx)
+
+    assert (
+        await _is_enabled(derived.get("billing").handoffs[0], ctx, derived.get("billing")) is False
+    )
+
+
+def test_ゲート合成でも他のper_edge設定は保持される() -> None:
+    """判定表に載る出辺でも、ゲート合成はゲート対象外の per-edge フィールドを保つ。"""
+    registry = _make_registry(billing_options={"tech": _PER_EDGE})
+    derived = apply_next_turn_policy(_PROHIBIT_BILLING, registry)
+    edge = derived.get("billing").handoffs[0]
+
+    assert isinstance(edge, Handoff)
+    assert edge.tool_description == "次担当へ引き継ぐ"
+    assert edge.tool_name == "to_next"
+    assert edge.input_filter is _keep_all
+    assert edge.nest_handoff_history is True
+    assert callable(edge.is_enabled)
+
+
 # ---------------------------------------------------------------------------
 # 到達記録とゲート評価（run 内一時状態）
 # ---------------------------------------------------------------------------
@@ -556,6 +608,31 @@ async def test_frozenな元registryの派生でも禁止は実際に効く() -> 
 
 
 # ---------------------------------------------------------------------------
+# 設置プリミティブの契約（freeze ガード / `_built` 破棄）
+# ---------------------------------------------------------------------------
+
+
+def test_設置プリミティブは_frozen後はRegistryFrozenErrorになる() -> None:
+    """`_install_next_turn_state` はプリミティブ単体でも freeze ガードを持つ（ADR 0014）。"""
+    registry = _make_registry()
+    registry.freeze()
+    derived = apply_next_turn_policy(_PROHIBIT_BILLING, registry)
+
+    with pytest.raises(RegistryFrozenError, match="_install_next_turn_state"):
+        derived._install_next_turn_state(derived._next_turn)  # noqa: SLF001
+
+
+def test_設置プリミティブは構築済みAgentを破棄する() -> None:
+    """再設置は `_built` を破棄し、次回 `get()` で合成前の結線を持つ Agent を作り直させない。"""
+    derived = apply_next_turn_policy(_PROHIBIT_BILLING, _make_registry())
+    before = derived.get("triage")
+
+    derived._install_next_turn_state(derived._next_turn)  # noqa: SLF001
+
+    assert derived.get("triage") is not before
+
+
+# ---------------------------------------------------------------------------
 # ファクトリ登録への禁止宣言は build 時に拒否する（silent no-op の防止）
 # ---------------------------------------------------------------------------
 
@@ -798,3 +875,62 @@ def test_記録対象エッジの正しいon_handoff宣言は従来どおり受�
     derived = apply_next_turn_policy(_PROHIBIT_BILLING, registry)
 
     assert isinstance(derived.get("triage").handoffs[0], Handoff)
+
+
+# ---------------------------------------------------------------------------
+# 利用者宣言 is_enabled の誤りは run 時評価で落とす（合成が SDK の検証を隠さない）
+#
+# `is_enabled` は build 時に検証されない（SDK も lib も型を見ない）ため、誤宣言は run 時の
+# 評価で初めて落ちる。ゲート合成が「bool でも callable でもない値」を静かに真偽値へ丸めると、
+# 禁止を宣言したエッジだけ例外が消える非対称になる。
+# ---------------------------------------------------------------------------
+
+
+_BAD_IS_ENABLED = HandoffConfig(is_enabled=1)
+"""bool でも callable でもない `is_enabled`（利用者の誤宣言）。
+
+SDK（`turn_preparation`）は `isinstance(attr, bool)` 以外を無条件に `attr(ctx, agent)` で
+呼ぶため、この宣言は run 時評価で `TypeError` になるのが基準挙動。
+"""
+
+
+async def test_誤宣言のis_enabledの例外型は禁止対象エッジと判定表外エッジで一致する() -> None:
+    """同一の `is_enabled` 誤宣言は、禁止を宣言してもしなくても同じ例外型で run 時に落ちる。
+
+    型が変わる（あるいは例外が消える）と、無関係な禁止ルールを足しただけで利用者の誤宣言が
+    黙って True/False に丸められ、判定表外エッジだけ `TypeError` になる非対称が生じる。
+    基準は SDK が `is_enabled` を呼ぶ形に由来する `TypeError` で、派生クラスでの一致に
+    緩めないよう型の同一性で比較する。
+    """
+    options = {"tech": _BAD_IS_ENABLED}
+    gated = apply_next_turn_policy(_PROHIBIT_BILLING, _make_registry(billing_options=options))
+    plain = _make_registry(billing_options=options)
+
+    gated_edge = gated.get("billing").handoffs[0]
+    plain_edge = plain.get("billing").handoffs[0]
+    ctx: RunContextWrapper[Any] = RunContextWrapper(context=None)
+
+    with pytest.raises(TypeError) as gated_exc:
+        await _is_enabled(gated_edge, ctx, gated.get("billing"))
+    with pytest.raises(TypeError) as plain_exc:
+        await _is_enabled(plain_edge, ctx, plain.get("billing"))
+
+    assert type(gated_exc.value) is type(plain_exc.value)
+    assert str(gated_exc.value) == str(plain_exc.value)
+
+
+async def test_到達記録済みなら誤宣言のis_enabledを評価せずFalseになる() -> None:
+    """短絡（記録済みなら既存宣言を評価しない）は誤宣言があっても不変。
+
+    到達後は既存 `is_enabled` を評価しないため、誤宣言でも `TypeError` にはならず False。
+    誤宣言を SDK と同じく呼ぶようにしても、この優先順位が壊れないことを pin する。
+    """
+    gated = apply_next_turn_policy(
+        _PROHIBIT_BILLING, _make_registry(billing_options={"tech": _BAD_IS_ENABLED})
+    )
+    gated_edge = gated.get("billing").handoffs[0]
+    ctx: RunContextWrapper[Any] = RunContextWrapper(context=None)
+
+    await _arrive(gated.get("triage").handoffs[0], ctx)
+
+    assert await _is_enabled(gated_edge, ctx, gated.get("billing")) is False

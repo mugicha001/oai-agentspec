@@ -15,8 +15,9 @@ pin する前提:
    複数 run で再利用する形が非対応である構造的根拠）。
 2. 記録と参照が同一 wrapper を受け取る: `get_handoffs(agent, context_wrapper)` は
    `is_enabled` を `(context_wrapper, agent)` で呼び、`execute_handoffs` は同じ
-   `context_wrapper` を引数に取る。`Handoff.on_invoke_handoff` は受け取った wrapper を
-   `on_handoff` へそのまま渡す。
+   `context_wrapper` を（fork や per-tool-call の派生インスタンスへ差し替えず）
+   `Handoff.on_invoke_handoff` へ渡し、`on_invoke_handoff` はそれを `on_handoff` へ
+   そのまま渡す。同一性は署名検査ではなく `execute_handoffs` の実駆動で確認する。
 3. handoff 有効性のステップ毎評価: `get_handoffs` は callable の `is_enabled` を毎回評価する。
 4. 無効 handoff のモデル非提示: `get_handoffs` の戻り値から除外される。
 5. `handoff()` の on_handoff 署名検証: `input_type` の有無で要求される引数個数が 1 / 2 に
@@ -36,11 +37,14 @@ import weakref
 from typing import Any
 
 import pytest
-from agents import Agent, Handoff, RunContextWrapper, handoff
+from agents import Agent, Handoff, RunConfig, RunContextWrapper, RunHooks, Usage, handoff
 from agents.exceptions import UserError
+from agents.items import ModelResponse
 from agents.run_internal.agent_runner_helpers import ensure_context_wrapper
+from agents.run_internal.run_steps import NextStepHandoff, ToolRunHandoff
 from agents.run_internal.turn_preparation import get_handoffs
 from agents.run_internal.turn_resolution import execute_handoffs
+from openai.types.responses import ResponseFunctionToolCall
 from pydantic import BaseModel
 
 pytestmark = pytest.mark.integration
@@ -133,10 +137,66 @@ async def test_sdk_get_handoffsは呼び出しのたびにis_enabledを評価す
     assert calls == ["evaluated", "evaluated"]
 
 
-def test_sdk_execute_handoffsはcontext_wrapperを引数に取る() -> None:
-    """記録（on_handoff）側と参照（is_enabled）側が同じ run の wrapper を受け取る構造の pin。"""
+def test_sdk_execute_handoffsとget_handoffsのcontext_wrapper引数名を固定する() -> None:
+    """引数名・引数順の pin（同一性そのものは次の実駆動テストが検証する）。
+
+    キーワード引数名が変わると本機能の合成が渡す先を失うため、名前自体も検知対象に置く。
+    """
     assert "context_wrapper" in inspect.signature(execute_handoffs).parameters
     assert list(inspect.signature(get_handoffs).parameters) == ["agent", "context_wrapper"]
+
+
+async def test_sdk_execute_handoffsはis_enabledと同一wrapperをon_handoffへ渡す() -> None:
+    """SDK 実関数を駆動し、ゲート参照側と到達記録側が受け取る wrapper の同一性（`is`）を pin。
+
+    `no_handoff_on_arrival` は「`on_handoff` が書いたキー」を「`is_enabled` が読む」ことで
+    成立する。SDK が `on_invoke_handoff` へ per-tool-call の派生 wrapper（`RunContextWrapper`
+    のサブクラスを fork したもの等）を渡すようになると、型エラーも例外も出ないまま記録先と
+    参照先のキーがずれて禁止が静かに機能停止する。署名検査では通り抜けるため、`execute_handoffs`
+    を実際に呼び、`context_wrapper` に渡したインスタンスがそのまま `on_handoff` へ届くことを
+    確認する。
+    """
+    gate_seen: list[Any] = []
+    record_seen: list[Any] = []
+
+    def _is_enabled(ctx: Any, agent: Any) -> bool:
+        gate_seen.append(ctx)
+        return True
+
+    def _on_handoff(ctx: Any) -> None:
+        record_seen.append(ctx)
+
+    built = handoff(Agent(name="billing"), on_handoff=_on_handoff, is_enabled=_is_enabled)
+    owner = Agent(name="triage")
+    owner.handoffs = [built]
+    wrapper: RunContextWrapper[Any] = RunContextWrapper(context=None)
+
+    await get_handoffs(owner, wrapper)
+    tool_call = ResponseFunctionToolCall(
+        id="fc_next_turn",
+        type="function_call",
+        call_id="call_next_turn",
+        name=built.tool_name,
+        arguments="{}",
+    )
+    result = await execute_handoffs(
+        public_agent=owner,
+        original_input="hi",
+        pre_step_items=[],
+        new_step_items=[],
+        new_response=ModelResponse(output=[tool_call], usage=Usage(), response_id=None),
+        run_handoffs=[ToolRunHandoff(handoff=built, tool_call=tool_call)],
+        hooks=RunHooks(),
+        context_wrapper=wrapper,
+        run_config=RunConfig(),
+    )
+
+    assert isinstance(result.next_step, NextStepHandoff)
+    assert result.next_step.new_agent.name == "billing"
+    assert len(gate_seen) == 1
+    assert len(record_seen) == 1
+    assert gate_seen[0] is wrapper
+    assert record_seen[0] is wrapper
 
 
 async def test_sdk_on_invoke_handoffは受け取ったwrapperをon_handoffへ渡す() -> None:
