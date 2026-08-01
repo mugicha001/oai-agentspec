@@ -17,8 +17,7 @@ from ._validation import validate_instructions_callable
 from .spec import AgentSpec, HandoffConfig
 
 if TYPE_CHECKING:
-    from ._adapters import Agent
-    from ._adapters.next_turn import NextTurnWiring
+    from ._adapters import Agent, NextTurnWiring
     from .protocols import AgentBuilder
 
 AgentFactory = Callable[["AgentRegistry"], "Agent"]
@@ -116,6 +115,10 @@ class AgentRegistry:
         よい（apply が触るのはコンテナと spec オブジェクト自体）。factory 登録は spec 実体を持た
         ないため変換・コピー対象外で、ファクトリ関数をそのまま引き継ぐ。登録順（`entry_name` の
         基準）と builder は引き継ぐ。`_built` キャッシュは引き継がない（新 registry で再構築）。
+        Next-Turn Agent Override の結線一式（判定表 + 到達記録ストア）は共有継承する（記録は
+        run 単位に分離されるため共有で安全・継承しないと clone 経由で禁止が静かに脱落する）。
+        分離は SDK が run ごとに context wrapper を生成する前提で成立する。利用者が同一
+        `RunContextWrapper` を複数 run へ渡した場合は記録が残るが、禁止が残る方向（安全側）。
 
         評価（LLMOps）で「利用者 registry を一切汚さずに tools をモック化した派生 registry」を
         作るための宣言層プリミティブ。`transform_spec` には plain な `AgentSpec -> AgentSpec` を

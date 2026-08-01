@@ -210,9 +210,9 @@ def resolve_next_agent(policy: NextTurnPolicy, result: Any) -> str | None:
     Returns:
         上書き先のエージェント名（Y）。上書きが発動しない場合は None。
     """
-    from ._adapters.next_turn import extract_turn_observation
+    from . import _adapters
 
-    observation = extract_turn_observation(result)
+    observation = _adapters.extract_turn_observation(result)
     last_agent = observation.last_agent
     if last_agent is None or not observation.handoffs:
         return None
@@ -256,12 +256,12 @@ def next_turn_agent(policy: NextTurnPolicy, result: Any, registry: AgentRegistry
     Raises:
         KeyError: 上書き先 Y が registry に登録されていない場合（registry から伝播する）。
     """
-    from ._adapters.next_turn import read_last_agent
+    from . import _adapters
 
     name = resolve_next_agent(policy, result)
     if name is not None:
         return registry.get(name)
-    return read_last_agent(result)
+    return _adapters.read_last_agent(result)
 
 
 def _declared_names(policy: NextTurnPolicy) -> set[str]:
@@ -391,7 +391,8 @@ def _validate_prohibition_wiring(
             "当該ルールの no_handoff_on_arrival を外してください）"
         )
 
-    implicit = ({src for src, _ in arrivals} & factories) - explicit
+    # explicit は上の raise で既に落ちているため、ここでは常に空（差集合は不要）。
+    implicit = {src for src, _ in arrivals} & factories
     if implicit:
         logger.warning(
             "next-turn policy: 包括ルールの到達元候補にファクトリ登録のエージェント %s が"
@@ -449,7 +450,7 @@ def apply_next_turn_policy(policy: NextTurnPolicy, registry: AgentRegistry) -> A
             いる場合、または registry が既に判定表（到達時ハンドオフ禁止の結線）を保持して
             いる場合。
     """
-    from ._adapters.next_turn import ArrivalStore, NextTurnWiring
+    from . import _adapters
 
     if registry._next_turn is not None:  # noqa: SLF001 - registry の内部状態の参照
         raise ValueError(
@@ -472,7 +473,7 @@ def apply_next_turn_policy(policy: NextTurnPolicy, registry: AgentRegistry) -> A
     derived = registry.clone()
     if arrivals:
         derived._install_next_turn_state(  # noqa: SLF001 - registry の内部プリミティブへの委譲
-            NextTurnWiring(arrivals=arrivals, gated=gated, store=ArrivalStore())
+            _adapters.NextTurnWiring(arrivals=arrivals, gated=gated, store=_adapters.ArrivalStore())
         )
     # 完全性（freeze）は派生へ引き継ぐ。設置は freeze ガード付きプリミティブを通るため、
     # 設置を終えてから freeze する。
