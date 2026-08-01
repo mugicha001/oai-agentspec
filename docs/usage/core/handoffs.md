@@ -14,7 +14,7 @@
 | `graph.dynamic_edge(src, candidates, resolver, tool_name=...)` | resolver 関数が候補内から実行時選択 | 入力に応じて候補内で分岐 |
 | 循環 edge（A → B / B → A） | 遅延構築で相互解決 | 状態遷移的な会話ループ |
 
-より広い（handoff vs agent-as-tool vs WorkflowGraph の）使い分けは [multi_agent](./multi_agent.md) を参照。
+より広い（handoff vs agent-as-tool vs WorkflowGraph の）使い分けは [multi_agent](./multi_agent.md) を参照。ハンドオフ後の次ターン開始エージェントを宣言で上書きする（到達時ハンドオフ禁止を含む）方法は [next_turn](./next_turn.md) を参照。
 
 ## 使い方
 

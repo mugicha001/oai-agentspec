@@ -89,6 +89,16 @@ from .models import (
     WorkflowModel,
     workflow_as_tool,
 )
+from .next_turn import (
+    ArrivalStore,
+    NextTurnWiring,
+    TurnObservation,
+    extract_turn_observation,
+    make_arrival_gate,
+    make_arrival_recorder,
+    read_last_agent,
+    validate_recorded_edge_declaration,
+)
 from .resilience import build_model_retry, build_run_budget_hooks
 from .responses import (
     _completed_event as _completed_event,
@@ -194,6 +204,15 @@ __all__ = [
     "register_dataset_items",
     "fetch_dataset_items",
     "observe_run_result",
+    # Next-Turn Agent Override（run 完了結果からの plain 観測抽出・SDK 型を外へ出さない）
+    "ArrivalStore",
+    "NextTurnWiring",
+    "TurnObservation",
+    "extract_turn_observation",
+    "make_arrival_gate",
+    "make_arrival_recorder",
+    "read_last_agent",
+    "validate_recorded_edge_declaration",
     # Agent Lightning（APO 最適化の単一窓口・agentlightning はトップ非 import）
     "run_apo",
     "judge_score",

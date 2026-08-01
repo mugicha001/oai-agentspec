@@ -13,6 +13,13 @@ from .integrity import (
     PromptTemplateIntegrityError,
     lockdown,
 )
+from .next_turn import (
+    NextTurnPolicy,
+    NextTurnRule,
+    apply_next_turn_policy,
+    next_turn_agent,
+    resolve_next_agent,
+)
 from .prompts import PromptLayout, PromptStore, PromptTemplate, dynamic_prompt
 from .registry import AgentRegistry, RegistryFrozenError
 from .spec import AgentSpec, HandoffConfig, SandboxAgentSpec
@@ -46,6 +53,8 @@ __all__ = [
     "HandoffGraph",
     "IntegrityCheck",
     "IntegrityError",
+    "NextTurnPolicy",
+    "NextTurnRule",
     "NodeFn",
     "NodeHook",
     "NodeResults",
@@ -60,11 +69,14 @@ __all__ = [
     "ToolSpec",
     "WorkflowFrozenError",
     "WorkflowGraph",
+    "apply_next_turn_policy",
     "default_input_filter",
     "dynamic_prompt",
     "from_specs",
     "function_tool",
     "lockdown",
+    "next_turn_agent",
+    "resolve_next_agent",
 ]
 
 

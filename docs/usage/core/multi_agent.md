@@ -20,6 +20,7 @@
 - 静的 / 動的 handoff → [handoffs](./handoffs.md)
 - agent as tool → [agents](./agents.md) の `sub_agents`
 - WorkflowGraph → [workflow](./workflow.md)
+- ハンドオフ後の次ターン開始エージェントの上書き（到達時ハンドオフ禁止を含む） → [next_turn](./next_turn.md)
 
 本ページは使い分けの集約表のみを提供します（各手段のパラメータ表は担当ページに記載）。
 
