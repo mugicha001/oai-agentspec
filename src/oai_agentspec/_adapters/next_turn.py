@@ -434,8 +434,19 @@ def make_arrival_gate(
     第 2 引数の内容には依存しない（所有側 Agent が渡る実装に依存しないため）。
 
     当該 run で X へ到達済みなら既存 `is_enabled` を**評価せずに** False を返す（短絡）。
-    未到達なら既存へ委譲し、既存が bool ならその値、callable なら `(ctx, agent)` を同一
-    オブジェクトのまま渡した評価結果（awaitable なら await した結果）を返す。
+    未到達なら既存へ委譲する。委譲の規則は SDK の `get_handoffs` をそのまま写し、
+    `isinstance(existing_is_enabled, bool)` ならその値を返し、**それ以外は `callable()` を
+    見ずに** `(ctx, agent)` を同一オブジェクトのまま渡して呼ぶ（呼んだ結果（awaitable なら
+    await した結果）を bool へ変換して返す）。
+
+    `is_enabled` は SDK の `handoff()` が build 時に一切検証しない（生値をそのまま格納する）
+    ため、bool でも callable でもない誤宣言は build を通り run 時の評価で `TypeError` になる。
+    合成側で `bool()` へ丸めると同じ誤宣言が禁止を宣言したエッジだけ例外にならない非対称が
+    生じるため、SDK と同じ規則・同じ例外型・同じタイミングで落とす（`_validate_user_on_handoff`
+    と同じ方針）。
+
+    ただし到達記録済みの短絡は既存宣言を評価しないため、誤宣言でもこの経路では例外にならず
+    False を返す（短絡の優先順位は誤宣言の有無に依存しない）。
 
     Args:
         store: 到達記録ストア（記録側と共有する）。
@@ -443,14 +454,16 @@ def make_arrival_gate(
         existing_is_enabled: 既存の `is_enabled` 宣言（bool または `(ctx, agent)` callable）。
 
     Returns:
-        SDK の `is_enabled` として渡せる合成 callable（2 引数）。
+        SDK の `is_enabled` として渡せる合成 callable（2 引数）。返された callable は
+        未到達かつ既存宣言が bool でも callable でもない場合に `TypeError` を送出する
+        （SDK が `is_enabled` を呼ぶ形に由来する run 時の失敗）。
     """
 
     async def _gate(ctx: Any, agent: Any) -> bool:
         if store.has_arrived(ctx, agent_name):
             return False
-        if not callable(existing_is_enabled):
-            return bool(existing_is_enabled)
+        if isinstance(existing_is_enabled, bool):
+            return existing_is_enabled
         outcome = existing_is_enabled(ctx, agent)
         if inspect.isawaitable(outcome):
             outcome = await outcome
