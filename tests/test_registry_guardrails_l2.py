@@ -674,6 +674,98 @@ def test_non_str問題行は値を含めて要素ごとに区別できる() -> N
     assert "2 番目" in lines[1]
 
 
+def test_validateはspec2件以上のguardrail問題行を登録順で全件集約する() -> None:
+    """問題を持つ spec が複数あるとき、全 spec 分の問題行が spec 登録順で列挙される（R6）。
+
+    集約は外側の spec ループと内側の宣言ループの 2 段で、単一 spec の構成だけでは外側ループを
+    制約できない。「最初に問題が出た spec で打ち切る」「登録順を反転する」変異が素通りするため、
+    2 spec に問題を置いて行順（spec 登録順・spec 内は宣言順）ごと完全一致で pin する。
+    """
+    provider = _provider(("tool_pii", Boundary.TOOL_OUTPUT))
+    reg = _registry(provider)
+    reg.register(AgentSpec(name="triage", instructions="i", guardrails=["x", _entity("direct")]))
+    reg.register(AgentSpec(name="billing", instructions="i", guardrails=["tool_pii", "y"]))
+
+    with pytest.raises(KeyError) as exc:
+        reg.validate()
+
+    billing_tool_line = (
+        "'billing' の guardrail 参照 'tool_pii' はツール境界（tool_output）のため "
+        "Agent へ振り分けできません"
+    )
+    billing_unknown_line = "'billing' の guardrail 参照 'y' が未登録"
+    assert exc.value.args[0] == "guardrail 参照の問題: " + "; ".join(
+        [_UNKNOWN_LINE, _non_str_line(2), billing_tool_line, billing_unknown_line]
+    )
+
+
+def test_validateはgetだけがKeyErrorを上げるproviderでも未登録を検出する() -> None:
+    """`boundary_of` が正常に答えても `get` が `KeyError` なら未登録として報告する（R7）。
+
+    集約器は `get` の戻り値を捨てるため、既存の provider ヘルパ（`get` が例外を上げない）では
+    `provider.get(name)` の 1 行を削除しても全テストが通る。片側だけ解決できる非対称 provider
+    を注入して、実体不在の検出が失われないことを pin する。
+    """
+
+    class _EntityMissingProvider:
+        """`get` だけが `KeyError` を上げ、`boundary_of` は agent 境界を正常に返す provider。"""
+
+        def get(self, name: str) -> Any:
+            """実体を保持していないため常に `KeyError`。"""
+            raise KeyError(name)
+
+        def boundary_of(self, name: str) -> str:
+            """境界だけは解決できると答える（`get` と非対称）。"""
+            return "input"
+
+    reg = _registry(_EntityMissingProvider())
+    reg.register(AgentSpec(name="triage", instructions="i", guardrails=["x"]))
+
+    with pytest.raises(KeyError) as exc:
+        reg.validate()
+    assert exc.value.args[0] == "guardrail 参照の問題: " + _UNKNOWN_LINE
+
+
+@pytest.mark.parametrize("position", [1, 2])
+def test_build経路の非str問題行は宣言リスト内の位置を示す(position: int) -> None:
+    """build 経路の非 str `ValueError` も位置表示（`N 番目`）を含む（R8）。
+
+    2 要素宣言の 1 番目 / 2 番目それぞれで完全一致を取るため、位置の受け渡し欠落（常に位置なし）
+    と `enumerate` の開始値ずれの双方を検知できる。
+    """
+    provider = _provider(("gr", Boundary.INPUT))
+    reg = _registry(provider)
+    declared: list[Any] = ["gr", "gr"]
+    declared[position - 1] = _entity("gr")
+    reg.register(AgentSpec(name="triage", instructions="i", guardrails=declared))
+
+    with pytest.raises(ValueError) as exc:
+        reg.get("triage")
+    assert str(exc.value) == _non_str_line(position)
+
+
+def test_非strとprovider未注入が同時成立しても非strを先に報告する() -> None:
+    """provider 未注入 + 非 str 要素では「非 str」が報告される（検証順の pin・R9）。
+
+    順序が入れ替わると、実体を直入れした利用者へ「`AgentRegistry(guardrail_registry=...)` で
+    注入してください」という誤った是正案（注入しても直らない）が出る。build 経路と `validate()`
+    経路の双方で同時成立させ、`uninjected` 行にならないことを押さえる。
+    """
+    reg = _registry()
+    reg.register(AgentSpec(name="triage", instructions="i", guardrails=[_entity("gr")]))
+
+    with pytest.raises(ValueError) as build_exc:
+        reg.get("triage")
+    assert str(build_exc.value) == _non_str_line(1)
+    assert "guardrail_registry" not in str(build_exc.value)
+
+    with pytest.raises(KeyError) as validate_exc:
+        reg.validate()
+    message = validate_exc.value.args[0]
+    assert message == "guardrail 参照の問題: " + _non_str_line(1)
+    assert "guardrail_registry" not in message
+
+
 def test_extraへguardrailsを渡すと専用フィールド衝突として拒否される() -> None:
     """`extra={"guardrails": ...}` が専用フィールドとの衝突として `ValueError`（P2）。
 

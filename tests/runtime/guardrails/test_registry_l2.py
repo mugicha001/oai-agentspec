@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import re
 from typing import Any
 
 import pytest
@@ -150,6 +151,144 @@ def _invoke_facade(
     raise AssertionError(f"未知の facade メソッド: {method}")
 
 
+# ----------------------------------------------------------------------
+# 引数転送の照合用（非既定値の payload と factory へ渡るべき `(args, kwargs)`）
+# ----------------------------------------------------------------------
+
+#: 引数転送テストで使う登録名（期待値テーブルと呼び出しで共有する）。
+_SPY_NAME = "g"
+
+#: 転送を照合する payload（同一性 / 等価性で factory 側へ届いたことを判定できる値を使う）。
+_MODEL = object()
+_PROMPT = "judge prompt"
+_PATTERNS = (r"\d{3}-\d{4}", r"secret")
+_CANARY = ("CANARY-1", "CANARY-2")
+_DENY = ("bad", "worse")
+_ALLOW = ("ok",)
+_EXTRA_PATTERNS = (r"eval\(",)
+_REASON = "理由"
+
+
+def _verdict(text: str) -> Detection:
+    """judge 出力の解釈関数（`prompt_llm_guardrail` の `verdict` DI 転送の照合用）。"""
+    return Detection(triggered=False)
+
+
+def _invoke_with_non_defaults(reg: GuardrailRegistry, method: str, name: str) -> GuardrailSpec:
+    """facade を全引数「非既定値」で呼ぶ（factory へ届く値を照合するためのディスパッチャ）。
+
+    既定値と一致する値で呼ぶと「引数の転送を落として factory 既定に任せる」変異が素通りするため、
+    転送対象の引数はすべて既定と異なる値（`run_in_parallel=False` / `flags=re.IGNORECASE` 等）を
+    渡す。`labels` / `severity` も渡し、これらが factory へ**漏れない**ことも同時に照合できる形に
+    する（期待 kwargs に含めないため、渡っていれば不一致で落ちる）。
+
+    Args:
+        reg: 対象の登録簿。
+        method: facade メソッド名。
+        name: 登録名。
+
+    Returns:
+        facade の戻り値（`GuardrailSpec`）。
+    """
+    extra: dict[str, Any] = {"labels": {"team": "sec"}, "severity": Severity.LOW}
+    if method == "prompt_llm_guardrail":
+        return reg.prompt_llm_guardrail(
+            _MODEL,
+            _PROMPT,
+            on="input",
+            verdict=_verdict,
+            name=name,
+            run_in_parallel=False,
+            **extra,
+        )
+    if method == "canary_guardrail":
+        return reg.canary_guardrail(_CANARY, name=name, **extra)
+    if method == "predicate_guardrail":
+        return reg.predicate_guardrail(
+            _never, on="input", reason=_REASON, name=name, run_in_parallel=False, **extra
+        )
+    if method == "regex_guardrail":
+        return reg.regex_guardrail(
+            _PATTERNS, on="input", flags=re.IGNORECASE, name=name, run_in_parallel=False, **extra
+        )
+    if method == "length_guardrail":
+        return reg.length_guardrail(
+            max_length=10, min_length=2, on="input", name=name, run_in_parallel=False, **extra
+        )
+    if method == "allow_deny_guardrail":
+        return reg.allow_deny_guardrail(
+            deny=_DENY,
+            allow=_ALLOW,
+            case_sensitive=False,
+            on="input",
+            name=name,
+            run_in_parallel=False,
+            **extra,
+        )
+    if method == "injection_baseline_guardrail":
+        return reg.injection_baseline_guardrail(
+            _EXTRA_PATTERNS, name=name, run_in_parallel=False, **extra
+        )
+    if method == "external_detector_guardrail":
+        return reg.external_detector_guardrail(
+            _detect, on="input", name=name, run_in_parallel=False, **extra
+        )
+    if method == "tool_guardrail":
+        return reg.tool_guardrail(_detect, on="input", on_trip="raise", name=name, **extra)
+    raise AssertionError(f"未知の facade メソッド: {method}")
+
+
+#: `_invoke_with_non_defaults` の各 facade 呼び出しで対応 factory が受けるべき `(args, kwargs)`。
+#:
+#: facade 固有の `labels` / `severity` は factory へ渡らない契約のため意図的に含めない（渡って
+#: いれば `==` 照合が不一致で落ちる）。`name` は可視名注入のため渡る。
+_EXPECTED_FACTORY_CALLS: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
+    "prompt_llm_guardrail": (
+        (_MODEL, _PROMPT),
+        {"on": "input", "verdict": _verdict, "name": _SPY_NAME, "run_in_parallel": False},
+    ),
+    "canary_guardrail": ((_CANARY,), {"name": _SPY_NAME}),
+    "predicate_guardrail": (
+        (_never,),
+        {"on": "input", "reason": _REASON, "name": _SPY_NAME, "run_in_parallel": False},
+    ),
+    "regex_guardrail": (
+        (_PATTERNS,),
+        {"on": "input", "flags": re.IGNORECASE, "name": _SPY_NAME, "run_in_parallel": False},
+    ),
+    "length_guardrail": (
+        (),
+        {
+            "max_length": 10,
+            "min_length": 2,
+            "on": "input",
+            "name": _SPY_NAME,
+            "run_in_parallel": False,
+        },
+    ),
+    "allow_deny_guardrail": (
+        (),
+        {
+            "deny": _DENY,
+            "allow": _ALLOW,
+            "case_sensitive": False,
+            "on": "input",
+            "name": _SPY_NAME,
+            "run_in_parallel": False,
+        },
+    ),
+    "injection_baseline_guardrail": (
+        (_EXTRA_PATTERNS,),
+        {"name": _SPY_NAME, "run_in_parallel": False},
+    ),
+    "external_detector_guardrail": (
+        (_detect,),
+        {"on": "input", "name": _SPY_NAME, "run_in_parallel": False},
+    ),
+    "tool_guardrail": ((_detect,), {"on": "input", "on_trip": "raise", "name": _SPY_NAME}),
+}
+
+
 # ======================================================================
 # A. facade 経路（生成 + 登録 + 境界導出）
 # ======================================================================
@@ -277,6 +416,19 @@ def test_facadeのname値域外はValueErrorで登録されない(name: Any) -> 
     assert reg.names() == []
 
 
+@pytest.mark.parametrize("method", FACADE_METHODS)
+def test_facadeの戻り値はmetadataと同一インスタンス(method: str) -> None:
+    """facade 9 件の戻り値は登録された宣言そのもの（`metadata()` と `is` 一致）。
+
+    `register` 経路の同一性は別テストで押さえているが、facade 経路は未 pin だった。等価な copy
+    （`replace(spec)` 等）を返す変異は等価比較では素通りし、利用者が戻り値の `labels` を更新しても
+    登録簿へ反映されない silent な不整合になるため `is` で pin する。
+    """
+    reg = GuardrailRegistry()
+    spec = _invoke_facade(reg, method, "g")
+    assert spec is reg.metadata("g")
+
+
 @pytest.mark.parametrize("severity", ["high", 3, object()])
 def test_facadeのseverity値域外はValueErrorで登録されない(severity: Any) -> None:
     """`Severity` メンバでも None でもない `severity` は `ValueError`（登録は空のまま）。
@@ -295,8 +447,21 @@ def test_facadeのseverity値域外はValueErrorで登録されない(severity: 
 # ======================================================================
 
 
-def _install_spy(monkeypatch: pytest.MonkeyPatch, method: str) -> list[Any]:
-    """`factories.<method>` を戻り値を記録する同期 spy へ差し替え、記録先を返す。
+class _SpyLog(list[Any]):
+    """spy が返した値を積むリスト（`calls` に `(args, kwargs)` を併記する）。
+
+    戻り値の列としては素の list と同じ振る舞い（`len` / 添字）を保ち、引数の記録だけを属性で
+    足す（戻り値ベースの既存検証を壊さないため）。
+    """
+
+    def __init__(self) -> None:
+        """空の記録を作る。"""
+        super().__init__()
+        self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+
+def _install_spy(monkeypatch: pytest.MonkeyPatch, method: str) -> _SpyLog:
+    """`factories.<method>` を引数と戻り値を記録する同期 spy へ差し替え、記録先を返す。
 
     実体は退避した本物の factory の戻り値を返すため、facade の後段（登録・検証）は
     本番と同じ経路を通る。
@@ -306,18 +471,20 @@ def _install_spy(monkeypatch: pytest.MonkeyPatch, method: str) -> list[Any]:
         method: 差し替える factory 名。
 
     Returns:
-        spy が返した値を呼び出し順に積むリスト（長さが呼び出し回数）。
+        spy が返した値を呼び出し順に積む `_SpyLog`（長さが呼び出し回数。`calls` に
+        `(args, kwargs)` を同じ順で保持する）。
     """
     original = getattr(factories, method)
-    returned: list[Any] = []
+    log = _SpyLog()
 
     def spy(*args: Any, **kwargs: Any) -> Any:
+        log.calls.append((args, dict(kwargs)))
         result = original(*args, **kwargs)
-        returned.append(result)
+        log.append(result)
         return result
 
     monkeypatch.setattr(factories, method, spy)
-    return returned
+    return log
 
 
 @pytest.mark.parametrize("method", ["canary_guardrail", "regex_guardrail"])
@@ -334,6 +501,69 @@ def test_facadeはfactoriesのモジュール属性経由で1回だけ代理呼�
     _invoke_facade(reg, method, "g")
     assert len(returned) == 1
     assert reg.get("g") is returned[0]
+
+
+@pytest.mark.parametrize("method", FACADE_METHODS)
+def test_facadeは利用者が渡した検知設定をそのまま対応factoryへ転送する(
+    monkeypatch: pytest.MonkeyPatch, method: str
+) -> None:
+    """facade 9 件は受け取った検知設定（payload）を欠落・改変せず対応 factory へ渡す。
+
+    可視名・境界・登録の一致だけを見る他テストは「利用者の正規表現 / canary / 検知器を捨てて
+    別の値で生成する」変異（`patterns` を固定文字列へ差し替える・`run_in_parallel` の転送を
+    落とす等）を検知できない。この状態の guardrail は登録簿から見て正常（登録済み・境界一致・
+    可視名一致）のまま、宣言した検知を一切行わない silent no-op へ退行する。
+
+    `(args, kwargs)` 全体を `==` で照合することで、値の差し替えと引数の欠落・余剰を同時に
+    押さえる。期待 kwargs には facade 固有の `labels` / `severity` を含めない（factory へ渡らない
+    契約なので、渡していれば不一致で落ちる）。`name` は可視名注入のため factory へ渡る。
+
+    引数の照合だけでは「factory を正しい引数で呼びつつ、登録するのは同じ可視名・同じ境界の
+    別実体（never-trip）」という変異が生存する。登録された実体が factory の戻り値そのもので
+    あることを `is` で併せて押さえ、実体差し替えレベルの silent no-op も 9 件全件で閉じる。
+    """
+    log = _install_spy(monkeypatch, method)
+    reg = GuardrailRegistry()
+    _invoke_with_non_defaults(reg, method, _SPY_NAME)
+    assert len(log.calls) == 1
+    assert log.calls[0] == _EXPECTED_FACTORY_CALLS[method]
+    assert reg.get(_SPY_NAME) is log[0]
+
+
+# ======================================================================
+# B2. facade 生成物の検知挙動（宣言した検知内容で trip する）
+# ======================================================================
+
+
+async def test_facade生成のcanaryは宣言した漏洩トークンを含む出力でtripする() -> None:
+    """`canary_guardrail` facade で登録した実体は、宣言した canary を含む出力で trip する。
+
+    引数転送の照合（spy）と対にして、facade 経路の guardrail が実際に宣言どおり検知することを
+    上流 SDK の駆動 API（`run`）越しに pin する（canary 値を捨てる変異の behavioral な kill）。
+    trip 側だけでは「常に trip」も通るため、非該当出力で trip しないことも併せて押さえる。
+    """
+    reg = GuardrailRegistry()
+    spec = reg.canary_guardrail("CANARY-XYZ", name="canary")
+    tripped = await spec.guardrail.run(
+        context=None, agent=None, agent_output="oops CANARY-XYZ leaked"
+    )
+    assert tripped.output.tripwire_triggered is True
+    clean = await spec.guardrail.run(context=None, agent=None, agent_output="clean output")
+    assert clean.output.tripwire_triggered is False
+
+
+async def test_facade生成のregexは宣言パターンに一致する入力でtripする() -> None:
+    """`regex_guardrail` facade で登録した実体は、宣言した正規表現に一致する入力で trip する。
+
+    利用者の `patterns` を捨てて別パターンで生成する変異を behavioral に kill する（非該当入力で
+    trip しないことも押さえ、「常に trip」への退行と区別する）。
+    """
+    reg = GuardrailRegistry()
+    spec = reg.regex_guardrail(r"\d{3}-\d{4}", on="input", name="phone")
+    tripped = await spec.guardrail.run(agent=None, input="call 123-4567", context=None)
+    assert tripped.output.tripwire_triggered is True
+    clean = await spec.guardrail.run(agent=None, input="no digits here", context=None)
+    assert clean.output.tripwire_triggered is False
 
 
 # ======================================================================
@@ -653,6 +883,18 @@ def test_boundary_ofは文字列として比較でき未登録はKeyError() -> N
     assert "missing" in str(exc.value)
 
 
+def test_boundary_ofの実返却はBoundaryメンバである() -> None:
+    """`boundary_of()` は素の str ではなく `Boundary` メンバを返す（実返却型の pin）。
+
+    `Boundary` は `str` 併用なので `== "output"` は素の str でも成立し、注釈の検査（別テスト）は
+    実装が注釈どおり返しているかを見ない。`Boundary(...).value` を返す変異は両方を素通りし、
+    利用者の `is Boundary.OUTPUT` / `match` による分岐が静かに外れるため `is` で押さえる。
+    """
+    reg = GuardrailRegistry()
+    reg.register(_spec("g", Boundary.OUTPUT))
+    assert reg.boundary_of("g") is Boundary.OUTPUT
+
+
 def test_specsは名前昇順で要素はmetadataと同一インスタンス() -> None:
     """`specs()` は名前昇順で、各要素は `metadata()` と `is` 一致する。"""
     reg = GuardrailRegistry()
@@ -811,12 +1053,19 @@ def test_run_config_kwargsの検証順は要素の型が名前解決より先() 
         reg.run_config_kwargs(["missing", 123])
 
 
-def test_run_config_kwargsの検証順は名前解決が境界検査より先() -> None:
-    """未登録名とツール境界名が混在したら名前解決由来の `KeyError` になる。"""
+@pytest.mark.parametrize("names", [["missing", "t_out"], ["t_out", "missing"]])
+def test_run_config_kwargsの検証順は名前解決が境界検査より先(names: list[str]) -> None:
+    """未登録名とツール境界名が混在したら名前解決由来の `KeyError` になる（並び順に依らない）。
+
+    段 2/3 を入れ替えると境界検査ループ内の `self._specs[item]` が素の `KeyError` を上げ、型だけ
+    見る検査では素通りする。`_unknown_guardrail_message` 由来の文言（`unknown guardrail`）まで
+    照合し、かつ違反要素の並びを反転したケースも通すことで「入力順に依存しない決定的な例外型」
+    という契約ごと pin する。
+    """
     reg = GuardrailRegistry()
     reg.register(_spec("t_out", Boundary.TOOL_OUTPUT))
-    with pytest.raises(KeyError):
-        reg.run_config_kwargs(["missing", "t_out"])
+    with pytest.raises(KeyError, match="unknown guardrail"):
+        reg.run_config_kwargs(names)
 
 
 def test_run_config_kwargsはツール境界名の明示をValueErrorで拒否する() -> None:
@@ -882,6 +1131,33 @@ def test_例外文言は登録名をreprで埋め込む() -> None:
     with pytest.raises(ValueError) as dup:
         reg.predicate_guardrail(_never, on="input", name="dup")
     assert "'dup'" in str(dup.value)
+
+
+def test_未登録名の文言は登録済み一覧を昇順で併記する() -> None:
+    """未登録名の `KeyError` は `registered guardrails: <登録名一覧>` を含む（診断文言の契約）。
+
+    既存の未登録名検査は参照名の部分一致しか見ておらず、一覧部分を落として
+    `f"unknown guardrail: {name!r}"` だけにする変異が素通りする。登録名一覧は利用者が typo を
+    自力で特定する唯一の手がかりなので、昇順 + `, ` 連結の形まで押さえる（ソート・区切りを崩す
+    変異も同時に kill する）。
+    """
+    reg = GuardrailRegistry()
+    reg.predicate_guardrail(_never, on="input", name="b_second")
+    reg.predicate_guardrail(_never, on="input", name="a_first")
+    with pytest.raises(KeyError) as exc:
+        reg.get("missing")
+    assert "registered guardrails: a_first, b_second" in str(exc.value)
+
+
+def test_登録が空なら未登録名の文言は一覧をnoneと表示する() -> None:
+    """登録が 1 件もない登録簿の未登録名エラーは一覧を `(none)` と表示する。
+
+    一覧が空文字になると `registered guardrails: ` で行が途切れ、「登録簿が空」と「一覧の生成に
+    失敗」を利用者が区別できない。空文字ではなく明示のプレースホルダを出す契約を pin する。
+    """
+    with pytest.raises(KeyError) as exc:
+        GuardrailRegistry().get("missing")
+    assert "registered guardrails: (none)" in str(exc.value)
 
 
 def test_registerは可視名取得の失敗をValueErrorへ包む() -> None:
