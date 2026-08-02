@@ -143,9 +143,12 @@ frozen が禁じるのは属性の再代入のみで、`labels` は `dict` の�
 
 ## Confirmation
 
-強制手段は `docs/QUALITY-GUARANTEES.md` に登録した 2 行（source = ADR-0015）が指すテストである。
+強制手段は `docs/QUALITY-GUARANTEES.md` に登録した 5 行（source = ADR-0015）が指すテストである。
 
 - facade メソッド集合が同梱 factory と一致し、シグネチャが許容差分 3 点のみで同期していること
-- 分類データのキー集合が「同梱 helper 識別子 − 分類が DI 依存の helper」と一致し、docs 分類表の framework ラベルと一致していること
+- 分類データのキー集合が「同梱 helper 識別子 − 分類が DI 依存の helper」と一致していること
+- facade 経路で宣言される適用境界が、生成された実体から判定した境界と一致していること
+- 名前参照が `AgentRegistry` 経由の build でのみ解決され、registry を経由しない build 経路は例外で拒否すること
+- docs 分類表の列構成・framework ラベル列・「利用者が宣言」の行集合がコード側の分類データと一致していること
 
 上流 SDK 結合点の 4 前提はバージョン耐性トリップワイヤのテストで pin する。個別の assert とテスト名はテストの docstring を一次情報とし、本 ADR には列挙しない。

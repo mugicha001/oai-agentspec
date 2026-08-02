@@ -162,7 +162,7 @@ if canary_detector(CANARY)(webhook_body).triggered:
 
 ## helper の framework 分類と既定危険度
 
-登録簿が自動付与する既定値の一覧です。**本表は `HELPER_DEFAULTS`（コードが SoT）の投影です。**機械可読データが必要な場合は表を書き写さず `HELPER_DEFAULTS` を import してください（現時点では表とコードの照合は手動で、自動検知はありません）。
+登録簿が自動付与する既定値の一覧です。**本表は `HELPER_DEFAULTS`（コードが SoT）の投影です。**機械可読データが必要な場合は表を書き写さず `HELPER_DEFAULTS` を import してください。表の列構成（見出し行の 5 列）・framework ラベル列・「利用者が宣言」の行集合はテストでコード側と双方向に照合されます。既定危険度列・適用境界列・備考列のセル値は照合対象に含めません（既定危険度を除外する理由は `docs/adr/0015-declarative-guardrail-registry.md` を参照）。
 
 | helper 識別子 | 適用境界 | framework ラベル | 既定危険度 | 備考 |
 |---|---|---|---|---|
