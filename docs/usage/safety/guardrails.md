@@ -78,6 +78,25 @@ guardrails.tool_guardrail(my_detector, on="output", name="tool_pii")
 guarded = function_tool(_my_func, tool_output_guardrails=[guardrails.get("tool_pii")])
 ```
 
+### セッション単位で入れ直す（カナリア等）
+
+カナリートークンのようにセッション毎に値を入れ替えるものは、共有の登録簿へ固定値として載せず、**セッション毎に登録簿を作り直して run 単位で渡します**。登録簿は宣言の保持に徹しており、登録済みの guardrail を差し替えるメソッドを持ちません（同名の再登録は `ValueError`）。名前は固定のまま、実体の生成だけをセッション境界へ寄せる形になります。
+
+```python
+def session_guardrails(canary: str) -> GuardrailRegistry:
+    reg = GuardrailRegistry()
+    reg.canary_guardrail([canary], name="session_canary")
+    return reg
+
+per_session = session_guardrails(issue_new_canary())
+cfg = RunConfig(**per_session.run_config_kwargs())
+result = await Runner.run(registry.get("assistant"), input=text, run_config=cfg)
+```
+
+`AgentSpec.guardrails` の名前参照は build 時に解決されて Agent へ焼き付くため、値が入れ替わるものには向きません。`AgentRegistry` は構築済み Agent をキャッシュするので、解決元が返す実体を差し替えても `update()` で invalidate するまで反映されません。セッションを跨いで固定のもの（注入検知のベースライン・固定の禁止語彙・長さ上限）は名前参照で宣言し、入れ替えるものは run 単位に置く、という切り分けになります。
+
+解決元そのものを差し替える経路（`GuardrailProvider` の自作実装を `AgentRegistry(guardrail_registry=...)` へ注入する）も取れますが、構築済み Agent への反映に `update()` が必要になるため、値だけを入れ替えたい用途では run 単位のほうが単純です。
+
 ### 危険度と一覧
 
 危険度は `low` < `medium` < `high` < `critical` の順序を持ちます（未宣言は順序比較の対象外）。監査や UI 表示のために登録済みの宣言を一覧で取り出せます。
@@ -189,6 +208,8 @@ if canary_detector(CANARY)(webhook_body).triggered:
 - LLM 判定系は追加レイテンシとコスト。頻度の低い最終段に限定する
 - 既定 `INJECTION_BASELINE_PATTERNS` は最小構成。プロダクションでは DI で組織固有パターンを追加する
 - `run_in_parallel=True`（既定）だと trip 前にモデルがツールを呼びうる。実行前ブロックが要るなら `False` または tool ガードを併用
+- `RunConfig` へ渡した**入力** guardrail は初回ターンの入力にしか掛からない（上流が最初のターンに限定している）。毎ターンの入力を検査したいものは Agent 単位で宣言する。出力 guardrail にはこの制約がなく、ハンドオフ先が最終出力を出しても評価される
+- `run_config_kwargs()` を引数なしで呼ぶと登録全件が対象になり、ツール境界の登録が 1 件でも混ざっていれば `ValueError` になる（静かに除外しない）。混在させる場合は対象名を明示する
 
 ## 参照
 
