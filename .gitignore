@@ -38,3 +38,6 @@ sample_code/
 
 # agent-lightning AgentOps tracer がカレントに吐く実行時ログ（session replay URL を含む）
 agentops.log
+
+# OS が生成するファイル（ディレクトリの表示設定を保持し内容と無関係）
+.DS_Store

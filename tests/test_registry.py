@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+import oai_agentspec.protocols
 from oai_agentspec import (
     AgentRegistry,
     AgentSpec,
@@ -12,7 +15,7 @@ from oai_agentspec import (
     RegistryFrozenError,
 )
 from oai_agentspec.next_turn import NextTurnPolicy, NextTurnRule, apply_next_turn_policy
-from oai_agentspec.protocols import AgentBuilder
+from oai_agentspec.protocols import AgentBuilder, GuardrailProvider
 
 from _helpers.fake_builder import FakeAgent, FakeAgentBuilder
 
@@ -25,6 +28,54 @@ def make_registry() -> tuple[AgentRegistry, FakeAgentBuilder]:
 def test_fake_builder_satisfies_agent_builder_protocol() -> None:
     """DI 拡張点 AgentBuilder（runtime_checkable Protocol）の構造的適合を担保する。"""
     assert isinstance(FakeAgentBuilder(), AgentBuilder)
+
+
+class _FakeGuardrailProvider:
+    """GuardrailProvider の 2 照会のみを実装した最小の provider。"""
+
+    def get(self, name: str) -> object:
+        return object()
+
+    def boundary_of(self, name: str) -> str:
+        return "input"
+
+
+class _ProviderWithoutBoundaryOf:
+    """`boundary_of` を欠いた provider（Protocol の必須メソッド集合を pin するための不足側）。"""
+
+    def get(self, name: str) -> object:
+        return object()
+
+
+class _ProviderWithoutGet:
+    """`get` を欠いた provider（同上）。"""
+
+    def boundary_of(self, name: str) -> str:
+        return "input"
+
+
+def test_fake_provider_satisfies_guardrail_provider_protocol() -> None:
+    """DI 拡張点 GuardrailProvider（runtime_checkable Protocol）の構造的適合を担保する。"""
+    assert isinstance(_FakeGuardrailProvider(), GuardrailProvider)
+
+
+def test_guardrail_provider_requires_both_queries() -> None:
+    """2 照会のいずれかを欠く実装は Protocol を充足しない（必須メソッドの過小側を pin）。"""
+    assert not isinstance(_ProviderWithoutBoundaryOf(), GuardrailProvider)
+    assert not isinstance(_ProviderWithoutGet(), GuardrailProvider)
+
+
+def test_guardrail_provider_declares_exactly_two_queries() -> None:
+    """Protocol の宣言メンバは get / boundary_of の 2 つのみ。
+
+    集合の `==` で pin する（照会の追加 = 過大と削除 = 過小の両方向を同時に検知するため。
+    `>=` や個別メンバの存在確認へ弱めると、登録簿固有の照会を Protocol へ持ち上げる変更を
+    見逃す）。
+
+    宣言メンバの列挙に `typing` の非公開属性 `__protocol_attrs__` を使う。廃止・改名された
+    場合は `AttributeError` で fail するので、追従要否の判断ポイントとして機能する。
+    """
+    assert set(GuardrailProvider.__protocol_attrs__) == {"get", "boundary_of"}
 
 
 def test_register_duplicate_raises() -> None:
@@ -652,3 +703,17 @@ def test_next_turn_判定表を持たないregistryのcloneは従来どおり() 
 
     assert cloned.get("triage").handoffs == [cloned.get("billing")]
     assert isinstance(cloned.get("triage").handoffs[0], FakeAgent)
+
+
+def test_protocols_モジュールは実装型を参照しない() -> None:
+    """`protocols.py` が `agents` / `runtime` 配下の実装型を import しない（NFR-1 / NFR-2）。
+
+    Protocol の戻り値注釈に `Boundary` / `GuardrailSpec` を用いると、コア層から
+    `runtime/guardrails` への依存辺が生じて単方向依存が崩れる。ソース上の import 文で pin する。
+    """
+    # `__file__` 欠落時のフォールバックは置かない（空文字にすると全 assert が vacuous に通る）。
+    source = Path(oai_agentspec.protocols.__file__).read_text(encoding="utf-8")
+    assert "from agents" not in source
+    assert "import agents" not in source
+    assert "oai_agentspec.runtime" not in source
+    assert ".runtime" not in source
