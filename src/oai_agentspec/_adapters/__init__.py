@@ -69,6 +69,8 @@ from .guardrails import (
     build_output_guardrail,
     build_tool_input_guardrail,
     build_tool_output_guardrail,
+    guardrail_boundary,
+    guardrail_visible_name,
     run_judge_prompt,
 )
 from .judge import (
@@ -225,6 +227,8 @@ __all__ = [
     "build_tool_input_guardrail",
     "build_tool_output_guardrail",
     "attach_tool_guardrails",
+    "guardrail_visible_name",
+    "guardrail_boundary",
     "run_judge_prompt",
     # AGT ガバナンス（ツール単位ポリシー強制 + 監査の SDK/AGT 結合窓口・AGT はトップ非 import）
     "govern_spec",

@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from ._adapters import Agent
@@ -44,4 +44,48 @@ class AgentBuilder(Protocol):
         ...
 
 
-__all__ = ["AgentBuilder"]
+@runtime_checkable
+class GuardrailProvider(Protocol):
+    """名前から guardrail を解決する責務（DI 注入点）。
+
+    `AgentSpec.guardrails` に宣言された名前を実体へ解決し、宣言された適用境界を答える。
+    `AgentRegistry` は build 時にこの 2 照会だけを使い、解決元の実装型には触れない。
+
+    照会を 2 つに絞り、戻り値を plain（不透明型と str）に閉じているのは、コア層から
+    `runtime/guardrails` への依存辺を作らないためである。境界の値域型や宣言型を戻り値の
+    型注釈に用いると、コア層が実装型を参照して単方向依存が崩れる。
+
+    登録簿が持つ他の照会（宣言 1 件の取得・一覧・危険度）は本 Protocol の契約に含めない。
+    自作の解決元へ実装を要求せず、必要な利用者が登録簿を直接使う形にする。
+    """
+
+    def get(self, name: str) -> Any:
+        """登録名から guardrail 実体を返す。
+
+        Args:
+            name: 解決する guardrail 名。
+
+        Returns:
+            SDK 互換の guardrail 実体（不透明型として扱う）。
+
+        Raises:
+            KeyError: name が未登録の場合。
+        """
+        ...
+
+    def boundary_of(self, name: str) -> str:
+        """登録名から宣言された適用境界を返す。
+
+        Args:
+            name: 解決する guardrail 名。
+
+        Returns:
+            適用境界の文字列（`"input"` / `"output"` / `"tool_input"` / `"tool_output"`）。
+
+        Raises:
+            KeyError: name が未登録の場合。
+        """
+        ...
+
+
+__all__ = ["AgentBuilder", "GuardrailProvider"]

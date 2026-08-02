@@ -381,6 +381,54 @@ def attach_tool_guardrails(
     return _dataclass_replace(tool, **changes)
 
 
+def guardrail_visible_name(guardrail: Any) -> str:
+    """guardrail の上流 SDK 可視名（トレース等に表示される名前）を返す（NFR-1）。
+
+    上流 4 型はいずれも `get_name()` を持ち、生成時に渡した `name` があればそれを、無ければ
+    guardrail 関数名を返す。登録簿はこの値を登録キーとの照合に用いるため、可視名の取得経路を
+    本関数 1 箇所へ寄せて `agents` 型の参照を `_adapters` に閉じる。
+
+    Args:
+        guardrail: 上流 SDK 互換の guardrail 実体。
+
+    Returns:
+        `get_name()` の戻り値を `str()` で文字列化した値。
+
+    Raises:
+        AttributeError: `get_name()` を持たない実体を渡した場合、または上流 4 型の
+            インスタンスでも `name` が未設定で `guardrail_function` が `__name__` を持たない
+            場合（`functools.partial` / `__call__` を持つオブジェクト等）。上流 4 型の
+            `get_name()` は `name or guardrail_function.__name__` 相当のため、境界判定
+            （`guardrail_boundary`）を通った実体でも後者は起こりうる。
+    """
+    return str(guardrail.get_name())
+
+
+def guardrail_boundary(guardrail: Any) -> str | None:
+    """guardrail の実体型から適用境界の文字列を判定する（NFR-1）。
+
+    上流 4 型は相互に継承関係を持たない別型として分離されており、`isinstance` で一意に
+    判別できる。宣言された境界との突合や、上流 guardrail 型でない実体の拒否に用いる。
+
+    Args:
+        guardrail: 判定対象。上流 SDK 互換の guardrail 実体を想定する。
+
+    Returns:
+        `"input"` / `"output"` / `"tool_input"` / `"tool_output"` のいずれか。上流 4 型の
+        いずれのインスタンスでもない場合は `None`（境界を推測せず、呼び出し側が拒否できる形
+        にする）。
+    """
+    if isinstance(guardrail, InputGuardrail):
+        return "input"
+    if isinstance(guardrail, OutputGuardrail):
+        return "output"
+    if isinstance(guardrail, ToolInputGuardrail):
+        return "tool_input"
+    if isinstance(guardrail, ToolOutputGuardrail):
+        return "tool_output"
+    return None
+
+
 async def run_judge_prompt(model: Any, prompt: str, content: str) -> str:
     """判定 model を SDK Runner 経由で 1 ターン実行し判定テキストを返す（prompt 駆動 LLM・NFR-1）。
 
