@@ -2,6 +2,9 @@
 
 型で build 経路を分岐する:
     - `AgentSpec`    -> `_adapters.build_agent(spec)` 直接（registry 不要・handoffs 空）。
+      ただし `guardrails`（名前参照）を宣言した spec は明示 `ValueError` で拒否する。
+      名前参照の解決元は `AgentRegistry` が持つため本経路では解決できず、silent に落とすと
+      「宣言した検査が存在しない対象」を最適化してしまう。
     - `HandoffGraph` -> registry 必須（spec 実体を持たないため）。`graph.apply(registry)` で
       エッジ反映 → `entry_agent(registry)`。
     - `WorkflowGraph`-> `as_agent_spec(name, registry=registry)` -> `build_agent`。
@@ -89,13 +92,26 @@ def normalize(
 
     Raises:
         TypeError: 未対応の target 型の場合（許容型を列挙）。
-        ValueError: HandoffGraph に registry が供給されていない場合。
+        ValueError: HandoffGraph に registry が供給されていない場合、または単体
+            `AgentSpec` の target が `guardrails`（名前参照）を宣言している場合
+            （本経路では解決元を持たず、silent に落とすと宣言した検査が無い対象を最適化
+            してしまうため）。
     """
     from ..._adapters import build_agent, mock_spec_tools
 
     mocks = tool_mocks or {}
 
     if isinstance(target, AgentSpec):
+        if target.guardrails:
+            # 名前参照の解決元（`GuardrailProvider`）は `AgentRegistry` が持つため、registry を
+            # 経由しない本経路では解決できない。silent に落とすと「宣言した検査が存在しない
+            # 対象」を測ってしまうので fail-closed にする（OWASP LLM09 の過剰依存を避ける）。
+            raise ValueError(
+                f"AgentSpec {target.name!r} の guardrails 名前参照 {target.guardrails!r} は "
+                "AgentRegistry 経由の build でのみ解決されます。単体 AgentSpec を target に"
+                "する場合は input_guardrails / output_guardrails へ実体を渡すか、registry を"
+                "受け取る HandoffGraph / WorkflowGraph を target にしてください"
+            )
         spec, replaced = mock_spec_tools(target, mocks.get(target.name, {}))
         return build_agent(spec), frozenset(replaced)
 

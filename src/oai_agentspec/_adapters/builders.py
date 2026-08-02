@@ -47,6 +47,9 @@ _DEDICATED_AGENT_KWARGS = frozenset(
         "hooks",
         "input_guardrails",
         "output_guardrails",
+        # 名前参照フィールド。`Agent` の kwarg ではないが、専用フィールドとの衝突として
+        # 検知するため列挙する（上流に `Agent.guardrails` が追加されても二重に渡らない）。
+        "guardrails",
     }
 )
 

@@ -119,6 +119,9 @@ class AgentSpec:
             `runtime.guardrails` の factory が返す guardrail オブジェクト）。
         output_guardrails: 出力ガードレールのリスト（`agents.Agent.output_guardrails` と同型・
             `runtime.guardrails` の factory が返す guardrail オブジェクト）。
+        guardrails: ガードレールの**登録名**リスト（実体は registry が build 時に
+            `GuardrailProvider` で解決し、宣言境界に応じて `input_guardrails` /
+            `output_guardrails` へ連結する。連結順序は「専用フィールド -> 名前参照」）。
         handoffs: ハンドオフ先エージェント名リスト（グラフ連携）。
         handoff_options: dst 名 -> HandoffConfig の per-edge 設定。
         sub_agents: as_tool 配線するサブエージェント名リスト（グラフ連携）。
@@ -137,6 +140,7 @@ class AgentSpec:
     # kw_only: 既存フィールドの位置引数束縛を保つため（handoffs 等のズレ防止）。
     input_guardrails: list[Any] = field(default_factory=list, kw_only=True)
     output_guardrails: list[Any] = field(default_factory=list, kw_only=True)
+    guardrails: list[str] = field(default_factory=list, kw_only=True)
     handoffs: list[str] = field(default_factory=list)
     handoff_options: dict[str, HandoffConfig] = field(default_factory=dict)
     sub_agents: list[str] = field(default_factory=list)
