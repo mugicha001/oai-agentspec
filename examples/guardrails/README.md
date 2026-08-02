@@ -86,6 +86,10 @@ spec = AgentSpec(
 )
 ```
 
+guardrail を名前で参照したい場合（UI からの有効 / 無効切り替え・危険度つきの一覧・run 全体への一括適用）は
+`GuardrailRegistry` へ登録して `AgentSpec(guardrails=[...])` で宣言する。登録簿のメソッドは生成と登録を 1 回の
+呼び出しで行い、境界・framework ラベル・危険度の既定を入れる（使い方は `docs/usage/safety/guardrails.md`）。
+
 既存ツール（`as_tool` 等 `function_tool` で定義し直せないもの）へ**後付け**するときは `guard_tool`
 を使う。`guard_tool(my_tool, ...)` は `my_tool` と同名のガード済みコピーを返すので、**ガード版を
 `tools` に入れ、元の無防備な `my_tool` を `tools` に残さないこと**（残すと無防備ツール経由で
@@ -103,6 +107,22 @@ spec = AgentSpec(
 | `04_presidio_pii.py` | LLM02 | output / `external_detector_guardrail` | A（Presidio） | `presidio-analyzer` ほか |
 | `05_moderation_external.py` | LLM01/05 | input / `external_detector_guardrail` | A（モデレーション） | なし（openai は本体同梱） |
 | `06_tool_output_guardrail.py` | LLM02/05 | tool 出力 / `tool_guardrail` + `function_tool`（後付けは `guard_tool`） | C（regex）他 DI 可 | なし |
+| `07_guardrail_registry.py` | LLM01/02/07 | `Boundary` 4 値すべて / `GuardrailRegistry`（facade 9 + register 経路 + 名前参照 + run 単位） | A（DI 検知器）/ B（判定 LLM）/ C（6 種）+ 自作 | なし |
+
+`07` は登録簿（`GuardrailRegistry`）で「名前の強制・適用境界の宣言・分類メタデータの宣言・名前
+参照」を 1 本で通す例で、`oai_agentspec.runtime.guardrails` の公開シンボル 27 件・facade 9 件・
+照会 6 件すべてを実際に使う（4 フェーズ構成: 宣言と一覧 / 名前参照と `validate()`・`clone()`・
+`freeze()` / run 単位 / detector 単独利用と分類データとツール境界）。`01`〜`06` の**実体を
+フィールドへ直接渡す経路は現行のまま有効**で、登録簿はそれを置き換えるものではない（名前で
+照合したい・境界とメタデータを宣言として保持したい場合の追加経路）。`07` の各フェーズは
+`docs/usage/safety/guardrails.md` の「名前で参照する」「適用範囲を選ぶ」「危険度と一覧」
+「検知器を単独で使う」に対応する。
+
+facade は `on` から適用境界を導出する。framework ラベルと既定危険度が自動で付くのは、**分類が
+helper 名で一意に定まる 2 件**（`canary_guardrail` / `injection_baseline_guardrail`）に限る。残りの
+helper は検知の実体（パターン・述語・検知器・判定モデル）が利用者側にあるため分類が確定せず、
+`labels` / `severity` を渡さなければ空 dict / 未宣言のままになる（`specs(min_severity=...)` や
+labels フィルタの対象に入らない）。
 
 helper は OWASP に限定されず MITRE ATLAS / NIST AI RMF / 品質・ブランド系の内容検査にも適用できる
 （検知家族は framework 中立）。カバレッジマトリクスと選定根拠は
