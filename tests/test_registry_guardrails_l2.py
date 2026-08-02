@@ -15,7 +15,13 @@ import inspect
 from typing import Any
 
 import pytest
-from agents import Agent, RunConfig, Runner
+from agents import (
+    Agent,
+    OutputGuardrailTripwireTriggered,
+    RunConfig,
+    Runner,
+    function_tool,
+)
 from agents.sandbox import SandboxAgent
 
 from oai_agentspec import AgentRegistry, AgentSpec
@@ -32,6 +38,7 @@ from oai_agentspec.runtime.guardrails.types import Boundary, GuardrailSpec
 from oai_agentspec.spec import SandboxAgentSpec
 
 from _helpers.fake_model import FakeModel
+from _helpers.responses import tool_call_response
 
 pytestmark = pytest.mark.integration
 
@@ -545,6 +552,85 @@ async def test_run_config_kwargs_drives_runner_without_tripping() -> None:
     assert result.final_output == "ok"
     assert config.input_guardrails == [guardrails.get("never_in")]
     assert config.output_guardrails == [guardrails.get("never_out")]
+
+
+async def test_run_configの入力guardrailは初回ターンの入力にしか掛からない() -> None:
+    """`RunConfig` に載せた入力 guardrail は 2 ターン目の入力では評価されない（上流結合点の pin）。
+
+    上流 run loop は入力 guardrail の集合を「最初のターンかつ resume でないとき」に限って
+    組み立てる。`docs/usage/safety/guardrails.md` の案内（毎ターン検査したいものは Agent 単位で
+    宣言する）はこの前提に依存するため、上流が毎ターン評価する形へ変わったら気付く必要がある。
+
+    ターン数が実際に 2 であることを併せて assert する。上流がツール呼び出しで 2 ターン目へ
+    進まなくなると呼び出し回数 1 は自明に成立し、テストが緑のまま何も検証しなくなる（本テストは
+    上流の変異を注入して RED を確認できないため、空振りの排除を assert で担保する）。
+
+    照合は回数ではなく受け取った値の列（`["hi"]` = 初回入力のみ）で行う。上流が 2 ターン目でも
+    評価する形へ変わると、ツール結果を含む 2 件目が現れて不一致になる。
+
+    本テストが pin するのはライブラリ実装が依拠する結合点ではなく、docs の運用案内が依拠する
+    上流の評価タイミングである（`tests/_adapters/test_guardrails_l2.py` の NFR-5 の 4 前提とは
+    別カテゴリで、あの 4 件には数えない）。
+    """
+    seen: list[str] = []
+
+    def _record(text: str) -> bool:
+        seen.append(text)
+        return False
+
+    @function_tool
+    def echo(value: str) -> str:
+        """受け取った値をそのまま返す。"""
+        return value
+
+    guardrails = GuardrailRegistry()
+    guardrails.predicate_guardrail(_record, on="input", name="count_in")
+    model = FakeModel()
+    model.queue_tool_call("echo", '{"value": "x"}')
+    model.queue_text("done")
+    reg = _registry(guardrails)
+    reg.register(AgentSpec(name="a", instructions="i", model=model, tools=[echo]))
+    config = RunConfig(**guardrails.run_config_kwargs(["count_in"]))
+
+    result = await Runner.run(reg.get("a"), "hi", run_config=config)
+
+    assert result.final_output == "done"
+    assert len(model.calls) == 2, "2 ターン走っていないと呼び出し回数 1 が自明に成立する"
+    assert seen == ["hi"]
+
+
+async def test_run_configの出力guardrailはハンドオフ先の最終出力も検査する() -> None:
+    """`RunConfig` に載せた出力 guardrail はハンドオフ先が出した最終出力でも trip する。
+
+    上流 run loop は最終出力の検査で「そのターンのエージェント」の出力 guardrail と
+    `RunConfig` の出力 guardrail を連結する（起点エージェントではない）。run 全体へ一律に
+    掛けたい guardrail を run 単位で渡すという案内はこの前提に依存する。
+
+    ハンドオフ先が実際に応答したことを併せて assert する。委譲が起きず起点エージェントが
+    最終出力を出した場合も trip はするため、それだけでは「ハンドオフ先でも効く」ことの
+    検証にならない（空振りの排除）。
+
+    上のテストと同じく、pin する対象は docs の運用案内が依拠する上流の評価範囲であり、
+    NFR-5 の 4 前提には数えない。
+    """
+
+    def _trips_on_delegate_output(text: str) -> bool:
+        return "handled by b" in text
+
+    guardrails = GuardrailRegistry()
+    guardrails.predicate_guardrail(_trips_on_delegate_output, on="output", name="run_wide_out")
+    model_a = FakeModel()
+    model_a.responses.append(tool_call_response("transfer_to_b"))
+    model_b = FakeModel().queue_text("handled by b")
+    reg = _registry(guardrails)
+    reg.register(AgentSpec(name="a", instructions="i", model=model_a, handoffs=["b"]))
+    reg.register(AgentSpec(name="b", instructions="i", model=model_b))
+    config = RunConfig(**guardrails.run_config_kwargs(["run_wide_out"]))
+
+    with pytest.raises(OutputGuardrailTripwireTriggered):
+        await Runner.run(reg.get("a"), "hi", run_config=config)
+
+    assert model_b.calls, "ハンドオフ先が応答していないと起点側の出力で trip した可能性が残る"
 
 
 def test_run_config_accepts_empty_kwargs() -> None:
