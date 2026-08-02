@@ -33,6 +33,87 @@ spec = AgentSpec(
 )
 ```
 
+### 名前で参照する（登録簿経由）
+
+guardrail を登録簿へ登録すると、`handoffs` と同じ流儀で名前で宣言できます。登録簿のメソッドは生成と登録を 1 回の呼び出しで行い、登録名がそのまま上流 SDK 側の guardrail 名になります（トレース上の表示名と照合キーが食い違いません）。適用境界は `on` の指定から導出されます（helper 自体で境界が固定されるものは `on` を取りません）。framework ラベルと既定危険度が自動で付くのは、分類が helper 名で一意に定まる 2 件（`canary_guardrail` / `injection_baseline_guardrail`）に限ります。残りの helper は検知内容が利用者 DI で決まるため既定を持たず、`labels` / `severity` を渡さなければ未分類のままです（`min_severity` や labels での絞り込み対象に入りません）。いずれも引数で上書きできます。
+
+```python
+from oai_agentspec import AgentRegistry, AgentSpec
+from oai_agentspec.runtime.guardrails import GuardrailRegistry, Severity
+
+guardrails = GuardrailRegistry()
+guardrails.injection_baseline_guardrail(name="injection_baseline")
+guardrails.canary_guardrail(CANARY, name="system_prompt_canary", severity=Severity.CRITICAL)
+
+registry = AgentRegistry(guardrail_registry=guardrails)
+registry.register(AgentSpec(
+    name="assistant", instructions="...",
+    guardrails=["injection_baseline", "system_prompt_canary"],   # 境界は宣言から解決される
+))
+registry.validate()   # 未登録名・未注入を run 前に一括検出
+```
+
+生の SDK guardrail や自作の実体を名前参照へ載せたい場合は `register()` を使います。この経路では登録時に「上流 guardrail 型か」「名前が一致するか」「宣言境界と実体の境界が一致するか」を検証し、ラベルと危険度の自動付与は行いません。
+
+### 適用範囲を選ぶ（Agent 単位 / run 単位）
+
+| 適用範囲 | 書き方 | 評価される範囲 |
+|---|---|---|
+| Agent 単位 | `AgentSpec.guardrails` または専用フィールド | その Agent のみ。出力側は**ハンドオフ先に付いていなければ評価されない** |
+| run 単位 | `RunConfig(**guardrails.run_config_kwargs([...]))` | run 全体。ハンドオフ先の出力も対象になる |
+
+カナリアのようにシステム全体へ一律に掛けたい guardrail は run 単位を選びます。`run_config_kwargs()` が境界別に振り分けたマッピングを返すので、`**` 展開でそのまま渡せます。
+
+```python
+from agents import RunConfig, Runner
+
+cfg = RunConfig(**guardrails.run_config_kwargs(["system_prompt_canary"]))
+result = await Runner.run(registry.get("assistant"), input=text, run_config=cfg)
+```
+
+ツール境界の guardrail は `agents.Agent` にも `RunConfig` にもフィールドがないため名前参照の対象外です。登録簿から取り出してツール定義時に渡します（名前参照へ渡すと `ValueError` になります）。
+
+```python
+guardrails.tool_guardrail(my_detector, on="output", name="tool_pii")
+guarded = function_tool(_my_func, tool_output_guardrails=[guardrails.get("tool_pii")])
+```
+
+### 危険度と一覧
+
+危険度は `low` < `medium` < `high` < `critical` の順序を持ちます（未宣言は順序比較の対象外）。監査や UI 表示のために登録済みの宣言を一覧で取り出せます。
+
+```python
+for spec in guardrails.specs():                       # 名前昇順
+    # `boundary` は `str` 併用の列挙メンバ。表示には `.value` を使う
+    #（そのまま埋めると `Boundary.INPUT` と出ます）。`severity` は IntEnum なので `.name`。
+    print(spec.name, spec.boundary.value, spec.severity.name.lower() if spec.severity else "-")
+
+guardrails.specs(min_severity=Severity.HIGH)          # 危険度 high 以上のみ
+```
+
+既定危険度はライブラリが付す出発点であり、運用ポリシーに応じて上書きする前提です（同じカナリア漏洩を `critical` と見るか `medium` と見るかは運用次第）。
+
+トリップ時の例外から guardrail 名を引けるので、危険度に応じた着地を利用者側で組めます。
+
+```python
+except OutputGuardrailTripwireTriggered as exc:
+    name = exc.guardrail_result.guardrail.get_name()   # 登録名と一致する
+    severity = guardrails.metadata(name).severity
+```
+
+### 検知器を単独で使う
+
+guardrail の中身にあたる検知器（テキストを受けて `Detection` を返す純関数）は単独で公開されています。上流 SDK のフックがない場所（webhook 応答・バッチ処理・自作パイプライン）で同じ検知を再利用できます。
+
+```python
+from oai_agentspec.runtime.guardrails import canary_detector, regex_detector
+
+if canary_detector(CANARY)(webhook_body).triggered:
+    ...
+```
+
+`Detection.info` にはマッチした値そのもの（カナリートークン等）が入ります。guardrail 経路ではこの値が SDK のトレースへ載るため、単独利用でも `Detection` を丸ごとログへ出さず `.triggered` /`.reason` を使ってください。
+
 ## パラメータ一覧（主要 factory 抜粋）
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
 
@@ -78,6 +159,24 @@ spec = AgentSpec(
 ### `Detection`（dataclass）
 
 `triggered: bool`, `reason: str | None = None`, `info: dict[str, Any] = {}`。
+
+## helper の framework 分類と既定危険度
+
+登録簿が自動付与する既定値の一覧です。**本表は `HELPER_DEFAULTS`（コードが SoT）の投影です。**機械可読データが必要な場合は表を書き写さず `HELPER_DEFAULTS` を import してください（現時点では表とコードの照合は手動で、自動検知はありません）。
+
+| helper 識別子 | 適用境界 | framework ラベル | 既定危険度 | 備考 |
+|---|---|---|---|---|
+| `injection_baseline_guardrail` | input | `owasp_llm: LLM01` | medium | 非網羅の補助検知（本丸はパラメータ化クエリ・安全 API 利用） |
+| `canary_guardrail` | output | `owasp_llm: LLM07` | high | 逐語一致。運用ポリシーに応じて `critical` へ上書きする |
+| `regex_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | 分類は DI するパターン次第 |
+| `predicate_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | 分類は DI する述語次第 |
+| `allow_deny_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | 分類は DI する語彙次第 |
+| `length_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | 分類は DI する閾値次第 |
+| `external_detector_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | Presidio 接着なら LLM02、モデレーション接着なら LLM01 / LLM05 |
+| `prompt_llm_guardrail` | on 引数 | 利用者が宣言 | 利用者が宣言 | 分類は DI する判定 prompt / model 次第 |
+| `tool_guardrail` | on 引数（tool 境界へ写る） | 利用者が宣言 | 利用者が宣言 | 分類は DI する検知器次第 |
+
+上段 2 件は helper 自体で適用境界と分類が固定されるため既定値を持ちます。下段 7 件は検知内容が利用者 DI で決まるため既定値を持たず、必要なら `labels` / `severity` を明示して宣言します（誤ったラベルを自動で付けないための切り分けです）。
 
 ## 判断軸
 
