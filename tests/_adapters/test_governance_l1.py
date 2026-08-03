@@ -2,8 +2,8 @@
 
 `_load_policy`（YAML 読込 / 未知キー fail-fast / 非強制フィールド警告 / policy オブジェクト
 素通し・検証）、`_evaluate_tool`（allowlist 短絡 / blocked_patterns 生文字列照合 / JSON
-エスケープ正規化照合 / パース不能フォールバック）、`_delegate`（sync・async 委譲 / None・
-メソッド欠如 no-op）、`_field_default`（default / default_factory / 必須）を直接検証する。
+エスケープ正規化照合 / パース不能フォールバック）、`_field_default`（default /
+default_factory / 必須）を直接検証する。
 
 ポリシー評価は fake policy（呼び出し記録付き）を注入し AGT 非依存で検証する。YAML 読込のみ
 実 `GovernancePolicy`（dataclass フィールド集合が挙動を決める）が必要なため、テスト内
@@ -20,7 +20,6 @@ from typing import Any
 import pytest
 
 from oai_agentspec._adapters.governance import (
-    _delegate,
     _evaluate_tool,
     _field_default,
     _load_policy,
@@ -288,49 +287,6 @@ def test_evaluate_tool_allowed_returns_none_after_all_candidates() -> None:
     assert policy.tool_calls == ["t"]
     # 正規化文字列は raw と同一のため重複排除され、デコード済みのキー / 値が続く。
     assert policy.content_calls == [raw, "q", "ok"]
-
-
-# ----------------------------------------------------------------------
-# _delegate: sync / async / None / メソッド欠如
-# ----------------------------------------------------------------------
-
-
-async def test_delegate_calls_sync_method_with_args() -> None:
-    """sync メソッドはそのまま呼ばれる（await 不要・引数素通し）。"""
-    seen: list[tuple[Any, ...]] = []
-
-    class _SyncHooks:
-        def on_start(self, *args: Any) -> None:
-            seen.append(args)
-
-    await _delegate(_SyncHooks(), "on_start", "ctx", "agent")
-    assert seen == [("ctx", "agent")]
-
-
-async def test_delegate_awaits_async_method() -> None:
-    """async メソッドは await されて完了する。"""
-    seen: list[tuple[Any, ...]] = []
-
-    class _AsyncHooks:
-        async def on_end(self, *args: Any) -> None:
-            seen.append(args)
-
-    await _delegate(_AsyncHooks(), "on_end", "ctx", "agent", "output")
-    assert seen == [("ctx", "agent", "output")]
-
-
-async def test_delegate_inner_none_is_noop() -> None:
-    """inner=None は何もしない（例外なし）。"""
-    await _delegate(None, "on_start", "ctx", "agent")
-
-
-async def test_delegate_missing_method_is_noop() -> None:
-    """同名メソッドを持たない inner も何もしない（例外なし）。"""
-
-    class _Empty:
-        pass
-
-    await _delegate(_Empty(), "on_start", "ctx", "agent")
 
 
 # ----------------------------------------------------------------------

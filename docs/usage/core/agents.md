@@ -54,7 +54,7 @@ agent = registry.get("triage")  # 依存解決して agents.Agent を構築
 | `tools` | `list[Any]` | `[]` | SDK Tool のリスト |
 | `model` | `Any` | `None` | モデル指定（str / `agents.Model` / None） |
 | `model_settings` | `Any` | `None` | `agents.ModelSettings` |
-| `hooks` | `Any` | `None` | `agents.AgentHooks` |
+| `hooks` | `Any` | `None` | `agents.AgentHooks`（複数宣言は `chain_agent_hooks` で合成。下記参照） |
 | `input_guardrails` | `list[Any]` | `[]` | 入力ガードレール（kw_only） |
 | `output_guardrails` | `list[Any]` | `[]` | 出力ガードレール（kw_only） |
 | `handoffs` | `list[str]` | `[]` | ハンドオフ先エージェント名リスト |
@@ -63,6 +63,64 @@ agent = registry.get("triage")  # 依存解決して agents.Agent を構築
 | `sub_agent_tools` | `dict[str, tuple[str \| None, str \| None]]` | `{}` | サブ名 -> (tool_name, tool_description) |
 | `dynamic_handoffs` | `list[DynamicHandoff]` | `[]` | 動的ハンドオフ宣言 |
 | `extra` | `dict[str, Any]` | `{}` | 上記以外の `agents.Agent` kwarg 素通し |
+
+#### `hooks` を複数宣言する（`chain_agent_hooks`）
+
+`hooks` は単一スロットのため、エージェント単位のフックを複数持たせる場合は
+`chain_agent_hooks` で 1 つに合成して渡します（追加 extra は不要）。
+
+```python
+from typing import Any
+
+from agents.lifecycle import AgentHooksBase
+
+from oai_agentspec import AgentSpec
+from oai_agentspec.runtime.hooks import chain_agent_hooks
+
+class MetricsHooks(AgentHooksBase[Any, Any]):     # 全 on_* を持つ通常の実装
+    async def on_start(self, context, agent): ...
+    async def on_end(self, context, agent, output): ...
+
+class ToolLogger:                                  # 部分実装（継承せず 2 メソッドのみ）
+    async def on_tool_start(self, context, agent, tool): ...
+    async def on_tool_end(self, context, agent, tool, result): ...
+
+enable_audit = False                               # 条件付きで有効化するフックの例
+
+spec = AgentSpec(
+    name="triage",
+    instructions="...",
+    hooks=chain_agent_hooks(
+        MetricsHooks(),
+        MetricsHooks() if enable_audit else None,   # 無効時は None のまま渡せる
+        ToolLogger(),                                # 部分実装も混在可
+    ),
+)
+```
+
+- 宣言順（左から右）に順次 await します。前段が例外を送出したら後段は呼ばれず、その例外が
+  そのまま伝播します（fail-fast）。
+- `None` は無視されるため、条件付きで有効化するフックを分岐なしに列挙できます。
+- run 単位フック（`agents.lifecycle.RunHooksBase` のインスタンス）は渡せません。渡すと build 時に
+  `TypeError` になります（メソッド名が異なり `on_handoff` の引数意味も違うため）。run 単位の合成は
+  `chain_hooks` を使ってください（[resilience](../safety/resilience.md)）。
+- `AgentHooksBase` を継承するフックの `on_*` は `async` で定義してください。合成ラッパ経由では
+  同期メソッドも呼び出せますが、実効 1 件かつ `AgentHooksBase` インスタンスの場合はそのフック
+  自身が返って正規化を経ないため、同期メソッドは SDK 側の await で `TypeError` になります
+  （同期許容は部分実装のための緩さで、フック件数に依存しない保証ではありません）。
+- `on_*` を 1 つも持たないオブジェクトも渡せません（build 時に `TypeError`）。包むと全メソッドが
+  no-op になり、フックが 1 度も発火しないのに例外が出ないためです。`*` の付け忘れ
+  （`chain_agent_hooks(my_hooks_list)`）や型違いがこれで検知されます。
+- 要素は `agents.lifecycle.AgentHooksBase` 継承クラスのインスタンスに限らず、`on_*` の一部だけを持つ
+  オブジェクト（部分実装）も渡せます。持たないメソッドはスキップされます。
+- `None` を除いた実効件数が 0 件なら全メソッド no-op のフック、1 件で
+  `agents.lifecycle.AgentHooksBase` のインスタンスならその要素自身が返り、余分なラッパは
+  作られません（型判定に使えるのは非ジェネリックな基底 `AgentHooksBase` です。添字付き
+  エイリアス `agents.AgentHooks` は `isinstance` の第 2 引数に使えません）。
+- 戻り値は `AgentSpec(hooks=...)` へそのまま渡せます（`agents.Agent(hooks=...)` へ素通し）。
+- run 単位（`Runner.run(hooks=...)`）の合成は `chain_hooks` です（[resilience](../safety/resilience.md)）。
+  メソッド名が `on_start` / `on_end` 対 `on_agent_start` / `on_agent_end` で異なるため、両者は
+  互換ではありません。
 
 ### `SandboxAgentSpec`（`AgentSpec` 継承 + 4 kw_only フィールド）
 
@@ -106,7 +164,8 @@ agent = registry.get("triage")  # 依存解決して agents.Agent を構築
 ## 参照
 
 - 詳細設計: `docs/architecture.md`（AgentSpec / SandboxAgentSpec 節）
-- 具体例: `examples/basic/basic.py` / `examples/basic/dynamic_context.py` / `examples/basic/runtime_update.py` / `examples/sandbox/`
+- 具体例: `examples/basic/basic.py` / `examples/basic/dynamic_context.py` / `examples/basic/runtime_update.py` / `examples/sandbox/` / `examples/hooks/01_chain_agent_hooks.py`（`hooks` の複数宣言）/ `examples/hooks/02_chain_hooks.py`（run 単位との非対称）
+- 設計判断: `docs/adr/0016-agent-hooks-chain-helper.md`（`chain_agent_hooks`）/ `docs/adr/0017-reject-run-hooks-in-chain-agent-hooks.md`（run 単位フックの拒否）
 
 ## 次
 

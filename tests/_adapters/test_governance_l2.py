@@ -6,9 +6,10 @@
 非破壊性 / 既定 sink の build 間共有（agent_id 跨ぎのチェーン連続）を検証する。
 
 SDK / AGT のバージョン耐性トリップワイヤを兼ねる: SDK `AgentHooksBase` の public ライフサイクル
-メソッド集合（増えたら `_AuditAgentHooks` の委譲漏れを検知）と、AGT `GovernancePolicy.check_tool /
-check_content`・`AuditLog.record / get_entries / verify_chain`・`PolicyViolationError` の存在 /
-シグネチャを固定する。FakeModel で出力を制御し実 LLM を呼ばない（決定的）。
+メソッド集合（増えたら `_AuditAgentHooks` の監査記録の追随漏れを検知）と、AGT
+`GovernancePolicy.check_tool / check_content`・`AuditLog.record / get_entries / verify_chain`・
+`PolicyViolationError` の存在 / シグネチャを固定する。FakeModel で出力を制御し実 LLM を
+呼ばない（決定的）。
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ pytest.importorskip(
 )
 
 from agents import FunctionTool, Runner  # noqa: E402
-from agents.lifecycle import AgentHooksBase  # noqa: E402
+from agents.lifecycle import AgentHooksBase, RunHooksBase  # noqa: E402
 from agents.tool_context import ToolContext  # noqa: E402
 from openai_agents_trust import AuditLog, GovernancePolicy  # noqa: E402
 
@@ -263,6 +264,91 @@ async def test_audit_hooks_on_handoff_records_and_delegates() -> None:
     assert inner_hooks.events == ["handoff:src->target"]
 
 
+async def test_audit_hooks_without_inner_returns_audit_hooks_itself() -> None:
+    """`inner=None` では合成ラッパを被せず監査フック自身を返す（記録のみ・`on_llm_*` は no-op）。
+
+    `_make_audit_hooks` は `chain_agent_hooks(audit, inner)` を返すため、`inner` が `None` の
+    ときは実効 1 件かつ `isinstance(audit, AgentHooksBase)` が真であることを根拠に audit 自身が
+    `is` 一致で返る。監査専用クラスから基底 `AgentHooks[Any]`（= `AgentHooksBase`）の継承を
+    外すと `isinstance` が偽になり不要なラッパが 1 個挟まるため、この pin が当該前提条件を守る。
+    """
+    sink = AuditLog()
+    hooks = _make_audit_hooks(sink, None)
+
+    # 合成ラッパではなく監査専用クラスのインスタンスがそのまま返る。
+    assert type(hooks).__name__ == "_AuditAgentHooks"
+    assert isinstance(hooks, AgentHooksBase)
+
+    class _Named:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    # 監査対象メソッドは記録される（委譲先が無くても例外を出さない）。
+    await hooks.on_tool_start(None, _Named("bot"), _Named("echo"))
+    assert [(e.agent_id, e.action, e.decision) for e in sink.get_entries()] == [
+        ("bot", "tool_start:echo", "allow")
+    ]
+
+    # 監査対象外の on_llm_start は基底の no-op が呼ばれるだけで記録されない。
+    await hooks.on_llm_start(None, _Named("bot"), None, [])
+    assert len(sink.get_entries()) == 1
+
+
+async def test_audit_record_precedes_inner_delegation() -> None:
+    """合成順が `(監査, 既存フック)` であること（既存フックが raise しても監査記録が残る）。
+
+    `_make_audit_hooks` は `chain_agent_hooks(audit, inner)` を返し、合成は fail-fast である。
+    したがって既存フックが `on_start` で例外を送出した場合、
+    - 正しい順序 `(audit, inner)`: 監査記録が先に完了し、記録が sink に残る
+    - 反転した順序 `(inner, audit)`: 既存フックの例外で後段の監査へ到達せず、記録が失われる
+    という観測可能な差が生じる。引数順の反転は `sink` と `inner` を別コレクションで独立に検証する
+    テストでは検知できないため、この pin が順序そのものを挙動差として固定する。
+    """
+
+    class _RaisingInnerHooks(AgentHooksBase[Any, Any]):
+        """`on_start` で必ず例外を送出する既存フック（`spec.hooks` 相当）。"""
+
+        async def on_start(self, context: Any, agent: Any) -> None:
+            """常に `RuntimeError` を送出する。"""
+            raise RuntimeError("inner boom")
+
+    class _Named:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    sink = AuditLog()
+    hooks = _make_audit_hooks(sink, _RaisingInnerHooks())
+
+    with pytest.raises(RuntimeError, match="inner boom"):
+        await hooks.on_start(None, _Named("bot"))
+
+    # 監査記録は既存フックの委譲より前に完了しているため残る。
+    assert [(e.agent_id, e.action, e.decision) for e in sink.get_entries()] == [
+        ("bot", "agent_start", "allow")
+    ]
+
+
+def test_govern_spec_rejects_run_scope_hooks_in_spec_hooks() -> None:
+    """`spec.hooks` に run 単位フックを置いた宣言は build 時に `TypeError` で落ちる。
+
+    `_make_audit_hooks` は `chain_agent_hooks(audit, inner)` を通るため、run 単位フックを
+    agent スロットへ入れた宣言は合成時に拒否される（ADR-0017）。従来は `on_start` / `on_end`
+    が silent skip され `on_handoff` は from/to が反転して誤記録が残っていたため、fail-fast へ
+    変えた振る舞い変更の pin。
+    """
+
+    class _RunScopeHooks(RunHooksBase[Any, Any]):
+        async def on_agent_start(self, context: Any, agent: Any) -> None:
+            """run 単位の開始通知（agent 単位の `on_start` とは別名）。"""
+
+    spec = AgentSpec(name="bot", instructions="i", hooks=_RunScopeHooks())
+
+    with pytest.raises(TypeError) as excinfo:
+        govern_spec(spec, policy=GovernancePolicy(), audit_sink=AuditLog())
+
+    assert "chain_hooks" in str(excinfo.value)
+
+
 # ----------------------------------------------------------------------
 # 非 FunctionTool 素通し / 元 spec・tool の非破壊性
 # ----------------------------------------------------------------------
@@ -345,8 +431,10 @@ def test_new_audit_sink_returns_fresh_agt_audit_log() -> None:
 def test_sdk_agent_hooks_lifecycle_method_set_tripwire() -> None:
     """SDK `AgentHooksBase` の public ライフサイクルメソッド集合が変化したら fail させる。
 
-    集合が増えた場合、`_make_audit_hooks` の `_AuditAgentHooks` に委譲メソッドを追加しないと
-    既存 `spec.hooks` の新メソッドが黙って失われる（委譲漏れの検知）。
+    集合が増えた場合、`_make_audit_hooks` の `_AuditAgentHooks` に監査記録を追加しないと
+    新メソッドの監査が黙って漏れる（監査記録側の追随漏れの検知）。既存 `spec.hooks` への
+    委譲は `chain_agent_hooks` が担うため、委譲漏れは
+    `tests/runtime/hooks/test_chain_agent_hooks_l2.py` の SDK パリティ tripwire が検知する。
     """
     expected = {
         "on_start",
@@ -364,7 +452,7 @@ def test_sdk_agent_hooks_lifecycle_method_set_tripwire() -> None:
     }
     assert actual == expected, (
         "SDK AgentHooksBase のライフサイクルメソッド集合が変化した。"
-        "_adapters/governance.py の _AuditAgentHooks の委譲を追従させること。"
+        "_adapters/governance.py の _AuditAgentHooks の監査記録を追従させること。"
         f" 差分: {sorted(actual.symmetric_difference(expected))}"
     )
 

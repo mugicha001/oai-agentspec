@@ -54,6 +54,8 @@ hooks = chain_hooks(budget_hooks, MyLoggingHooks())  # 宣言順に順次 await�
 result = await Runner.run(agent, msg, hooks=hooks)
 ```
 
+エージェント単位（`agents.AgentHooks`）の合成は `chain_agent_hooks` を使います（[agents.md](../core/agents.md)）。
+
 `RunBudgetExceeded` は `oai_agentspec.exceptions` から catch します。SDK `error_handlers` を素通しで伝播し、`on_llm_end` ターン境界で判定されます（詳細は architecture.md）。
 
 ```python

@@ -489,6 +489,8 @@ PromptLayout(base="base", parts="parts", agents="agents")
 | `examples/tool_registry/05_runtime_feature_flag.py` | `enabled` の動的トグルで tool を実行時に切替（feature flag 用途） |
 | `examples/resilience/01_retry_and_budget.py` | `ModelRetryPolicy` + `RunBudgetPolicy` の併用 + streaming 経路での例外観測 + `asyncio.wait_for` によるハード timeout パターン |
 | `examples/resilience/02_failsafe.py` | `FailsafePolicy` の宣言 1 回 + `failsafe_call` による例外着地（正常時は透過・未宣言例外は素通し・`Exception` キーの build-time 拒否・`last_agent` の 2 段解決（`RUNNING_AGENT` / `fallback_last_agent`）） |
+| `examples/hooks/01_chain_agent_hooks.py` | agent 単位フックの合成（`chain_agent_hooks`）: 受理 3 形（インスタンス / 部分実装 / `None`）・縮退（`is` 一致）・fail-fast・run 単位フックの build 時拒否 |
+| `examples/hooks/02_chain_hooks.py` | run 単位フックの合成（`chain_hooks`）と agent 単位との非対称（`None` 非除外・部分実装非許容）+ 両スコープ同時使用 |
 
 ```bash
 uv run python examples/basic/basic.py

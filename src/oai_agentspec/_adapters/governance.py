@@ -3,13 +3,15 @@
 `from agents import ...` と `agent-governance-toolkit`（AGT）の import を本モジュールに局在化する。
 `govern_spec` は宣言層の `AgentSpec` を受け、各 `FunctionTool` の `on_invoke_tool` をポリシー評価
 付きラップへ非破壊置換し（許可なら実関数を実行・違反なら実関数を実行せず `PolicyViolationError` を
-送出）、ライフサイクル監査を記録する合成 `AgentHooks` を `spec.hooks` と合成した新 `AgentSpec` を
+送出）、ライフサイクル監査を記録する `AgentHooks` を `spec.hooks` と合成した新 `AgentSpec` を
 返す（build-don't-run・実行は SDK Runner に委ねる）。
 
 ポリシー評価・監査 sink・拒否例外は AGT の `[openai-agents]` 連携（`openai_agents_trust` の
 `GovernancePolicy` / `AuditLog` と core の `PolicyViolationError`）をそのまま使い、自前で再実装しな
-い。SDK 型を知る FunctionTool ラップと監査 `AgentHooks` 合成のみ本モジュールが担う（AGT は build 時
-結線用の FunctionTool ラッパ / `AgentHooks` を提供しないため）。AGT の import は関数内遅延に閉じ、未
+い。SDK 型を知る FunctionTool ラップと監査 `AgentHooks` の生成のみ本モジュールが担う（AGT は build
+時結線用の FunctionTool ラッパ / `AgentHooks` を提供しないため）。既存 `spec.hooks` への委譲は本
+モジュールで手書きせず `_adapters/hooks.py` の `chain_agent_hooks` に委ねる（委譲実体の一元化）。
+AGT の import は関数内遅延に閉じ、未
 導入時は install hint 付き `ImportError`（`_adapters/lightning.py` の `_require_agentlightning` /
 `_LIGHTNING_INSTALL_HINT` と同型）。policy / audit_sink は引数 DI で受け、env 参照は持たない。
 """
@@ -28,6 +30,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from agents import AgentHooks, FunctionTool
+
+# `AgentHooksBase` は `agents` トップレベルに export されていないためサブモジュールから import する
+# （`_make_audit_hooks` の戻り値注釈用。`agents.AgentHooks` は `TAgent = Agent` を主張するが、
+# 合成結果は `inner` 自身になり得るため保証できない）。
+from agents.lifecycle import AgentHooksBase
 
 # govern ラップが元 on_invoke_tool の第 1 引数注釈（'ToolContext[Any]' 等の文字列注釈）を
 # 引き継いだ際、SDK 側の get_type_hints が本モジュールの globals で解決できるようにするための
@@ -566,52 +573,38 @@ def _govern_tool(
     return _dataclass_replace(tool, on_invoke_tool=_on_invoke_tool)
 
 
-async def _delegate(inner: Any, method: str, *args: Any) -> None:
-    """`inner`（既存 `spec.hooks`）の同名ライフサイクルメソッドへ委譲する（await 可能なら await）。
+def _make_audit_hooks(sink: Any, inner: Any) -> AgentHooksBase[Any, Any]:
+    """ライフサイクル事象を監査 sink へ記録するフックを既存 `spec.hooks` と合成して返す。
 
-    `inner` が None、または当該メソッドを持たない場合は何もしない（合成フックが既存フックの
-    振る舞いを失わせないための薄い委譲）。
-
-    Args:
-        inner: 既存の `spec.hooks`（None 可）。
-        method: 委譲先のライフサイクルメソッド名。
-        *args: そのメソッドへ渡す引数。
-    """
-    if inner is None:
-        return
-    fn = getattr(inner, method, None)
-    if fn is None:
-        return
-    result = fn(*args)
-    if inspect.isawaitable(result):
-        await result
-
-
-def _make_audit_hooks(sink: Any, inner: Any) -> AgentHooks[Any]:
-    """ライフサイクル事象を監査 sink へ記録し既存 `spec.hooks` へ委譲する合成 `AgentHooks` を作る。
-
-    各ライフサイクルメソッドで「監査記録 → 既存フックの同名メソッドへ委譲」の順に呼ぶ
-    （上書きでなく合成）。`inner`（既存 `spec.hooks`）が None のときは監査記録のみ行う。
-    `on_llm_start` / `on_llm_end` は監査対象外だが、既存フックを失わないため委譲だけ行う。
+    監査記録のみを行う `AgentHooks` を作り、`chain_agent_hooks` で既存フックと宣言順
+    `(監査, 既存)` に合成する（上書きでなく合成）。これにより各ライフサイクルメソッドは
+    「監査記録 → 既存フックの同名メソッドへ委譲」の順に呼ばれる。`inner`（既存 `spec.hooks`）が
+    None のときは合成ラッパを被せず監査フック自身を返すため、監査記録のみ行う。
+    `on_llm_start` / `on_llm_end` は監査対象外で、監査フック側は基底の no-op のまま既存フックの
+    同名メソッドだけが呼ばれる。
 
     Args:
         sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
-        inner: 既存の `spec.hooks`（None 可）。
+        inner: 既存の `spec.hooks`（None 可・部分実装可）。
 
     Returns:
-        監査 + 委譲を行う合成 `AgentHooks` インスタンス。
+        監査記録と既存フックへの委譲を行う合成済み `AgentHooksBase` インスタンス。
     """
+    # `chain_agent_hooks` は関数内遅延 import に留める（トップレベル禁止）。
+    # `import oai_agentspec` -> `_adapters/__init__.py` -> `governance` の連鎖で本モジュールは
+    # 常時ロードされるため、トップレベル import にすると `_adapters.hooks` も常時ロードされ、
+    # `tests/runtime/hooks/test_init_pep562_l1.py` の「窓口 import だけでは `_adapters.hooks` が
+    # 載らない」probe（PEP 562 遅延窓口の契約）が赤になる。
+    from .hooks import chain_agent_hooks
 
     class _AuditAgentHooks(AgentHooks[Any]):
-        """監査記録を上乗せし既存フックへ委譲する合成 `AgentHooks`。"""
+        """監査記録のみを行う `AgentHooks`（既存フックへの委譲は `chain_agent_hooks` が担う）。"""
 
         async def on_start(self, context: Any, agent: Any) -> None:
             sink.record(agent_id=agent.name, action="agent_start", decision="allow")
-            await _delegate(inner, "on_start", context, agent)
 
         async def on_end(self, context: Any, agent: Any, output: Any) -> None:
             sink.record(agent_id=agent.name, action="agent_end", decision="allow")
-            await _delegate(inner, "on_end", context, agent, output)
 
         async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
             sink.record(
@@ -619,7 +612,6 @@ def _make_audit_hooks(sink: Any, inner: Any) -> AgentHooks[Any]:
                 action=f"tool_start:{getattr(tool, 'name', '')}",
                 decision="allow",
             )
-            await _delegate(inner, "on_tool_start", context, agent, tool)
 
         async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
             sink.record(
@@ -627,7 +619,6 @@ def _make_audit_hooks(sink: Any, inner: Any) -> AgentHooks[Any]:
                 action=f"tool_end:{getattr(tool, 'name', '')}",
                 decision="allow",
             )
-            await _delegate(inner, "on_tool_end", context, agent, tool, result)
 
         async def on_handoff(self, context: Any, agent: Any, source: Any) -> None:
             sink.record(
@@ -635,17 +626,8 @@ def _make_audit_hooks(sink: Any, inner: Any) -> AgentHooks[Any]:
                 action=f"handoff:{getattr(agent, 'name', '')}",
                 decision="allow",
             )
-            await _delegate(inner, "on_handoff", context, agent, source)
 
-        async def on_llm_start(
-            self, context: Any, agent: Any, system_prompt: Any, input_items: Any
-        ) -> None:
-            await _delegate(inner, "on_llm_start", context, agent, system_prompt, input_items)
-
-        async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
-            await _delegate(inner, "on_llm_end", context, agent, response)
-
-    return _AuditAgentHooks()
+    return chain_agent_hooks(_AuditAgentHooks(), inner)
 
 
 def govern_spec(
@@ -689,7 +671,11 @@ def govern_spec(
         FileNotFoundError: policy が指す YAML パスが存在しない場合。
         yaml.YAMLError: policy が指す YAML の構文が不正な場合。
         ValueError: policy YAML がマッピングでない、または未知キーを含む場合。
-        TypeError: policy オブジェクトに callable な `check_tool` / `check_content` が無い場合。
+        TypeError: policy オブジェクトに callable な `check_tool` / `check_content` が無い場合、
+            または `spec.hooks` が run 単位フック（`RunHooksBase` インスタンス）の場合、
+            または `spec.hooks` が `on_*` を 1 つも持たないオブジェクト（`*` の付け忘れで
+            渡した list 等）の場合（監査フックとの合成が `chain_agent_hooks` を通るため。
+            ADR-0017）。
     """
     governance_policy, audit_log_cls, policy_violation_error = _require_agt()
     policy_obj = _load_policy(policy, governance_policy)
