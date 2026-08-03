@@ -113,7 +113,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（`RunHooksBase` 合成ヘルパー `chain_hooks` の公開窓口・extra 不要＝`agents` はコア依存）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -2221,7 +2221,41 @@ import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
 - `chain_hooks(single)`（1 引数）は `single` をそのまま返す（合成ラッパを被せない最適化）
 - SDK に hook メソッドが追加された際の追随手順（オーバーライド追加）は module docstring に明記する
 
-詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md` を参照。
+agent 単位（`agents.AgentHooks`）の合成は同じ窓口 `oai_agentspec.runtime.hooks` の
+`chain_agent_hooks(*hooks: Any) -> AgentHooksBase[Any, Any]` で行う。`AgentSpec.hooks` は単一スロット
+（`Any`）であり、戻り値をそのまま `AgentSpec(hooks=...)` へ渡すと registry の build で
+`agents.Agent(hooks=...)` へ素通しされる（追加変換なし）。実装実体は同じく `_adapters/hooks.py` で、
+合成クラスは agent 単位専用の `_ChainedAgentHooks`（run 単位 `_ChainedHooks` を MRO に含まない）。
+
+agent 単位の合成仕様:
+
+- 7 メソッド（`on_start` / `on_end` / `on_handoff` / `on_llm_start` / `on_llm_end` /
+  `on_tool_start` / `on_tool_end`）を宣言順に順次 await する。`on_handoff` は
+  `(context, agent, source)` の 3 引数を転送する（run 単位の `(context, from_agent, to_agent)` とは
+  引数意味が異なる）。fail-fast も run 単位と同じ（前段が例外を送出したら後段は呼ばず即伝播）
+- run 単位フック（`RunHooksBase` インスタンス。両基底を継承した要素も含む）は build 時に
+  `TypeError` で拒否する（`docs/adr/0017-reject-run-hooks-in-chain-agent-hooks.md`）
+- `on_*` を 1 つも持たない要素も build 時に `TypeError` で拒否する（包むと全メソッドが no-op に
+  なり、フックが 1 度も発火しないのに例外が出ない。`*` の付け忘れ・型違いの検知。ADR-0017）
+- 要素は `AgentHooksBase` インスタンス / `on_*` の部分実装（duck-typed・非継承・`on_*` を 1 つ以上
+  持つこと）/ `None` の 3 形を
+  受理する。委譲は `getattr` で同名メソッドの有無を見て、無ければスキップ（`AttributeError` に
+  しない）、呼び出し結果が awaitable なら await する（`inspect.isawaitable` 判定）。同名属性が
+  callable でない場合は callable 判定を挟まず呼び出し時の `TypeError` をそのまま伝播する
+- 縮退は `None` 除外後の実効件数で決める。0 件なら全メソッド no-op の素 `AgentHooksBase()`、
+  1 件かつ `isinstance(x, AgentHooksBase)` ならその要素自身（`is` 一致・ラッパ非生成）、それ以外
+  （2 件以上 / 1 件だが非インスタンス）は合成ラッパの新インスタンス。渡した引数列は変更しない
+- run 単位との非対称は「`None` を無視して件数を数える」「1 件が `AgentHooksBase` の非インスタンス
+  なら包む」の 2 点。`chain_hooks` は戻り値が `Runner.run(hooks=...)` の型契約を満たす必要があり
+  `None` / 部分実装を許容しない。非対称の理由は `_adapters/hooks.py` の docstring に記述する
+- 型判定には非ジェネリック基底 `agents.lifecycle.AgentHooksBase` を使う（`agents.AgentHooks` は
+  添字付きジェネリックエイリアスで `isinstance` の第 2 引数に使えない）
+- governance の監査フック（`govern_spec`）も内部でこの合成を使い、`chain_agent_hooks(audit, inner)`
+  の宣言順で「監査記録 -> 既存 `spec.hooks` へ委譲」の順序を保つ。duck-typed 委譲の実体は
+  `_adapters/hooks.py` の 1 箇所のみに存在する
+
+詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md`（run 単位）・
+`docs/adr/0016-agent-hooks-chain-helper.md`（agent 単位）を参照。
 
 ### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `FailsafeResult` / `RUNNING_AGENT`）
 
