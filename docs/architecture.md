@@ -2208,7 +2208,8 @@ enforcement 特性:
 
 `Runner.run(hooks=...)` が単数の `RunHooksBase` しか受けない制約を埋めるため、複数の `RunHooksBase` を
 宣言順に fan-out する汎用ヘルパー `chain_hooks(*hooks) -> RunHooksBase` を提供する。公開窓口は
-`oai_agentspec.runtime.hooks`（PEP 562 遅延再エクスポート・窓口 import 時に `agents` を発火させない）で、
+`oai_agentspec.runtime.hooks`（PEP 562 遅延再エクスポート・窓口 import 時に実装実体 `_adapters.hooks`
+をロードしない。`agents` 自体はコア依存で窓口 import より前にロード済み）で、
 実装実体は `_adapters/hooks.py`（`_ChainedHooks(RunHooksBase)` のサブクラス定義に `agents.lifecycle` の
 import が不可避なため SDK 隔離に従い `_adapters` に閉じる）。
 

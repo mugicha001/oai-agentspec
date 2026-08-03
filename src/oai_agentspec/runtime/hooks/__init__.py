@@ -5,8 +5,10 @@
 `chain_agent_hooks(*hooks)` を再エクスポートする。実装実体は `_adapters/hooks.py`（`RunHooksBase` /
 `AgentHooksBase` サブクラス定義のため `agents.lifecycle` の import が不可避で、SDK 隔離 NFR-1 に従い
 `_adapters/` に配置）。本窓口は PEP 562 の module `__getattr__` で両シンボルを遅延取得し、
-`import oai_agentspec.runtime.hooks` 時点では `agents` を発火させない（`governance` 窓口と同型の
-遅延パターン）。
+`import oai_agentspec.runtime.hooks` 時点では合成クラス定義を含む `_adapters.hooks` をロードしない
+（`governance` 窓口と同型の遅延パターン）。`agents` / `agents.lifecycle` 自体はコア依存であり、
+`oai_agentspec/__init__.py` -> `_adapters/__init__.py` の連鎖で本窓口の import より前にロード済みに
+なる。遅延の対象は実装実体のモジュールであって SDK ではない。
 
 合成仕様（詳細は `_adapters/hooks.py` の module docstring と `docs/architecture.md` の
 「hooks 合成（chain_hooks）」節を参照）:
@@ -36,9 +38,10 @@ __all__ = ["chain_agent_hooks", "chain_hooks"]
 def __getattr__(name: str) -> Any:
     """`chain_hooks` / `chain_agent_hooks` を `_adapters.hooks` から遅延取得する（PEP 562）。
 
-    `agents.lifecycle` の import を属性アクセス時まで遅らせ、`import oai_agentspec.runtime.hooks`
-    時点では SDK を発火させない。取得済みの値は module 属性へキャッシュし、以降のアクセスは通常の
-    属性解決で返す。
+    `_adapters.hooks`（`RunHooksBase` / `AgentHooksBase` のサブクラス定義を含む）のロードを属性
+    アクセス時まで遅らせる。`agents` / `agents.lifecycle` 自体はコア依存で本窓口の import より前に
+    ロード済みなので、遅延の対象ではない。取得済みの値は module 属性へキャッシュし、以降のアクセスは
+    通常の属性解決で返す。
 
     Args:
         name: アクセスされた属性名。

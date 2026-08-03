@@ -409,33 +409,38 @@ async def test_chain_agent_hooks_propagates_type_error_for_non_callable_attribut
 # ---------------------------------------------------------------------------
 # 観点 10. メソッド単位の fail-fast と例外の保存
 # ---------------------------------------------------------------------------
-async def test_chain_agent_hooks_stops_forwarding_when_element_raises() -> None:
-    """中段が `on_end` で raise すると後段の同メソッドは 0 回呼ばれ、例外が伝播すること。
+@pytest.mark.parametrize("raising_method", _METHOD_NAMES)
+async def test_chain_agent_hooks_stops_forwarding_when_element_raises(raising_method: str) -> None:
+    """中段が raise すると後段の同メソッドは 0 回呼ばれ、例外が伝播すること（7 メソッド全件）。
 
-    fail-fast はメソッド単位であり、raise しない別メソッド（`on_start`）では h1/h2/h3
-    すべてが呼ばれることも併せて検証する。
+    fail-fast はメソッド単位である。7 メソッドそれぞれについて (a) 当該メソッドでは h3 が
+    呼ばれず例外が伝播する、(b) raise しない別メソッドでは h1/h2/h3 すべてが呼ばれる、を
+    検証する。個別メソッドに `try` / `except` を入れる退行を全メソッドで検知するため
+    parametrize する（3 メソッドのみを対象にしていると残り 4 メソッドの変異が生き残る）。
     """
+    other_method = next(name for name in _METHOD_NAMES if name != raising_method)
+
     calls: list[_Call] = []
     h1 = RecordingHooks("h1", calls)
-    h2 = RaisingHooks("h2", calls, raise_on="on_end", exc=RuntimeError("stop"))
+    h2 = RaisingHooks("h2", calls, raise_on=raising_method, exc=RuntimeError("stop"))
     h3 = RecordingHooks("h3", calls)
 
     chained = chain_agent_hooks(h1, h2, h3)
 
     calls.clear()
     with pytest.raises(RuntimeError):
-        await _call_method(chained, "on_end", _args_for("on_end"))
+        await _call_method(chained, raising_method, _args_for(raising_method))
     assert [(hook_id, name) for hook_id, name, _args, _kwargs in calls] == [
-        ("h1", "on_end"),
-        ("h2", "on_end"),
+        ("h1", raising_method),
+        ("h2", raising_method),
     ]
 
     calls.clear()
-    await _call_method(chained, "on_start", _args_for("on_start"))
+    await _call_method(chained, other_method, _args_for(other_method))
     assert [(hook_id, name) for hook_id, name, _args, _kwargs in calls] == [
-        ("h1", "on_start"),
-        ("h2", "on_start"),
-        ("h3", "on_start"),
+        ("h1", other_method),
+        ("h2", other_method),
+        ("h3", other_method),
     ]
 
 

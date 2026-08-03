@@ -294,6 +294,40 @@ async def test_audit_hooks_without_inner_returns_audit_hooks_itself() -> None:
     assert len(sink.get_entries()) == 1
 
 
+async def test_audit_record_precedes_inner_delegation() -> None:
+    """合成順が `(監査, 既存フック)` であること（既存フックが raise しても監査記録が残る）。
+
+    `_make_audit_hooks` は `chain_agent_hooks(audit, inner)` を返し、合成は fail-fast である。
+    したがって既存フックが `on_start` で例外を送出した場合、
+    - 正しい順序 `(audit, inner)`: 監査記録が先に完了し、記録が sink に残る
+    - 反転した順序 `(inner, audit)`: 既存フックの例外で後段の監査へ到達せず、記録が失われる
+    という観測可能な差が生じる。引数順の反転は `sink` と `inner` を別コレクションで独立に検証する
+    テストでは検知できないため、この pin が順序そのものを挙動差として固定する。
+    """
+
+    class _RaisingInnerHooks(AgentHooksBase[Any, Any]):
+        """`on_start` で必ず例外を送出する既存フック（`spec.hooks` 相当）。"""
+
+        async def on_start(self, context: Any, agent: Any) -> None:
+            """常に `RuntimeError` を送出する。"""
+            raise RuntimeError("inner boom")
+
+    class _Named:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    sink = AuditLog()
+    hooks = _make_audit_hooks(sink, _RaisingInnerHooks())
+
+    with pytest.raises(RuntimeError, match="inner boom"):
+        await hooks.on_start(None, _Named("bot"))
+
+    # 監査記録は既存フックの委譲より前に完了しているため残る。
+    assert [(e.agent_id, e.action, e.decision) for e in sink.get_entries()] == [
+        ("bot", "agent_start", "allow")
+    ]
+
+
 def test_govern_spec_rejects_run_scope_hooks_in_spec_hooks() -> None:
     """`spec.hooks` に run 単位フックを置いた宣言は build 時に `TypeError` で落ちる。
 

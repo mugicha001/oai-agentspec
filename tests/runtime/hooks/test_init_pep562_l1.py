@@ -1,8 +1,12 @@
 """L1: `runtime.hooks.__init__` の公開窓口契約（PEP 562 の 2 シンボル遅延）。
 
 run 単位 `chain_hooks` と agent 単位 `chain_agent_hooks` を `_adapters.hooks` から遅延取得する
-薄い窓口。`import oai_agentspec.runtime.hooks` 時点では `agents.lifecycle` を発火させず、
-属性アクセス時に初めて `_adapters.hooks` 経由で実体を取得する（`governance` 窓口と同型）。
+薄い窓口。`import oai_agentspec.runtime.hooks` 時点では合成クラス定義を含む `_adapters.hooks` を
+ロードせず、属性アクセス時に初めて実体を取得する（`governance` 窓口と同型）。
+
+遅延の対象は `_adapters.hooks` モジュールであって `agents` ではない。`agents` / `agents.lifecycle`
+はコア依存で `oai_agentspec/__init__.py` -> `_adapters/__init__.py` の連鎖によりこの窓口の import
+より前にロード済みになるため、本ファイルの probe も `_adapters.hooks` の非ロードのみを検査する。
 """
 
 from __future__ import annotations
