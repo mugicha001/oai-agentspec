@@ -2500,8 +2500,11 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
 `RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`、関数 1 種
 `failsafe_call`、sentinel 1 種 `RUNNING_AGENT`）は module import 時点で直 import 済み、残り 12 件
 （`build_model_retry` / `build_run_budget_hooks` の 2 種と SDK 生型 10 種）は `__getattr__` で
-`_adapters.resilience` 経由の PEP 562 遅延取得とし、窓口 import 時に `agents` を発火させない
-（extra 未導入耐性）。例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は
+`_adapters.resilience` 経由の PEP 562 遅延取得とし、窓口 import 時点では実装実体の
+`_adapters.resilience` をロードしない（`hooks` 窓口と同型。`agents` はコア依存で窓口 import より
+前にロード済みのため、遅延の対象は実装実体のモジュールであって SDK ではない。この不変条件の
+成立のため `_adapters/__init__.py` は `.resilience` をトップレベルで import しない）。
+例外 `RunBudgetExceeded` は本窓口からは撤去済みで、正規経路は
 `oai_agentspec.exceptions`（統一窓口）。
 
 SDK 生型の再エクスポート（10 種。上級用途で利用者コードに `from agents` を書かせないための窓口）:
