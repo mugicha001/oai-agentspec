@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 
 import pytest
 
@@ -407,3 +408,97 @@ def test_coverage_report_per_case_accepts_none_as_invalidated_marker() -> None:
     )
     values = [steps for _, steps in r.per_case]
     assert values == [None, (), ("triage",)]
+
+
+# ----------------------------------------------------------------------
+# CoverageReport.complete の構築時 bool 型検証
+# ----------------------------------------------------------------------
+
+
+def _coverage_report_kwargs(**overrides: object) -> dict[str, object]:
+    """CoverageReport の最小構築 kwargs（bool 検証テストの共通引数）。"""
+    base: dict[str, object] = {
+        "covered": frozenset({"a"}),
+        "missing": frozenset({"b"}),
+        "per_case": (),
+        "interrupted_cases": 0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_coverage_report_complete_none_raises() -> None:
+    """complete=None は bool でないため構築時 ValueError（メッセージ全文を pin）。
+
+    観測完了度フラグが黙って falsy になると「部分レポートを完走扱いする」誤診断が起きるため、
+    構築時に fail-fast する。
+    """
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    with pytest.raises(ValueError, match=re.escape("complete must be a bool, got 'NoneType'")):
+        CoverageReport(**_coverage_report_kwargs(complete=None))  # type: ignore[arg-type]
+
+
+def test_coverage_report_complete_str_raises() -> None:
+    """complete="no" は truthy な文字列だが ValueError で弾く（silent 受理しない）。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    with pytest.raises(ValueError, match=re.escape("complete must be a bool, got 'str'")):
+        CoverageReport(**_coverage_report_kwargs(complete="no"))  # type: ignore[arg-type]
+
+
+def test_coverage_report_complete_int_zero_raises() -> None:
+    """complete=0（int）は bool でないため ValueError（bool は int のサブクラスだが逆は不可）。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    with pytest.raises(ValueError, match="complete"):
+        CoverageReport(**_coverage_report_kwargs(complete=0))  # type: ignore[arg-type]
+
+
+def test_coverage_report_complete_bool_constructs() -> None:
+    """complete へ True / False を渡した構築は成功する（正常系の維持）。"""
+    from oai_agentspec.runtime.lightning import CoverageReport
+
+    assert CoverageReport(**_coverage_report_kwargs(complete=True)).complete is True  # type: ignore[arg-type]
+    assert CoverageReport(**_coverage_report_kwargs(complete=False)).complete is False  # type: ignore[arg-type]
+
+
+# ----------------------------------------------------------------------
+# SlotSegment.tune の構築時 bool 型検証
+# ----------------------------------------------------------------------
+
+
+def test_slot_segment_tune_none_raises() -> None:
+    """tune=None は bool でないため構築時 ValueError（メッセージ全文を pin）。
+
+    tune は APO 最適化対象かの二値フラグで、falsy な誤値を silent 受理すると
+    「最適化したいセグメントが固定扱いになる」silent failure になる。
+    """
+    from oai_agentspec.runtime.lightning.types import SlotSegment
+
+    with pytest.raises(ValueError, match=re.escape("tune must be a bool, got 'NoneType'")):
+        SlotSegment(ref="base:main", text="seed", tune=None)  # type: ignore[arg-type]
+
+
+def test_slot_segment_tune_str_raises() -> None:
+    """tune="no" は truthy な文字列だが ValueError で弾く（silent 受理しない）。"""
+    from oai_agentspec.runtime.lightning.types import SlotSegment
+
+    with pytest.raises(ValueError, match=re.escape("tune must be a bool, got 'str'")):
+        SlotSegment(ref="base:main", text="seed", tune="no")  # type: ignore[arg-type]
+
+
+def test_slot_segment_tune_int_zero_raises() -> None:
+    """tune=0（int）は bool でないため ValueError。"""
+    from oai_agentspec.runtime.lightning.types import SlotSegment
+
+    with pytest.raises(ValueError, match="tune"):
+        SlotSegment(ref="base:main", text="seed", tune=0)  # type: ignore[arg-type]
+
+
+def test_slot_segment_tune_bool_constructs() -> None:
+    """tune へ True / False を渡した構築は成功する（正常系の維持）。"""
+    from oai_agentspec.runtime.lightning.types import SlotSegment
+
+    assert SlotSegment(ref="agent:triage", text="seed", tune=True).tune is True
+    assert SlotSegment(ref="part:style", text="fixed", tune=False).tune is False

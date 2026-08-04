@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 
@@ -35,6 +36,33 @@ def test_approval_decision_fields_and_default() -> None:
     assert dataclasses.is_dataclass(decision)
     with pytest.raises(dataclasses.FrozenInstanceError):
         decision.approve = False
+
+
+def test_approval_decision_approve_none_raises() -> None:
+    """approve=None は bool でないため構築時 ValueError（メッセージ全文を pin）。
+
+    承認フラグの silent な falsy 受理（黙って却下扱い）を構造的に排除する。
+    """
+    with pytest.raises(ValueError, match=re.escape("approve must be a bool, got 'NoneType'")):
+        ApprovalDecision(call_id="c1", approve=None)  # type: ignore[arg-type]
+
+
+def test_approval_decision_approve_str_raises() -> None:
+    """approve="no" は truthy な文字列だが ValueError で弾く（誤承認の防止）。"""
+    with pytest.raises(ValueError, match=re.escape("approve must be a bool, got 'str'")):
+        ApprovalDecision(call_id="c1", approve="no")  # type: ignore[arg-type]
+
+
+def test_approval_decision_approve_int_zero_raises() -> None:
+    """approve=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="approve"):
+        ApprovalDecision(call_id="c1", approve=0)  # type: ignore[arg-type]
+
+
+def test_approval_decision_approve_bool_constructs() -> None:
+    """approve へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    assert ApprovalDecision(call_id="c1", approve=True).approve is True
+    assert ApprovalDecision(call_id="c1", approve=False).approve is False
 
 
 def test_public_api_contract_adds_typed_symbols_and_drops_alias() -> None:

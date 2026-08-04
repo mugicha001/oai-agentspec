@@ -173,3 +173,39 @@ def validate_realtime_handoff_options(
                     f"agent {agent_name!r} -> {dst!r}: on_handoff は {form} 引数である"
                     f"必要がありますが {n_params} 引数です"
                 )
+
+
+def validate_bool(value: Any, label: str) -> None:
+    """値が bool であることを strict に検証する（宣言的 bool フィールド用）。
+
+    bool は int の subclass だが `isinstance(0, bool)` は False のため、
+    int の 0 / 1 も拒否される（truthy な文字列・数値の silent 受理を防ぐ）。
+
+    Args:
+        value: 検証対象の値。
+        label: エラーメッセージに含めるフィールド表示名。
+
+    Raises:
+        ValueError: value が bool でない場合。
+    """
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a bool, got {type(value).__name__!r}")
+
+
+def validate_optional_bool(value: Any, label: str) -> None:
+    """値が bool または None であることを strict に検証する（宣言的 bool フィールド用）。
+
+    None は未指定として受理する。それ以外は `validate_bool` と同じ strict 判定で、
+    int の 0 / 1 を含む bool 以外の型を拒否する。
+
+    Args:
+        value: 検証対象の値。
+        label: エラーメッセージに含めるフィールド表示名。
+
+    Raises:
+        ValueError: value が None でも bool でもない場合。
+    """
+    if value is None:
+        return
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a bool or None, got {type(value).__name__!r}")

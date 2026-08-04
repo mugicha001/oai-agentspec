@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import re
 from types import MappingProxyType
 from typing import Any
 
@@ -149,6 +150,48 @@ def test_next_turn_rule_禁止Falseの明示だけでも_ValueError() -> None:
     """`no_handoff_on_arrival=False` の明示は「禁止を持たない」であり効果のない宣言。"""
     with pytest.raises(ValueError):
         NextTurnRule(no_handoff_on_arrival=False, source="triage")
+
+
+# ---------------------------------------------------------------------------
+# NextTurnRule: build-time ValueError（no_handoff_on_arrival の bool 型検証・Issue #58）
+# ---------------------------------------------------------------------------
+
+
+def test_next_turn_rule_no_handoff_on_arrivalにNoneはメッセージ全文つき_ValueError() -> None:
+    """Issue #58 再現: next_agent 併記の None は silent 受理せず、メッセージ全文で拒否する。"""
+    with pytest.raises(
+        ValueError, match=re.escape("no_handoff_on_arrival must be a bool, got 'NoneType'")
+    ):
+        NextTurnRule(next_agent="planner", no_handoff_on_arrival=None)  # type: ignore[arg-type]
+
+
+def test_next_turn_rule_no_handoff_on_arrivalに文字列は_ValueError() -> None:
+    """truthy 文字列 'no' で禁止が誤って ON になる silent failure を build-time で拒否する。"""
+    with pytest.raises(
+        ValueError, match=re.escape("no_handoff_on_arrival must be a bool, got 'str'")
+    ):
+        NextTurnRule(next_agent="planner", no_handoff_on_arrival="no")  # type: ignore[arg-type]
+
+
+def test_next_turn_rule_no_handoff_on_arrivalにintの0と1は_ValueError() -> None:
+    """bool は int の subclass だが、int の 0 / 1 は strict 判定で拒否する。"""
+    with pytest.raises(
+        ValueError, match=re.escape("no_handoff_on_arrival must be a bool, got 'int'")
+    ):
+        NextTurnRule(next_agent="planner", no_handoff_on_arrival=0)  # type: ignore[arg-type]
+    with pytest.raises(
+        ValueError, match=re.escape("no_handoff_on_arrival must be a bool, got 'int'")
+    ):
+        NextTurnRule(next_agent="planner", no_handoff_on_arrival=1)  # type: ignore[arg-type]
+
+
+def test_next_turn_rule_no_handoff_on_arrivalの真偽値は従来どおり構築できる() -> None:
+    """True / False（next_agent 併記）は型検証追加後も従来どおり構築できる（正常系の維持）。"""
+    rule_true = NextTurnRule(next_agent="planner", no_handoff_on_arrival=True)
+    rule_false = NextTurnRule(next_agent="planner", no_handoff_on_arrival=False)
+
+    assert rule_true.no_handoff_on_arrival is True
+    assert rule_false.no_handoff_on_arrival is False
 
 
 # ---------------------------------------------------------------------------

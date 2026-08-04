@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..._validation import validate_bool
+
 if TYPE_CHECKING:
     # NFR-1: openai はランタイム import しない（型注釈のみ）。client は不透明値として保持する。
     from openai import AsyncOpenAI
@@ -50,11 +52,13 @@ class CompactionConfig:
     options: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """有効化時に client 欠落を早期検知する（誤用を構築時に弾く）。
+        """`enabled` の型と、有効化時の client 欠落を早期検知する（誤用を構築時に弾く）。
 
         Raises:
-            ValueError: `enabled=True` かつ `client` が None の場合。
+            ValueError: `enabled` が bool でない場合、または `enabled=True` かつ `client` が
+                None の場合。
         """
+        validate_bool(self.enabled, "enabled")
         if self.enabled and self.client is None:
             raise ValueError("compaction を有効化する場合は client（AsyncOpenAI 系）が必須です")
 
@@ -77,6 +81,14 @@ class SessionPolicy:
     db_name: str = DEFAULT_SESSION_DB_NAME
     persist: bool = True
     compaction: CompactionConfig | None = None
+
+    def __post_init__(self) -> None:
+        """`persist` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `persist` が bool でない場合。
+        """
+        validate_bool(self.persist, "persist")
 
     def compaction_kwargs(self) -> dict[str, Any]:
         """`CompactionConfig` を `make_session` の plain kwargs へ展開する（非公開ヘルパ）。

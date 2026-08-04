@@ -11,6 +11,7 @@ ImportError となり本ファイル全体が collection error で失敗する =
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 
@@ -216,6 +217,103 @@ def test_model_retry_policy_有効条件ゼロでも_extra_statusesがあれば�
         extra_retry_statuses=(408,),
     )
     assert policy.extra_retry_statuses == (408,)
+
+
+# ---------------------------------------------------------------------------
+# ModelRetryPolicy: bool フィールドの構築時型検証
+# ---------------------------------------------------------------------------
+
+
+def test_model_retry_policy_backoff_jitter_Noneは正当値として許容() -> None:
+    """`backoff_jitter` は `bool | None` のため None（SDK 既定へ委譲）を受理する。"""
+    policy = ModelRetryPolicy(backoff_jitter=None)
+    assert policy.backoff_jitter is None
+
+
+def test_model_retry_policy_backoff_jitter_boolは許容() -> None:
+    """`backoff_jitter` は True / False をそのまま受理する。"""
+    assert ModelRetryPolicy(backoff_jitter=True).backoff_jitter is True
+    assert ModelRetryPolicy(backoff_jitter=False).backoff_jitter is False
+
+
+def test_model_retry_policy_backoff_jitter_文字列は_ValueError() -> None:
+    """`backoff_jitter` に truthy な文字列を渡すと ValueError（silent 受理しない）。
+
+    メッセージは optional bool 書式（`... must be a bool or None, got ...`）で pin する。
+    """
+    with pytest.raises(
+        ValueError, match=re.escape("backoff_jitter must be a bool or None, got 'str'")
+    ):
+        ModelRetryPolicy(backoff_jitter="no")  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_backoff_jitter_int0は_ValueError() -> None:
+    """`backoff_jitter` に int 0 を渡すと ValueError（bool は int のサブクラスだが逆は不可）。"""
+    with pytest.raises(ValueError, match="backoff_jitter"):
+        ModelRetryPolicy(backoff_jitter=0)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_timeout_Noneは_ValueError() -> None:
+    """`retry_on_timeout` は `bool` のため None を拒否する（メッセージ全文を pin）。"""
+    with pytest.raises(
+        ValueError, match=re.escape("retry_on_timeout must be a bool, got 'NoneType'")
+    ):
+        ModelRetryPolicy(retry_on_timeout=None)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_network_error_Noneは_ValueError() -> None:
+    """`retry_on_network_error` も None を拒否する（`bool | None` は backoff_jitter のみ）。"""
+    with pytest.raises(ValueError, match="retry_on_network_error"):
+        ModelRetryPolicy(retry_on_network_error=None)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_rate_limit_Noneは_ValueError() -> None:
+    """`retry_on_rate_limit` も None を拒否する。"""
+    with pytest.raises(ValueError, match="retry_on_rate_limit"):
+        ModelRetryPolicy(retry_on_rate_limit=None)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_server_error_Noneは_ValueError() -> None:
+    """`retry_on_server_error` も None を拒否する。"""
+    with pytest.raises(ValueError, match="retry_on_server_error"):
+        ModelRetryPolicy(retry_on_server_error=None)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_retry_after_Noneは_ValueError() -> None:
+    """`retry_on_retry_after` も None を拒否する。"""
+    with pytest.raises(ValueError, match="retry_on_retry_after"):
+        ModelRetryPolicy(retry_on_retry_after=None)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_timeout_文字列noは_ValueError() -> None:
+    """`retry_on_timeout="no"` は truthy な文字列だが ValueError で弾く（Issue の核心）。"""
+    with pytest.raises(ValueError, match=re.escape("retry_on_timeout must be a bool, got 'str'")):
+        ModelRetryPolicy(retry_on_timeout="no")  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_server_error_int0は_ValueError() -> None:
+    """`retry_on_server_error=0`（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="retry_on_server_error"):
+        ModelRetryPolicy(retry_on_server_error=0)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_on_rate_limit_int1は_ValueError() -> None:
+    """`retry_on_rate_limit=1`（int）も bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="retry_on_rate_limit"):
+        ModelRetryPolicy(retry_on_rate_limit=1)  # type: ignore[arg-type]
+
+
+def test_model_retry_policy_retry_onフラグのbool指定は許容() -> None:
+    """`retry_on_*` へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    policy = ModelRetryPolicy(
+        retry_on_network_error=True,
+        retry_on_timeout=False,
+        retry_on_rate_limit=True,
+        retry_on_server_error=False,
+        retry_on_retry_after=True,
+    )
+    assert policy.retry_on_timeout is False
+    assert policy.retry_on_retry_after is True
 
 
 # ---------------------------------------------------------------------------

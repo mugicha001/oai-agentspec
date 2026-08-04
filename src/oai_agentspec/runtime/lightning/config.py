@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..._validation import validate_bool
+
 # `apo_api` の受理値（optimizer の検証と `_adapters._build_apo` のディスパッチが共有する
 # 単一定義。2 層で独立にリテラルを持つと drift 時に「検証は通るが誤った API で実行される」
 # silent 事故になるため）。
@@ -83,3 +85,11 @@ class OptimizeConfig:
     apo_branch_factor: int | None = None
     tracer: Any = None
     skip_coverage_check: bool = False
+
+    def __post_init__(self) -> None:
+        """`skip_coverage_check` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `skip_coverage_check` が bool でない場合。
+        """
+        validate_bool(self.skip_coverage_check, "skip_coverage_check")

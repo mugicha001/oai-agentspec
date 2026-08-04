@@ -7,6 +7,7 @@ Registry 側のキャッシュ挙動・エラー文言・登録名検証のみ�
 
 from __future__ import annotations
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,56 @@ def test_異常系_toolspec_idempotentフィールドは存在しない() -> Non
         ToolSpec(func=_dummy_fn, idempotent=True)  # type: ignore[call-arg]
     spec = ToolSpec(func=_dummy_fn)
     assert not hasattr(spec, "idempotent")
+
+
+# ----------------------------------------------------------------------
+# ToolSpec: bool フィールドの build-time 型検証（Issue #58・RED 先行）
+# ----------------------------------------------------------------------
+def test_正常系_toolspec_enabledは真偽値を受理する() -> None:
+    """enabled=True / False は型検証追加後も従来どおり構築できる。"""
+    assert ToolSpec(func=_dummy_fn, enabled=True).enabled is True
+    assert ToolSpec(func=_dummy_fn, enabled=False).enabled is False
+
+
+def test_正常系_toolspec_strict_modeは真偽値とNoneを受理する() -> None:
+    """strict_mode は True / False に加え None（kwarg を渡さない）が正当値のまま受理される。"""
+    assert ToolSpec(func=_dummy_fn, strict_mode=True).strict_mode is True
+    assert ToolSpec(func=_dummy_fn, strict_mode=False).strict_mode is False
+    assert ToolSpec(func=_dummy_fn, strict_mode=None).strict_mode is None
+
+
+def test_異常系_toolspec_enabledにNoneはメッセージ全文つき_ValueError() -> None:
+    """enabled=None は silent 受理せず、label 名と型名入りのメッセージ全文で拒否する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'NoneType'")):
+        ToolSpec(func=_dummy_fn, enabled=None)  # type: ignore[arg-type]
+
+
+def test_異常系_toolspec_enabledに文字列は_ValueError() -> None:
+    """truthy 文字列 'no' で無効化のつもりが有効のままになる silent failure を拒否する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'str'")):
+        ToolSpec(func=_dummy_fn, enabled="no")  # type: ignore[arg-type]
+
+
+def test_異常系_toolspec_enabledにintの0は_ValueError() -> None:
+    """bool は int の subclass だが、int の 0 は strict 判定で拒否する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'int'")):
+        ToolSpec(func=_dummy_fn, enabled=0)  # type: ignore[arg-type]
+
+
+def test_異常系_toolspec_strict_modeに文字列はメッセージ全文つき_ValueError() -> None:
+    """strict_mode='strict' は or None 形のメッセージ全文（label 名と型名入り）で拒否する。"""
+    with pytest.raises(
+        ValueError, match=re.escape("strict_mode must be a bool or None, got 'str'")
+    ):
+        ToolSpec(func=_dummy_fn, strict_mode="strict")  # type: ignore[arg-type]
+
+
+def test_異常系_toolspec_strict_modeにintの0は_ValueError() -> None:
+    """int の 0 は None 許容の strict_mode でも拒否する（bool 以外の型は通さない）。"""
+    with pytest.raises(
+        ValueError, match=re.escape("strict_mode must be a bool or None, got 'int'")
+    ):
+        ToolSpec(func=_dummy_fn, strict_mode=0)  # type: ignore[arg-type]
 
 
 # ----------------------------------------------------------------------

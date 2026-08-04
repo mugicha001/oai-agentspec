@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..._validation import validate_bool
 from .types import CriterionStatus, Verdict
 
 
@@ -58,6 +59,14 @@ class EvaluationConfig:
     fail_closed_status: CriterionStatus = CriterionStatus.FAIL
     inconclusive_policy: Verdict = Verdict.FAIL
     deepeval_telemetry_opt_out: bool = True
+
+    def __post_init__(self) -> None:
+        """`deepeval_telemetry_opt_out` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `deepeval_telemetry_opt_out` が bool でない場合。
+        """
+        validate_bool(self.deepeval_telemetry_opt_out, "deepeval_telemetry_opt_out")
 
 
 @dataclass(frozen=True)

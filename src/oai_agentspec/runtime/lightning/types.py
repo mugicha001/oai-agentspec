@@ -20,6 +20,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict
 
+from ..._validation import validate_bool
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -102,6 +104,14 @@ class CoverageReport:
     interrupted_cases: int
     complete: bool = True
     invalid_cases: int = 0
+
+    def __post_init__(self) -> None:
+        """`complete` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `complete` が bool でない場合。
+        """
+        validate_bool(self.complete, "complete")
 
 
 def _format_exception_message(exc: BaseException) -> str:
@@ -254,6 +264,14 @@ class SlotSegment:
     ref: str
     text: str
     tune: bool
+
+    def __post_init__(self) -> None:
+        """`tune` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `tune` が bool でない場合。
+        """
+        validate_bool(self.tune, "tune")
 
 
 @dataclass(frozen=True)

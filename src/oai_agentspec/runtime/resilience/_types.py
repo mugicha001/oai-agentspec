@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from ..._validation import validate_bool, validate_optional_bool
+
 
 @dataclass(frozen=True)
 class ModelRetryPolicy:
@@ -62,10 +64,18 @@ class ModelRetryPolicy:
         """build-time 検証を行い、矛盾した宣言を `ValueError` で fail-fast する。
 
         Raises:
-            ValueError: `max_retries` 負数 / `backoff_multiplier` < 1 /
+            ValueError: bool フィールドが bool（`backoff_jitter` は bool / None）でない /
+                `max_retries` 負数 / `backoff_multiplier` < 1 /
                 `initial_delay_seconds` > `max_delay_seconds` / 有効な retry 条件が
                 ゼロなのに `max_retries` が正、のいずれかに該当する場合。
         """
+        validate_optional_bool(self.backoff_jitter, "backoff_jitter")
+        validate_bool(self.retry_on_network_error, "retry_on_network_error")
+        validate_bool(self.retry_on_timeout, "retry_on_timeout")
+        validate_bool(self.retry_on_rate_limit, "retry_on_rate_limit")
+        validate_bool(self.retry_on_server_error, "retry_on_server_error")
+        validate_bool(self.retry_on_retry_after, "retry_on_retry_after")
+
         if self.max_retries is not None and self.max_retries < 0:
             raise ValueError("max_retries must be >= 0")
 
