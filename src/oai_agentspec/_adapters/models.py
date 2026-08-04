@@ -19,6 +19,9 @@ from agents.items import ModelResponse
 from agents.tool_context import ToolContext
 
 from .responses import (
+    _WORKFLOW_MESSAGE_ID,
+    _WORKFLOW_RESPONSE_ID,
+    _WORKFLOW_STREAM_MODEL,
     _completed_event,
     _text_delta_events,
     _text_of,
@@ -109,10 +112,15 @@ class WorkflowModel(Model):
         response = await self.get_response(*args, **kwargs)
         text = _text_of(response)
         seq = 0
-        for event in _text_delta_events(text):
+        for event in _text_delta_events(text, item_id=_WORKFLOW_MESSAGE_ID):
             yield event
             seq = event.sequence_number + 1
-        yield _completed_event(response.output, seq)
+        yield _completed_event(
+            response.output,
+            seq,
+            response_id=_WORKFLOW_RESPONSE_ID,
+            model=_WORKFLOW_STREAM_MODEL,
+        )
 
 
 class DeterministicToolCallModel(Model):
@@ -168,7 +176,12 @@ class DeterministicToolCallModel(Model):
             ResponseCompletedEvent（function ToolCall を載せた終端）。
         """
         response = await self.get_response(*args, **kwargs)
-        yield _completed_event(response.output, 0)
+        yield _completed_event(
+            response.output,
+            0,
+            response_id=_WORKFLOW_RESPONSE_ID,
+            model=_WORKFLOW_STREAM_MODEL,
+        )
 
 
 def workflow_as_tool(
