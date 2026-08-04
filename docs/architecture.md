@@ -48,6 +48,8 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ Resilience (runtime/resilience 公開窓口・resilience extra・agents 非依存・宣言層)
    │
+   ┊ 決定的応答モデル (runtime/deterministic 公開窓口・extra 不要・_adapters/deterministic へ再エクスポート委譲)
+   │
 利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify・resilience build）
    │ import       │
    ▼              │
@@ -64,6 +66,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
    │                 │
    │                 └─→ _validation.py (共有バリデーションヘルパ。agents 非依存・最下層。
    │                           │          realtime/registry・_adapters も下向き参照)
+   ├────────────────→ agent_names.py (AgentNames / validate_agent_names。stdlib のみ・最下層リーフ)
    └────────────────→ _adapters/ (agents / 外部クライアント への import 単一窓口) ◄── 会話サービス / LLMOps 評価 / Agent Lightning 最適化
                               │ runtime import
                               ▼
@@ -89,7 +92,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -107,13 +110,14 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
 | `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
+| `agent_names.py` | `AgentNames`（エージェント名をクラス属性として宣言する基底クラス）/ `validate_agent_names`（定数簿の宣言集合と registry の登録名集合の整合検査）。実行時 import は標準ライブラリ（`keyword` / `inspect` / `typing`）のみで `agents` 非依存のコア最下層リーフ。`AgentRegistry` からの依存辺を持たない任意の追加手段。詳細は「エージェント名定数簿」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）/ `runtime/deterministic`（決定的応答モデルと応答ビルダの公開窓口・extra 不要＝追加依存なし。詳細は「決定的応答モデル」節）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -128,6 +132,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 __all__ = [
     "END",
     "START",
+    "AgentNames",    # エージェント名定数簿の宣言基底（詳細は「エージェント名定数簿」節）
     "AgentRegistry",
     "AgentSpec",
     "FacadeMode",
@@ -155,6 +160,7 @@ __all__ = [
     "lockdown",                       # runtime インテグリティ防御の起動点
     "next_turn_agent",                # 次ターン: 解決 + registry 解決 + last_agent フォールバック
     "resolve_next_agent",             # 次ターン: 上書き先の名前 or None（上書きなし）
+    "validate_agent_names",           # 定数簿と registry 登録名の整合検査（単一 KeyError）
     "IntegrityCheck",                 # 型: Callable[[], None]
     "IntegrityError",                 # 例外（Exception 継承・基底）
     "PromptTemplateIntegrityError",   # 例外（IntegrityError 継承）
@@ -194,6 +200,8 @@ Realtime シンボル（`RealtimeAgentSpec` / `RealtimeHandoffConfig` / `Realtim
 |---|---|
 | `AgentRegistry` | Agent の登録・遅延構築・ランタイム差し替えの中枢 |
 | `AgentSpec` | `Agent` の薄い宣言的 Wrapper（dataclass） |
+| `AgentNames` | エージェント名をクラス属性として宣言する基底クラス。継承した subclass のクラス定義時に到達不能名・非 str 値・注釈のみ宣言・値の重複を `ValueError` で拒否し、未宣言名アクセスは宣言済み名一覧つき `AttributeError`（詳細は「エージェント名定数簿」節） |
+| `validate_agent_names` | 定数簿の宣言集合と `AgentRegistry` の登録名集合の両方向の差分を全件集約し単一 `KeyError` で報告する検査関数（差分 0 件なら例外なし） |
 | `HandoffConfig` | ハンドオフ 1 エッジの設定（description / on_handoff / input_type / input_filter / is_enabled + options 素通し） |
 | `HandoffEdge` | 静的ハンドオフ 1 エッジ（src / dst / config） |
 | `HandoffGraph` | ハンドオフトポロジ。`edge` / `dynamic_edge` で宣言、`apply(registry)` で反映、`mermaid()` で可視化 |
@@ -366,6 +374,84 @@ Tool の再構築なしに次の run から当該 Tool を LLM から隠す（SD
 SDK ラップ（`function_tool()` 呼び出し・メタデータの SDK 引数への流し込み・is_enabled callable
 結線）は `_adapters/tools.py` の `build_function_tool` に閉じる（SDK 隔離）。設計判断の経緯は
 `docs/adr/0001-tool-metadata-centralization.md` を参照。
+
+## エージェント名定数簿
+
+`AgentNames` はエージェント名を 1 箇所のクラス属性宣言へ集約し、以降の参照を定数経由にするための
+コア公開 API である。`AgentSpec` / `AgentRegistry` / `HandoffGraph` / `NextTurnPolicy` からは完全に
+独立で、opt-in の注入点も設けない（橋渡しは利用者コードで定数を渡すことのみ）。生 str による宣言と
+`registry.validate()` / `get()` の実行時検出は不変であり、定数簿は**任意の追加手段**である。
+
+mypy 非導入のため「記述時に防ぐ」は静的型チェックではなく次の 3 点で達成する。
+
+1. 宣言済み名が実行時の登録操作なしに静的属性として解決でき、`dir()` に全宣言名が含まれる
+2. 未宣言名アクセスが即時の `AttributeError`（宣言済み名の一覧つき）になる
+3. 到達不能な宣言・不正な値・値の重複がクラス定義時に `ValueError` になる
+
+### 宣言と定義時検査
+
+```python
+class Names(AgentNames):
+    """本アプリのエージェント名（宣言はここ 1 箇所）。"""
+
+    PLANNER = "planner"
+    WRITER = "writer"
+```
+
+メタクラス（非公開）の `__new__` がクラス定義時に namespace を走査する。検査対象と扱いは次のとおり。
+
+| namespace のエントリ | 扱い |
+|---|---|
+| dunder（`__module__` / `__qualname__` / `__doc__` / `__annotations__` 等） | 検査・宣言集合とも除外（除外しないと docstring 付きクラスが定義できない） |
+| 基底 `AgentNames` 自身の生成 | 検査を skip（`bases` にメタクラスのインスタンスを含まない呼び出し） |
+| 単一 `_` 始まりの非 dunder | `ValueError` |
+| callable / classmethod / staticmethod / property / 型オブジェクト | `ValueError`（宣言専用の性質を守る） |
+| 注釈のみの宣言（`PLANNER: str`） | `ValueError`（属性が生えず参照が `AttributeError` になる silent trap の防止） |
+| 非空の str 値 | 採用。属性名に到達不能名規則 4 分岐、値に「非空 str」を課す |
+
+到達不能名規則の 4 分岐（非空 + `str.isidentifier()` / `_` 始まり禁止 / `keyword.iskeyword()` 禁止 /
+予約属性名との衝突禁止）は `ToolRegistry._validate_name` と同一規則で、規則の SoT は
+`ToolRegistry._validate_name` 側に置き docstring から相互参照する。予約属性名は
+`{"names", "mro"}` の明示集合とする（`mro` を含めるのは、`type.mro` が非データ記述子でクラス属性に
+隠され `cls.mro()` による introspection が壊れるため）。
+
+同一値が 2 つ以上の**異なる属性名**へ割り当てられている場合も `ValueError` にする（同一属性名の
+override は 1 名前として扱うため通る）。`PLANNER = "planner"` / `PLANER = "planner"` は防ぎたい
+タイポの一類型でありながら、拒否しなければ属性アクセスも整合検査も通ってしまい、どの検出網にも
+掛からないためである。属性名と値が異なる宣言（`PLANNER_V2 = "planner-v2"`）は許容する。
+
+### 参照・継承・照会
+
+- 宣言済み名はクラス属性として静的に解決され、`__getattr__` を通らない。`__getattr__` は**未宣言名の
+  検出専用**で、宣言済み**属性名**の一覧を含む `AttributeError` を送出する（`ToolRegistry.__getattr__`
+  と同一体裁）。`_` 始まりの名前は素の `AttributeError` で素通しし、`inspect` / `copy` / `pickle` /
+  pytest の内部プロトコル探索へ誤誘導メッセージを返さない。
+- 多段継承（`class Sub(Names): ...`）を許可し、宣言集合は MRO 集約する。`dir()` が親の属性を含むため、
+  集約しないと `names()` と `dir()` が食い違う。
+- `names() -> list[str]` は MRO 集約後の**宣言値**の昇順リストを返す（`AttributeError` が列挙するのは
+  属性名で、`names()` が返すのは値である点が非対称）。
+- 値は `str` のため、既存の名前参照フィールド（`AgentSpec.name` / `handoffs` / `handoff_options` の
+  キー / `sub_agents` / `sub_agent_tools` のキー / `DynamicHandoff.candidates` / `NextTurnRule` の
+  到達元・遷移先 / entry 名）へ変換なしに渡せる。定数と生 str の混在宣言も名前文字列の一致のみで
+  解決されるため、混在による解決失敗は起きない。
+
+### 整合検査（`validate_agent_names`）
+
+`validate_agent_names(names, registry)` は定数簿と同一モジュールの独立関数である。`AgentRegistry`
+からは既存公開 API の `registry.names()`（spec と factory の和集合）のみを呼び、型注釈は
+`if TYPE_CHECKING:` 配下でのみ import する。これにより `AgentRegistry` は名前定数簿を知らず、
+registry -> 定数簿の依存辺は存在しない。
+
+報告は「定数簿に宣言済みだが registry へ未登録」「registry へ登録済みだが定数簿に未宣言」の両方向の
+差分を全件集約し、単一の `KeyError` で送出する（群ごとに接頭辞を付け `"; "` で連結し、群が 2 つ
+揃うときのみ `" | "` で連結する `AgentRegistry.validate()` と同型の体裁）。差分 0 件なら例外を
+送出しない。`register_factory` で登録された名前も registry 側の既知名として扱う。
+
+例外メッセージの言語は「踏襲元の同一トピックに揃える」方針で、属性アクセス・識別子規則に属する
+`ValueError` / `AttributeError` は英語（`ToolRegistry` 踏襲）、集約報告の `KeyError` は日本語
+（`AgentRegistry.validate()` 踏襲）とする。
+
+設計判断の経緯は `docs/adr/0018-declarative-agent-name-catalog.md` を参照。
 
 ## SDK 隔離と依存性注入（DI）
 
@@ -806,7 +892,10 @@ DI 拡張点は「生成 = `AgentBuilder`」「実行 = 内部 runner シーム�
   post-execution streaming）。`Model.get_response` は context を受け取れないため、外側 context
   は engine へ渡さない（context 非伝播のハード制約）。構造化出力は `output_extractor`（既定は最終出力を
   単一メッセージ化）で `ModelResponse` の output を組み立てる。`ModelResponse` 構築ヘルパ
-  （`tests/_helpers/responses.py` の `text_response` と同型）を `_adapters` 内に置き既定で利用する。
+  （`_adapters/responses.py` の `text_response`。item 構築は公開応答ビルダと共有する非公開ヘルパへ
+  委譲し、ワークフロー用の固定 id を渡す）を `_adapters` 内に置き既定で利用する。streaming イベントの
+  ヘルパ（`_text_delta_events` / `_completed_event`）も公開モデルと共有し、`item_id` / `response_id` /
+  `model` にワークフロー用の値（`msg_workflow` / `resp_workflow` / `oai-agentspec-workflow`）を渡す。
 - `workflow_as_tool(interpret, *, tool_name, tool_description, output_extractor=None) -> FunctionTool`
   （経路A / D 共通）: `on_invoke_tool(tool_context, json)` クロージャ内で `tool_context.context` を内部
   インタプリタへ受け渡し（不変条件。SDK が自動透過しないため配線欠落は経路A / D でのみ共有 context 欠落の
@@ -817,6 +906,9 @@ DI 拡張点は「生成 = `AgentBuilder`」「実行 = 内部 runner シーム�
   `{"input": ...}` を引数にワークフロー tool を 1 回呼ぶ ToolCall だけを返す（`tool_call_response` ヘルパ
   経由）。`stop_on_first_tool` 併用前提（無いと tool 結果後に再び ToolCall を返し無限ループ）。可変な実行
   状態を持たないため同一インスタンスを並行 run で共有しても安全。
+
+上記 2 モデルはいずれも応答内容が lib 内部で固定される内部専用実装であり、利用者ルール関数へ応答決定を
+委譲する公開モデル `DeterministicResponseModel` との責務差は「決定的応答モデル」節を参照。
 
 ### 経路C / A / D は spec・registry・handoffs を非破壊で利用
 
@@ -877,6 +969,10 @@ lib が駆動してよいのは宣言済みグラフの制御フロー解釈（�
 前後フックの差込口に留める（利用者が書く）。前者は宣言の決定論的展開、後者は外部状態・時間・失敗に依存する
 副作用管理であり、薄さ・SDK 隔離原則の責任範囲を超えるためである。途中再開（mid-workflow resume /
 checkpoint）も持たない。
+
+`runtime/deterministic` の公開窓口も同じ線引きに従い、公開するのは「モデル宣言（ルール関数を持つ
+`Model` 実装）」と「応答オブジェクトの構築（応答ビルダ 5 種）」までで、`Runner.run` を内部で駆動する
+関数・独自の実行ループ・再試行機構は公開しない。
 
 ### データ受け渡しと継続
 
@@ -1105,6 +1201,9 @@ Realtime シンボルはコア `__all__` に載せず、`oai_agentspec.runtime.c
 
 `registry.validate()` は全 spec の `handoffs` / `sub_agents` 参照と動的ハンドオフ候補が解決可能かを
 一括検証し、未解決の参照をすべて集約して報告する。run 前に呼ぶことで名前のタイポ等を早期に検出できる。
+
+名前定数簿（`AgentNames`）の宣言集合と registry の登録名集合の整合検査は本節の対象外で、
+独立関数 `validate_agent_names` が担う（詳細は「エージェント名定数簿」節）。
 
 `guardrails`（guardrail 名の参照・「内容ガードレール」節）を宣言している spec がある場合、同じ検証で
 guardrail 由来の問題も集約する。集約対象は「未登録の guardrail 名」「解決元の未注入」「`guardrails` に
@@ -2410,6 +2509,144 @@ SDK 生型の再エクスポート（10 種。上級用途で利用者コード�
 `RetryPolicyContext` / `ModelRetryNormalizedError` / `RunErrorHandlers` / `RunErrorHandlerResult` /
 `RunErrorHandlerInput` / `RunErrorData`。
 
+## 決定的応答モデル
+
+`DeterministicResponseModel` は、外部 API を呼ばず「入力からルール関数が応答を決める」純関数方式の
+SDK `Model` 実装である。内部キューを消費しないため応答は呼び出し回数・順序に依存せず、同一インスタンスを
+複数 run・複数 Agent へ共有できる。想定用途は自動テスト・オフライン開発・デモ実行・決定的なシナリオ
+再生の 4 つで、テスト専用機能ではない。ただし本番の LLM 呼び出し経路の代替として運用構成へ残す使い方は
+誤用であり、この注意は利用者向けドキュメント（`docs/usage/runtime/deterministic.md`）にも明記する。
+
+### 既存の決定的モデル 2 種との責務差
+
+lib 内には決定的（実 LLM を呼ばない）Model が 3 つ存在するが、責務は次のとおり分かれる。
+
+| モデル | 応答の決まり方 | 公開面 | `stream_response` |
+|---|---|---|---|
+| `WorkflowModel`（経路C） | ワークフロー内部インタプリタの結果に固定 | 非公開（`_adapters`） | post-execution streaming（delta + 終端） |
+| `DeterministicToolCallModel`（経路D の入口） | 保持する固定 tool 名を 1 回呼ぶ ToolCall に固定 | 非公開（`_adapters`） | 終端イベント 1 件 |
+| `DeterministicResponseModel` | 利用者ルール関数が入力から決定 | `runtime/deterministic` 公開窓口 | post-execution streaming（delta + 終端） |
+
+3 モデルはいずれも応答を確定させてからイベントを流す **post-execution streaming** で揃える。
+`DeterministicResponseModel.stream_response` は `WorkflowModel.stream_response` と同型の async
+generator で、`get_response` を回して応答を確定させ、テキストが非空ならテキスト delta を流し、最後に
+終端イベントを yield する。ツール呼び出しのみの応答では delta が流れず終端イベントのみになる
+（`DeterministicToolCallModel` と同じ）。区切り規則（擬似トークン長）と `item_id` の採番は lib の内部
+決定であり、利用者ルール関数へは課さない。
+
+制約として、これは実際の逐次生成ではなく**完成済みの応答を一定長で区切って流す**方式であり、delta は
+進捗を表さない（応答はルール関数が返した時点で確定している）。この性質は `WorkflowModel` と同一である。
+
+### 配置と依存方向
+
+```
+runtime/deterministic/__init__.py   公開窓口・再エクスポート専用・__all__ 7 件
+        |  from ..._adapters.deterministic import ...
+        v
+_adapters/deterministic.py          ModelRequest / DeterministicResponseModel /
+        |                           公開応答ビルダ 5 種 / 既定 id 定数 5 件
+        |  from .responses import _make_text_message, _make_function_call,
+        |                         _text_delta_events, _completed_event, _text_of
+        v
+_adapters/responses.py              共有 item / イベントヘルパ（非公開）+ ワークフロー用 2 ビルダ
+```
+
+`_adapters/deterministic.py` は `_adapters/__init__.py` から import しない（`_adapters/hooks.py` /
+`guardrails.py` / `intent.py` と同じ「1 窓口 ↔ 1 専用 `_adapters` モジュール」の配置）。
+`_adapters/__init__.py` は無変更。`_adapters/models.py` は共有ヘルパの引数化に伴う id の明示渡し
+のみで、既存 2 モデルの応答内容・固定 id 値・イベント列は不変である。
+
+SDK Responses item の構築（`ResponseOutputMessage` / `ResponseFunctionToolCall`）は
+`_adapters/responses.py` の非公開共有ヘルパ（`_make_text_message` / `_make_function_call`）へ集約し、
+ワークフロー用の既存 2 ビルダも公開ビルダも同ヘルパへ委譲する。ヘルパを既存モジュール側へ置くのは、
+新モジュール側へ置くと共有ヘルパ（`_text_of` 等）の参照と合わせて module レベルの循環になるためである。
+`ModelResponse` のラップ（1 行）は 2 箇所に残す。
+
+streaming イベント生成のヘルパ（`_text_delta_events` / `_completed_event`）も両経路で共有する。
+どちらも id 値を引数で受け取り（`_text_delta_events(text, *, item_id)` /
+`_completed_event(output_items, sequence_number, *, response_id, model)`）、呼び出し側がワークフロー用 /
+公開用の値を明示する。既定値は持たせない（渡し忘れが既定値で無言に成立しないようにするため）。
+
+### ルール関数の契約と `ModelRequest`
+
+`get_response` はキーワード優先 + 位置フォールバックで引数を正規化してから `ModelRequest`（frozen
+dataclass）を組み立て、ルール関数へ渡す。フィールドは `system_instructions` / `input` / `user_text` /
+`turn` / `tool_outputs` / `model_settings` / `tools` / `handoffs` / `output_schema` で、`tracing` /
+`previous_response_id` / `conversation_id` / `prompt` は渡さない（応答決定に使う合理的理由がなく
+公開面を広げないため。後から増やすのは非破壊）。SDK 型は不透明値として `Any` / `tuple[Any, ...]` で
+運ぶだけで、lib は属性へ触らない。
+
+- `user_text` は user 由来のテキストだけを載せる `str` で、抽出できない場合は空文字列になる。生の
+  入力が要る場合は `input` から取る。入力全体の文字列表現を載せると、tool 実行結果や system 文言と
+  いった非 user 由来のデータが `user_text` 経由で `if "..." in request.user_text` 形の遷移判定へ
+  流れ込む（信頼境界の越境）ためである。
+- `turn` と `tool_outputs`（入力中の tool 実行結果アイテム列）はいずれも `input` から純粋に
+  導出する。内部カウンタを持たないためステートレス性は保たれる。入力は
+  `ItemHelpers.input_to_new_input_list` で input-list へ正規化し、list へ正規化できない入力
+  （`None` / 非 iterable / 単体 dict 等）は空列へ倒す。このとき `user_text` は空文字列・
+  `turn` は 0・`tool_outputs` は空になる。
+- `turn` は入力（Session 併用時は履歴を含む）に含まれるモデル応答の件数で、**1 モデル応答 = 1 ターン**
+  として数える。SDK は Session 指定時に「セッション履歴 + 今ターンの入力」をモデル入力として渡すため、
+  `runtime.conversation` や `Runner.run(session=...)` を併用する構成では前ターンまでの応答も数に入り、
+  run ごとの初回のモデル呼び出しでも 0 にはならない。ターン境界は「user / tool 側が話したところ」
+  （role が `user` / `system` / `developer`、または `*_output` 型の item）で判定し、role も type も
+  取れない要素は SDK item と見なさず計上しない（単体 dict が list 化されてキー文字列だけが届く経路で、
+  非 item 要素が assistant 由来として数えられるのを防ぐ。正常な item は role か type を必ず持つため、
+  この除外は通常の入力では発火しない）。残りは assistant 由来として扱う。assistant 側の item 種別を
+  列挙する allowlist にしないのは、SDK が assistant 側の item 種別を増やす方向（hosted tool 系の
+  `web_search_call` 等）であり、allowlist では追随漏れした種別が 1 応答の途中でグループを分断して
+  1 応答が 2 ターンとして数えられるためである。既知の限界として、`mcp_approval_response` は
+  user（承認者）側の item でありながら role も `*_output` 接尾辞も持たないため境界として検出できず、
+  承認要求 item と承認応答 item が 1 グループへ連結して `turn` が過少計上される（実運用影響は限定的で、
+  決定的モデル自身は hosted MCP item を生成できないため、記録済み履歴の再生用途に限られる）。
+- `turn` と `tool_outputs` が必要なのは、`user_text` が載せるのは role が `user` の最新テキストであり、**tool 呼び出しの
+  前後で `user_text` が変わらない**ためである。`user_text` だけで分岐するルール関数は tool 結果を
+  受けた次のターンでも同じ ToolCall を返し続け、`max_turns` まで回る（`DeterministicToolCallModel`
+  が `stop_on_first_tool` 前提で回避しているのと同じ現象）。
+- ルール関数は同期 / async の双方を受理し、戻り値が awaitable なら `inspect.isawaitable` で分岐して
+  await する（`AgentRegistry._build_dynamic_handoff` の resolver と同型）。
+- `None` の返却は「応答を決定できない」の通知手段で、空テキスト応答となり run は正常終了する。
+- ルール関数が送出した例外は握り潰さず伝播させ、空応答へ差し替えない。SDK はモデルを retry ラッパ
+  経由で呼ぶため、利用者が `ModelRetryPolicy` を併用した構成では当該例外も再試行対象になりうる
+  （利用者が明示的に有効化した SDK ネイティブ機構の作用であり、lib 側で例外を握らない契約は不変）。
+
+### 応答ビルダと既定 id の 2 系統
+
+公開ビルダは次の 5 種で、いずれも実行を伴わない純関数である。
+
+| ビルダ | 応答の内容 |
+|---|---|
+| `text_response(text)` | 単一のアシスタントテキストメッセージ |
+| `text_response_with_usage(text, *, total_tokens, requests=1)` | 上記 + usage 指定 |
+| `tool_call_response(tool_name, arguments="{}", *, call_id=...)` | 単一の function ToolCall |
+| `multi_tool_call_response(calls)` | 複数の ToolCall（`(tool 名, 引数, call_id)` の列） |
+| `mixed_response(text, calls, *, total_tokens=0, requests=0)` | テキストメッセージ 1 件 + 宣言順の ToolCall（「一言返してから tool を呼ぶ」「発話しながらハンドオフする」用） |
+
+既定 id 値は公開用と内部ワークフロー用の 2 系統を持つ。
+
+| 用途 | メッセージ id | ToolCall の item id | `call_id` | stream 終端の id / model |
+|---|---|---|---|---|
+| 公開（`runtime/deterministic`） | `msg_deterministic` | `fc_deterministic`（複数指定できる版は `fc_<call_id>`） | `call_deterministic`（指定可） | `resp_deterministic` / `oai-agentspec-deterministic` |
+| 内部ワークフロー用（`_adapters/responses.py`） | `msg_workflow` | SDK 既定（`None`） | `wf_call` | `resp_workflow` / `oai-agentspec-workflow` |
+
+公開側の既定値 5 件は `Fake` / `Mock` / `Dummy` / `workflow` / `wf` のいずれも含まず、SDK の id 接頭辞
+慣行（`msg_` / `fc_` / `call_` / `resp_`）を守る。内部ワークフロー用の値は既存挙動を変えないため不変。
+
+### 公開窓口と配置
+
+公開窓口は `oai_agentspec.runtime.deterministic`。実装本体を持たず直 import と `__all__` 宣言のみで
+構成する（`runtime/guardrails` と同型の通常再エクスポート）。`__all__` は 7 件
+（`DeterministicResponseModel` / `ModelRequest` / 応答ビルダ 5 種）で、run 実行関数・実行ループ・
+再試行機構は含めない。`ModelRequest` を掲載するのは、利用者がルール関数の引数へ型注釈を付けられ、
+エディタ補完でフィールドを発見できるためである。
+
+PEP 562 遅延再エクスポート（`runtime/hooks` 方式）は採らない。`_adapters/__init__.py` が `.models` /
+`.responses` を eager import し、`import oai_agentspec` で `agents` が必ず載るため遅延が成立せず、
+追加依存もゼロで extra 未導入耐性のための遅延も不要なためである。extra は宣言せず、コア `__all__` にも
+1 件も載せない（コア `__all__` は宣言層シンボルのみという原則を保つ）。
+
+設計判断の経緯は `docs/adr/0019-deterministic-response-model.md` を参照。
+
 ## テスト層
 
 | 層 | 依存 | 対象 |
@@ -2441,8 +2678,33 @@ ML ベース分類器支援は同じ 2 層で検証する。L2 の `test_ml_l2.p
 mapper・dedup・allowlist・sort・truncate・同期/非同期ブリッジ・fit 駆動・ラベルエンコード/復号を
 検証する。sklearn 自体はテストスイートで一切使用せず、examples 実行時のみの依存に留める。
 
+エージェント名定数簿（`agent_names`）は L1 で検証する。docstring 付きクラスと基底クラス自身の生成が
+通ること、未宣言名アクセスの一覧つき `AttributeError` と `_` 始まりの素通し、到達不能名 4 分岐・非 str /
+空 / callable・descriptor・注釈のみ宣言・値の重複・予約属性名の各 `ValueError`、多段継承での `names()` の
+MRO 集約と `dir()` の対応、`isinstance(value, str)` と `names()` の昇順、整合検査の両方向差分・単一
+`KeyError`・`register_factory` 名の扱い・差分 0 件の正常終了を pin する。FR-2 の全参照経路については
+`FakeAgentBuilder` 注入で「定数と生 str が同一の Agent 構成（`handoffs` の並び・`tools` の並び）になる」
+ことと、定数を位置引数で渡した `AgentSpec` の位置引数束縛契約を pin する。
+
+決定的応答モデル（`runtime/deterministic`）は L1 / L2 の両方で検証する。応答ビルダ 5 種は L1 で構造・
+`usage` 反映・`call_id` の指定 / 省略・複数 ToolCall の個別 `call_id`・`mixed_response` のテキストと
+ToolCall の並び・既定 id 値 5 件のリテラル pin と、ワークフロー用 2 ビルダおよび streaming イベントの
+id / model の回帰 pin（委譲統合・ヘルパ引数化で挙動が変わらないこと）を行う。モデル本体は L2 で
+実 `Runner` を使い、`Runner.run` の完走と `final_output` 反映・同一インスタンスの再実行同一性・複数
+Agent 共有の順序非依存・tool / handoff 誘発・`None` 返却時の空文字終了・awaitable 受理・例外伝播
+（`model_settings.retry` 未設定の既定構成で pin）・`Runner.run_streamed` でのテキスト delta と終端
+イベント（ツール呼び出しのみの応答では終端イベントのみ）・`get_response` の位置 / キーワード両様の
+正規化・`turn` と `tool_outputs` の導出・`turn` で分岐する
+ルール関数で 2 ターンが完走し `max_turns` に達しないこと（無限ループ回帰の pin）を検証する。いずれも
+conftest の autouse fixture（API キー削除・トレーシング無効化・ネットワーク遮断）下で走る。公開窓口の
+`__all__` 7 件の集合 pin と clean subprocess での import 成功、および公開面の命名照合（コア `__all__` と
+`runtime/` 全窓口の `__all__` に `Fake` / `Mock` / `Dummy` を含む名前が 0 件・コア `__all__` に決定的
+応答モデル系シンボルが 0 件）も置く。命名照合は窓口を import せず `__init__.py` を `ast` で静的解析する
+方式とし、extra 未導入環境でも skip されず保証が空洞化しないようにする。
+
 L2 には SDK バージョン耐性トリップワイヤ（NFR-7）を置く。openai-agents SDK との結合点で手組みしている
-前提（`Model` 抽象メソッド集合・手組みレスポンス型の必須フィールド集合・入口入力の正規化形式への依存・
+前提（`Model` 抽象メソッド集合・`get_response` / `stream_response` の位置引数順とキーワード専用引数の
+集合・手組みレスポンス型の必須フィールド集合・入口入力の正規化形式への依存・
 context 透過経路の公開構造・`tool_choice` の既知 `Literal` メンバ・HITL の interruptions の存在 /
 `RunState` の `to_string` / `from_string` 往復 / approve / reject の API 形）が SDK の将来変更で build-time にも
 実行時例外にも現れないまま静かに退行するのを防ぐため、前提が崩れたら CI で fail させる。検知の網だけを

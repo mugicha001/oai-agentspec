@@ -137,6 +137,43 @@ spec = AgentSpec(
 |---|---|---|---|
 | `agent_builder` | `AgentBuilder \| None` | `None` | Agent 構築の Protocol 実装。省略時は `_adapters` の既定 |
 
+### `AgentNames`（エージェント名の定数簿）
+
+エージェント名の文字列リテラルを複数箇所へ書き写すとタイポが run まで発覚しません。`AgentNames` を
+継承したクラスに名前を 1 箇所だけ宣言すると、以降の参照を定数経由にできます（opt-in。生 str の宣言は
+従来どおり動きます）。
+
+```python
+from oai_agentspec import AgentNames, AgentRegistry, AgentSpec, validate_agent_names
+
+
+class Names(AgentNames):
+    """本アプリのエージェント名（宣言はここ 1 箇所）。"""
+
+    PLANNER = "planner"
+    WRITER = "writer"
+
+
+registry = AgentRegistry()
+registry.register(AgentSpec(Names.PLANNER, "計画を立てる", handoffs=[Names.WRITER]))
+registry.register(AgentSpec(Names.WRITER, "本文を書く"))
+
+validate_agent_names(Names, registry)   # 宣言と登録の差分が 0 件なら何も起きない
+registry.validate()                     # 既存の参照検証（従来どおり）
+agent = registry.get(Names.PLANNER)
+```
+
+| メンバ | 説明 |
+|---|---|
+| クラス属性宣言（`PLANNER = "planner"`） | 値は `str`。`handoffs` / `sub_agents` / `handoff_options` のキー / `DynamicHandoff.candidates` / `NextTurnRule` の到達元・遷移先 / entry 名へ変換なしに渡せる |
+| `Names.PLANER`（未宣言名） | 宣言済み名の一覧つき `AttributeError` |
+| `Names.names()` | 宣言値の昇順リスト（多段継承時は MRO 集約） |
+| `validate_agent_names(Names, registry)` | 「宣言済みだが未登録」「登録済みだが未宣言」の両方向の差分を全件集約して単一 `KeyError`。差分 0 件なら例外なし |
+
+クラス定義時に `ValueError` になる宣言: `_` 始まり / 非識別子 / Python 予約語 / 予約属性名（`names` /
+`mro`）との衝突 / 値が非 str・空文字・callable / 注釈だけの宣言（`PLANNER: str`）/ **同じ値を異なる
+属性名へ 2 回宣言**（`PLANNER = "planner"` と `PLANER = "planner"` の併存）。
+
 ### `HandoffConfig`（frozen）
 
 | パラメータ | 型 | 既定 | 説明 |
@@ -160,12 +197,14 @@ spec = AgentSpec(
 - `extra` に専用フィールドと同名キーを入れると `ValueError`（二重指定防止）
 - `extra` の未知キー（`output_typ` 等のタイポ）は `ValueError` で弾く
 - `registry.freeze()` 後に register / update すると `RegistryFrozenError`（`lockdown(root, registry=registry)` は内部で `freeze()` を呼ぶ）
+- `AgentNames` の subclass は「宣言専用」です。メソッド・property を持たせるとクラス定義時に `ValueError` になります
+- `validate_agent_names` は任意の追加手段です。呼ばなくても従来どおり `validate()` / `get()` の実行時検出は働きます
 
 ## 参照
 
 - 詳細設計: `docs/architecture.md`（AgentSpec / SandboxAgentSpec 節）
-- 具体例: `examples/basic/basic.py` / `examples/basic/dynamic_context.py` / `examples/basic/runtime_update.py` / `examples/sandbox/` / `examples/hooks/01_chain_agent_hooks.py`（`hooks` の複数宣言）/ `examples/hooks/02_chain_hooks.py`（run 単位との非対称）
-- 設計判断: `docs/adr/0016-agent-hooks-chain-helper.md`（`chain_agent_hooks`）/ `docs/adr/0017-reject-run-hooks-in-chain-agent-hooks.md`（run 単位フックの拒否）
+- 具体例: `examples/basic/basic.py` / `examples/basic/dynamic_context.py` / `examples/basic/runtime_update.py` / `examples/sandbox/` / `examples/hooks/01_chain_agent_hooks.py`（`hooks` の複数宣言）/ `examples/hooks/02_chain_hooks.py`（run 単位との非対称）/ `examples/agent_names/01_declarative_names.py`（エージェント名定数簿）
+- 設計判断: `docs/adr/0016-agent-hooks-chain-helper.md`（`chain_agent_hooks`）/ `docs/adr/0017-reject-run-hooks-in-chain-agent-hooks.md`（run 単位フックの拒否）/ `docs/adr/0018-declarative-agent-name-catalog.md`（`AgentNames`）
 
 ## 次
 

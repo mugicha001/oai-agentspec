@@ -77,7 +77,7 @@ class _RepeatModel(Model):
         **kwargs: Any,
     ) -> ModelResponse:
         """固定テキスト応答を返す。"""
-        from _helpers.responses import text_response
+        from oai_agentspec.runtime.deterministic import text_response
 
         return text_response(self._text)
 
@@ -2593,7 +2593,7 @@ def _fake_handoff_model(handoff_count: int = 30) -> FakeModel:
     rollout（pre-flight + train + val 各 case）にわたって同一パターンの handoff を安定して
     再現する。billing の応答は別の `_RepeatModel` に任せる。
     """
-    from _helpers.responses import tool_call_response
+    from oai_agentspec.runtime.deterministic import tool_call_response
 
     model = FakeModel()
     for _ in range(handoff_count):

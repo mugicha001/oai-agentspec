@@ -19,7 +19,7 @@ from typing import Any
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
-from .responses import text_response
+from oai_agentspec.runtime.deterministic import text_response
 
 
 @dataclass
@@ -112,7 +112,9 @@ class QueuedFakeModel(Model):
         response = await self.get_response(system_instructions, input, *args, **kwargs)
         text = _text_of(response)
         seq = 0
-        for event in _text_delta_events(text):
+        for event in _text_delta_events(text, item_id="msg_stream_fake"):
             yield event
             seq = event.sequence_number + 1
-        yield _completed_event(response.output, seq)
+        yield _completed_event(
+            response.output, seq, response_id="resp_stream_fake", model="stream-fake"
+        )

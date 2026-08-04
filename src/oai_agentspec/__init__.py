@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from ._adapters import function_tool
+from .agent_names import AgentNames, validate_agent_names
 from .handoffs import HandoffEdge, HandoffGraph, from_specs
 from .integrity import (
     IntegrityCheck,
@@ -45,6 +46,7 @@ from .workflow import (
 __all__ = [
     "END",
     "START",
+    "AgentNames",
     "AgentRegistry",
     "AgentSpec",
     "FacadeMode",
@@ -77,6 +79,7 @@ __all__ = [
     "lockdown",
     "next_turn_agent",
     "resolve_next_agent",
+    "validate_agent_names",
 ]
 
 

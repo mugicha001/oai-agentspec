@@ -12,7 +12,7 @@ from typing import Any
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
-from .responses import text_response
+from oai_agentspec.runtime.deterministic import text_response
 
 
 class IntentFakeModel(Model):

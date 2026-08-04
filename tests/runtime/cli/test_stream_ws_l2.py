@@ -32,9 +32,8 @@ from oai_agentspec.runtime.cli.client import (  # noqa: E402
     StreamToken,
 )
 from oai_agentspec.runtime.conversation import ConversationService  # noqa: E402
+from oai_agentspec.runtime.deterministic import text_response  # noqa: E402
 from oai_agentspec.runtime.serve import create_app  # noqa: E402
-
-from _helpers.responses import text_response  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -69,10 +68,12 @@ class _StreamingFakeModel(Model):
         response = await self.get_response(system_instructions, input, *args, **kwargs)
         text = _text_of(response)
         seq = 0
-        for event in _text_delta_events(text):
+        for event in _text_delta_events(text, item_id="msg_stream_fake"):
             yield event
             seq = event.sequence_number + 1
-        yield _completed_event(response.output, seq)
+        yield _completed_event(
+            response.output, seq, response_id="resp_stream_fake", model="stream-fake"
+        )
 
 
 def _free_port() -> int:

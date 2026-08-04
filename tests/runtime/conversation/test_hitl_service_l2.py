@@ -32,13 +32,13 @@ from oai_agentspec.runtime.conversation import (
     StreamDelta,
     StreamDone,
 )
-
-from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool
-from _helpers.responses import (
+from oai_agentspec.runtime.deterministic import (
     multi_tool_call_response,
     text_response,
     tool_call_response,
 )
+
+from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool
 
 pytestmark = pytest.mark.integration
 

@@ -38,12 +38,13 @@
 16. [runtime/realtime.md](./runtime/realtime.md)
 17. [runtime/conversation.md](./runtime/conversation.md)
 18. [runtime/serve_and_cli.md](./runtime/serve_and_cli.md)
+19. [runtime/deterministic.md](./runtime/deterministic.md)
 
 ## extras 一覧
 
 | extra | 追加依存 | 有効化される機能 |
 |---|---|---|
-| （なし） | - | `AgentSpec` / `AgentRegistry` / `HandoffGraph` / `NextTurnPolicy` / `WorkflowGraph` / `PromptStore` / `ToolRegistry` / `lockdown` / Realtime 宣言 |
+| （なし） | - | `AgentSpec` / `AgentRegistry` / `AgentNames`（エージェント名定数簿 + `validate_agent_names`）/ `HandoffGraph` / `NextTurnPolicy` / `WorkflowGraph` / `PromptStore` / `ToolRegistry` / `lockdown` / Realtime 宣言 / `runtime.deterministic`（決定的応答モデル + 応答ビルダ） |
 | `conversation` | 追加依存なし | `ConversationService` 等の公開窓口分離（opt-in 表現） |
 | `serve` | `fastapi` / `uvicorn` | `oai-agentspec serve`（FastAPI サーバ入口・dev 用途） |
 | `cli` | `httpx` / `websockets` / `rich` | `oai-agentspec chat`（別プロセス CLI） |
@@ -65,6 +66,7 @@
 - 決定論的に順次実行したい → [core/workflow](./core/workflow.md)
 - 会話履歴を扱いたい → [runtime/conversation](./runtime/conversation.md)
 - レイテンシ最小の音声 → [runtime/realtime](./runtime/realtime.md)
+- 実 API を呼ばずに決定的な応答で動かしたい → [runtime/deterministic](./runtime/deterministic.md)
 - 実行の安全網（retry / budget / guardrails / policy） → [safety/](./safety/)
 - 品質評価 → [ops/llmops](./ops/llmops.md)
 - プロンプト自動最適化 → [ops/lightning](./ops/lightning.md)

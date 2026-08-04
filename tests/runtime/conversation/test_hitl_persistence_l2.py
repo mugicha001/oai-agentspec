@@ -24,9 +24,9 @@ from oai_agentspec.runtime.conversation import (
     PendingApproval,
     SessionPolicy,
 )
+from oai_agentspec.runtime.deterministic import text_response, tool_call_response
 
 from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool
-from _helpers.responses import text_response, tool_call_response
 
 pytestmark = pytest.mark.integration
 
