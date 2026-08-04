@@ -12,8 +12,11 @@ SDK 生型 10 種（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再�
 import しない）ため**直 import** で `__all__` へ載せる。intent 窓口は pydantic 依存の
 ため全シンボルを PEP 562 で遅延化しているが、本窓口では依存を持たないシンボルは直
 import としてよい（差分理由）。`build_*` と SDK 生型 10 種は SDK への上向き参照を持つ
-ため、`__getattr__` で `_adapters.resilience` 経由の**遅延取得**とし、窓口の import 自体
-は `agents` を発火させない（NFR-1 の隔離を利用者側の import タイミングでも維持）。
+ため、`__getattr__` で `_adapters.resilience` 経由の**遅延取得**とし、窓口 import 時点では
+実装実体の `_adapters.resilience` をロードしない（`hooks` 窓口と同型の遅延パターン）。
+`agents` 自体はコア依存であり、`oai_agentspec/__init__.py` -> `_adapters/__init__.py` の
+連鎖で本窓口の import より前にロード済みになる。遅延の対象は実装実体のモジュールで
+あって SDK ではない。
 
 `_DIRECT_SYMBOLS` は直 import 済みシンボルの再解決フォールバック用にシンボル名から
 所属モジュール名（`_types` / `_failsafe`）への対応を dict で持つ（複数モジュールに
@@ -89,8 +92,9 @@ _DIRECT_SYMBOLS: dict[str, str] = {
 def __getattr__(name: str) -> Any:
     """PEP 562: `_adapters.resilience` 経由でシンボルを遅延取得しキャッシュする。
 
-    窓口 import 時に `agents` を発火させないため、SDK 生型と build 関数は本関数で初めて
-    ロードする。取得済み値は `globals()` に載せて 2 回目以降を高速化する。
+    SDK 生型と build 関数の実装実体である `_adapters.resilience` のロードを属性アクセス時
+    まで遅らせる。`agents` 自体はコア依存で本窓口の import より前にロード済みのため、遅延の
+    対象ではない。取得済み値は `globals()` に載せて 2 回目以降を高速化する。
 
     Args:
         name: アクセスされた属性名。

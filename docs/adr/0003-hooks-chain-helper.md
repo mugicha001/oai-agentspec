@@ -1,6 +1,6 @@
 # 0003: RunHooksBase 合成ヘルパー chain_hooks を提供する
 
-- Status: accepted
+- Status: accepted (Confirmation の記述は 0020 で訂正)
 - Date: 2026-07-22
 
 ## Context

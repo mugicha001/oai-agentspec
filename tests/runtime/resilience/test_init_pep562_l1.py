@@ -8,13 +8,41 @@ resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudge
 遅延取得になる。
 lib 独自例外 `RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`
 （本窓口からは撤去済み）。
+
+遅延の対象は `_adapters.resilience` モジュールであって `agents` ではない。`agents` は
+コア依存で `oai_agentspec/__init__.py` -> `_adapters/__init__.py` の連鎖によりこの窓口の
+import より前にロード済みになるため、本ファイルの probe も `_adapters.resilience` の
+非ロードのみを検査する（`tests/runtime/hooks/` の probe と同型）。
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 pytestmark = pytest.mark.unit
+
+
+_SRC_DIR = Path(__file__).resolve().parent.parent.parent.parent / "src"
+
+
+def _run_in_clean_subprocess(probe: str) -> str:
+    """`src` を path に通したクリーンな子プロセスで probe スクリプトを実行し標準出力を返す。"""
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(_SRC_DIR) + (os.pathsep + existing if existing else "")
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+    return result.stdout.strip()
 
 
 # lib 独自 9 種。うち直 import は宣言型 5 + 関数 1 + sentinel 1、遅延は build_* 2。
@@ -132,6 +160,44 @@ def test_run_budget_exceeded_is_removed_from_window() -> None:
 
     with pytest.raises(AttributeError):
         mod.__getattr__("RunBudgetExceeded")
+
+
+def test_importing_window_does_not_load_adapter_module() -> None:
+    """`import oai_agentspec.runtime.resilience` 時点で `_adapters.resilience` を発火させない。
+
+    実体 `_adapters/resilience.py` は SDK 生型と build 関数を定義するが、窓口の `__getattr__`
+    経由でしか import されないため、窓口 module import だけでは実装 module 自体が読み込まれない
+    ことを固定する。`agents` は core 依存として本体 import で既に載っているため対象外。
+    `_adapters/__init__.py` がトップレベルで `.resilience` を import する退行（コア import 連鎖で
+    常時ロードされ遅延が空振りする）もこの probe が検知する。
+    """
+    probe = (
+        "import sys\n"
+        "import oai_agentspec.runtime.resilience\n"
+        "loaded = 'oai_agentspec._adapters.resilience' in sys.modules\n"
+        "print('loaded' if loaded else 'not-loaded')\n"
+    )
+    out = _run_in_clean_subprocess(probe)
+    assert out == "not-loaded", f"窓口 import で _adapters.resilience が発火しました: {out}"
+
+
+def test_dir_call_does_not_load_adapter_module() -> None:
+    """`dir(mod)` を呼んでも `_adapters.resilience` を発火させない（名前集合のみを見る）。
+
+    `__dir__` が `__all__` の名前集合と `globals()` のみを参照し実体に触れないことを固定する。
+    遅延シンボル未アクセスの状態で `dir()` を呼ぶ経路を押さえることで、シンボル追加時に
+    `__dir__` が実体解決（`__getattr__` 相当の呼び出し）へ退化する回帰を検知する。
+    """
+    probe = (
+        "import sys\n"
+        "import oai_agentspec.runtime.resilience as mod\n"
+        "names = set(dir(mod))\n"
+        "assert 'build_model_retry' in names and 'ModelRetrySettings' in names, sorted(names)\n"
+        "loaded = 'oai_agentspec._adapters.resilience' in sys.modules\n"
+        "print('loaded' if loaded else 'not-loaded')\n"
+    )
+    out = _run_in_clean_subprocess(probe)
+    assert out == "not-loaded", f"dir() 呼び出しで _adapters.resilience が発火しました: {out}"
 
 
 async def test_failsafe_call_is_usable_via_window_import() -> None:
