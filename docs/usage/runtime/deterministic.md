@@ -77,7 +77,7 @@ registry.register(AgentSpec("booking", "予約", model=model))
 | `system_instructions` | `str \| None` | Agent の instructions |
 | `input` | `Any` | SDK が渡した入力（str または input item のリスト） |
 | `user_text` | `str` | 入力から抽出した直近の user テキスト。user 由来テキストのみを載せ、抽出できない場合は空文字列（生の入力は `input` から取得する） |
-| `turn` | `int` | 入力に含まれるモデル応答の件数（1 モデル応答 = 1 ターン・初回 0）。`input` から導出 |
+| `turn` | `int` | 入力（Session 併用時は履歴を含む）に含まれるモデル応答の件数（1 モデル応答 = 1 ターン）。`input` から導出。Session を使う構成では前ターンまでの応答も数に入るため、run ごとの初回は 0 になりません |
 | `tool_outputs` | `tuple[Any, ...]` | 入力中の tool 実行結果アイテムの列。`input` から導出 |
 | `model_settings` | `Any` | `agents.ModelSettings`（`tool_choice` 等で分岐したい場合に使う） |
 | `tools` | `tuple[Any, ...]` | 提示されている Tool |
@@ -117,8 +117,12 @@ return mixed_response("担当へおつなぎします", [("transfer_to_booking",
 
 ## 落とし穴
 
-- **多ターンは `turn` で分岐します**。`user_text` だけで分岐すると tool 結果を受けた次のターンでも同じ ToolCall を返し続け、`max_turns` に達するまで無限ループになります。tool 実行結果は role が `user` のアイテムではないため、tool 呼び出しの前後で `user_text` は変わりません。tool 名や戻り値で分岐したい場合は `tool_outputs` を見てください
-- **`tool_outputs` にはハンドオフ（`transfer_to_*`）の結果も載ります**。ハンドオフも SDK 上は関数呼び出しだからです。`if request.tool_outputs:` のように無条件で分岐すると、ハンドオフ後の応答まで tool 分岐が乗っ取ります。tool 実行で分岐するときは tool 名か `call_id` で絞り込んでください（応答ビルダは `call_id` を指定できます）
+- **多ターンは `turn` で分岐します**。`user_text` だけで分岐すると tool 結果を受けた次のターンでも同じ ToolCall を返し続け、`max_turns` に達するまで無限ループになります。tool 実行結果は role が `user` のアイテムではないため、tool 呼び出しの前後で `user_text` は変わりません。戻り値や `call_id` で分岐したい場合は `tool_outputs` を見てください
+- **`tool_outputs` に載るアイテムは tool 名を持ちません**。SDK が載せる `function_call_output` アイテムのフィールドは `call_id` / `output` / `type`（+ `id` / `status`）だけで、tool 名は `request.input` 側の `function_call` アイテムにしかありません。したがって `tool_outputs` の絞り込みは **`call_id` で行うのが正典**です。tool 名で絞りたい場合は 2 段階の手順を踏みます: (1) `request.input` を走査して `type == "function_call"` のアイテムから `name` -> `call_id` の対応を作る、(2) その `call_id` で `tool_outputs` を絞る
+- **`tool_outputs` にはハンドオフ（`transfer_to_*`）の結果も載ります**。ハンドオフも SDK 上は関数呼び出しだからです。`if request.tool_outputs:` のように無条件で分岐すると、ハンドオフ後の応答まで tool 分岐が乗っ取ります。tool 実行で分岐するときは `call_id` で絞り込んでください（応答ビルダは `call_id` を指定できます）
+- **tool 実行とハンドオフを併用する場合は、呼び出しごとに一意な `call_id` を指定してください**。`tool_call_response` の既定 `call_id` は `call_deterministic` という、全呼び出しで共有される単一の固定値です。1 つのルール関数が tool 呼び出しと `transfer_to_*` の双方を既定値のまま発行すると、両方の `function_call_output` が同じ `call_id` を持ち、`call_id` による絞り込みが判別能力を失います。`multi_tool_call_response` / `mixed_response` は `call_id` が必須引数なので、この穴はありません
+- **`input` は必ず list で渡してください**。単体 dict（`Runner.run(agent, input={"role": ..., "content": ...})`）を渡すと list へ正規化できず、`user_text` が空文字列・`turn` が 0・`tool_outputs` が空になります。**例外も警告も出ない**ため、気づけるのはルール関数の分岐が想定と違う挙動をしたときだけです（`None` や非 iterable を渡した場合も同じ空値になります）
+- Session（`runtime.conversation` / `Runner.run(session=...)`）併用時に run 単位で分岐したい場合は、`turn` の絶対値に依存せず `tool_outputs` または `input` を見てください。Session 併用時の `turn` にはセッション履歴中の応答も数に入るため、run ごとの初回でも 0 になりません
 - ストリーミング（`Runner.run_streamed`）は **post-execution streaming** です。ルール関数が返した完成済みの応答を一定長で区切って delta として流すため、delta は進捗を表しません（実 LLM の逐次生成と同じ体感にはなりません）。ツール呼び出しのみの応答では delta が流れず終端イベントのみになります
 - ルール関数が送出した例外は握り潰されず伝播します。ただし `ModelRetryPolicy`（[safety/resilience](../safety/resilience.md)）を併用した構成では、SDK が retry ラッパ経由でモデルを呼ぶためルール関数の例外も**再試行対象になりえます**。ルール関数を副作用のない純関数に保てば、再試行されても結果は変わりません
 - **本番の LLM 呼び出し経路の代替として運用構成へ残さないでください**。名称がテスト専用を含意しないぶん、実 API を呼ぶべき経路に決定的モデルが残ったまま気付かれない誤用リスクがあります。運用構成では実モデルへ差し替える手順を用意してください

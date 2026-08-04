@@ -10,8 +10,12 @@
     if request.tool_outputs:            # <- ハンドオフの結果にも当たってしまう
         return text_response(...)
 
-正しくは、呼んだ tool を **tool 名または `call_id` で絞り込む**。応答ビルダは `call_id` を
-指定できるので、自分が発行した ToolCall だけを識別できる。
+正しくは、呼んだ tool を **`call_id` で絞り込む**。応答ビルダは `call_id` を指定できるので、
+自分が発行した ToolCall だけを識別できる。`ModelRequest.tool_outputs` の
+`function_call_output` アイテムは `call_id` / `output` / `type`（+ `id` / `status`）のみを
+持ち、tool 名フィールドは無い。tool 名で絞りたい場合は 2 段階の手順が要る:
+`request.input` を走査して `type == "function_call"` のアイテムから `name` -> `call_id` の
+対応を作り、その `call_id` で `tool_outputs` を絞り込む。
 
 本例は「乗っ取られる版」と「絞り込む版」を同じ入力で実行し、出力の差を示す。
 

@@ -5,7 +5,9 @@
 フィールドを持つ。
 
 - `turn`: 入力に含まれるモデル応答の件数（初回 0）。**1 モデル応答 = 1 ターン**として数える。
-- `tool_outputs`: 入力中の tool 実行結果アイテムの列。tool 名や戻り値で分岐したいとき使う。
+- `tool_outputs`: 入力中の tool 実行結果アイテムの列。各アイテムは `call_id` / `output` /
+  `type` のみを持ち tool 名は含まない（tool 名は `request.input` 側の `function_call`
+  アイテムにしかない）。戻り値や `call_id` で分岐したいとき使う。
 
 **`user_text` だけで分岐してはならない**。`user_text` は role が `user` の最新テキストであり、
 tool 実行結果を受け取った次のターンでも変わらない。そのため `user_text` の部分一致だけで

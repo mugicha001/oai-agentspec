@@ -110,7 +110,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
 | `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
-| `agent_names.py` | `AgentNames`（エージェント名をクラス属性として宣言する基底クラス）/ `validate_agent_names`（定数簿の宣言集合と registry の登録名集合の整合検査）。実行時 import は `keyword` / `typing` のみで `agents` 非依存のコア最下層リーフ。`AgentRegistry` からの依存辺を持たない任意の追加手段。詳細は「エージェント名定数簿」節 |
+| `agent_names.py` | `AgentNames`（エージェント名をクラス属性として宣言する基底クラス）/ `validate_agent_names`（定数簿の宣言集合と registry の登録名集合の整合検査）。実行時 import は標準ライブラリ（`keyword` / `inspect` / `typing`）のみで `agents` 非依存のコア最下層リーフ。`AgentRegistry` からの依存辺を持たない任意の追加手段。詳細は「エージェント名定数簿」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
 | `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
@@ -2546,19 +2546,20 @@ runtime/deterministic/__init__.py   公開窓口・再エクスポート専用�
 _adapters/deterministic.py          ModelRequest / DeterministicResponseModel /
         |                           公開応答ビルダ 5 種 / 既定 id 定数 5 件
         |  from .responses import _make_text_message, _make_function_call,
-        |                         _text_delta_events, _completed_event, _text_of, latest_user_text
+        |                         _text_delta_events, _completed_event, _text_of
         v
 _adapters/responses.py              共有 item / イベントヘルパ（非公開）+ ワークフロー用 2 ビルダ
 ```
 
 `_adapters/deterministic.py` は `_adapters/__init__.py` から import しない（`_adapters/hooks.py` /
 `guardrails.py` / `intent.py` と同じ「1 窓口 ↔ 1 専用 `_adapters` モジュール」の配置）。
-`_adapters/models.py` と `_adapters/__init__.py` は無変更で、既存 2 モデルの挙動には触れない。
+`_adapters/__init__.py` は無変更。`_adapters/models.py` は共有ヘルパの引数化に伴う id の明示渡し
+のみで、既存 2 モデルの応答内容・固定 id 値・イベント列は不変である。
 
 SDK Responses item の構築（`ResponseOutputMessage` / `ResponseFunctionToolCall`）は
 `_adapters/responses.py` の非公開共有ヘルパ（`_make_text_message` / `_make_function_call`）へ集約し、
 ワークフロー用の既存 2 ビルダも公開ビルダも同ヘルパへ委譲する。ヘルパを既存モジュール側へ置くのは、
-新モジュール側へ置くと `latest_user_text` の参照と合わせて module レベルの循環になるためである。
+新モジュール側へ置くと共有ヘルパ（`_text_of` 等）の参照と合わせて module レベルの循環になるためである。
 `ModelResponse` のラップ（1 行）は 2 箇所に残す。
 
 streaming イベント生成のヘルパ（`_text_delta_events` / `_completed_event`）も両経路で共有する。
@@ -2579,14 +2580,26 @@ dataclass）を組み立て、ルール関数へ渡す。フィールドは `sys
   入力が要る場合は `input` から取る。入力全体の文字列表現を載せると、tool 実行結果や system 文言と
   いった非 user 由来のデータが `user_text` 経由で `if "..." in request.user_text` 形の遷移判定へ
   流れ込む（信頼境界の越境）ためである。
-- `turn`（初回 0）と `tool_outputs`（入力中の tool 実行結果アイテム列）はいずれも `input` から純粋に
-  導出する。内部カウンタを持たないためステートレス性は保たれる。`turn` は **1 モデル応答 = 1 ターン**
-  として数え、ターン境界は「user / tool 側が話したところ」（role が `user` / `system` / `developer`、
-  または `*_output` 型の item）で判定する。assistant 側の item 種別を列挙する allowlist にしないのは、
-  SDK が assistant 側の item 種別を増やす方向（hosted tool 系の `web_search_call` 等）であり、
-  allowlist では追随漏れした種別が 1 応答の途中でグループを分断して 1 応答が 2 ターンとして
-  数えられるためである。
-- この 2 つが必要なのは、`user_text` が載せるのは role が `user` の最新テキストであり、**tool 呼び出しの
+- `turn` と `tool_outputs`（入力中の tool 実行結果アイテム列）はいずれも `input` から純粋に
+  導出する。内部カウンタを持たないためステートレス性は保たれる。入力は
+  `ItemHelpers.input_to_new_input_list` で input-list へ正規化し、list へ正規化できない入力
+  （`None` / 非 iterable / 単体 dict 等）は空列へ倒す。このとき `user_text` は空文字列・
+  `turn` は 0・`tool_outputs` は空になる。
+- `turn` は入力（Session 併用時は履歴を含む）に含まれるモデル応答の件数で、**1 モデル応答 = 1 ターン**
+  として数える。SDK は Session 指定時に「セッション履歴 + 今ターンの入力」をモデル入力として渡すため、
+  `runtime.conversation` や `Runner.run(session=...)` を併用する構成では前ターンまでの応答も数に入り、
+  run ごとの初回のモデル呼び出しでも 0 にはならない。ターン境界は「user / tool 側が話したところ」
+  （role が `user` / `system` / `developer`、または `*_output` 型の item）で判定し、role も type も
+  取れない要素は SDK item と見なさず計上しない（単体 dict が list 化されてキー文字列だけが届く経路で、
+  非 item 要素が assistant 由来として数えられるのを防ぐ。正常な item は role か type を必ず持つため、
+  この除外は通常の入力では発火しない）。残りは assistant 由来として扱う。assistant 側の item 種別を
+  列挙する allowlist にしないのは、SDK が assistant 側の item 種別を増やす方向（hosted tool 系の
+  `web_search_call` 等）であり、allowlist では追随漏れした種別が 1 応答の途中でグループを分断して
+  1 応答が 2 ターンとして数えられるためである。既知の限界として、`mcp_approval_response` は
+  user（承認者）側の item でありながら role も `*_output` 接尾辞も持たないため境界として検出できず、
+  承認要求 item と承認応答 item が 1 グループへ連結して `turn` が過少計上される（実運用影響は限定的で、
+  決定的モデル自身は hosted MCP item を生成できないため、記録済み履歴の再生用途に限られる）。
+- `turn` と `tool_outputs` が必要なのは、`user_text` が載せるのは role が `user` の最新テキストであり、**tool 呼び出しの
   前後で `user_text` が変わらない**ためである。`user_text` だけで分岐するルール関数は tool 結果を
   受けた次のターンでも同じ ToolCall を返し続け、`max_turns` まで回る（`DeterministicToolCallModel`
   が `stop_on_first_tool` 前提で回避しているのと同じ現象）。
