@@ -13,9 +13,8 @@ import pytest
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
+from oai_agentspec.runtime.deterministic import text_response
 from oai_agentspec.runtime.llmops import JudgeConfig
-
-from _helpers.responses import text_response
 
 
 class JudgeFakeModel(Model):

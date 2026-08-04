@@ -32,13 +32,13 @@ from oai_agentspec._adapters.guardrails import (
     build_tool_output_guardrail,
 )
 from oai_agentspec.protocols import GuardrailProvider
+from oai_agentspec.runtime.deterministic import tool_call_response
 from oai_agentspec.runtime.guardrails._detectors import Detection
 from oai_agentspec.runtime.guardrails.registry import GuardrailRegistry
 from oai_agentspec.runtime.guardrails.types import Boundary, GuardrailSpec
 from oai_agentspec.spec import SandboxAgentSpec
 
 from _helpers.fake_model import FakeModel
-from _helpers.responses import tool_call_response
 
 pytestmark = pytest.mark.integration
 

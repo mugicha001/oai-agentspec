@@ -19,9 +19,9 @@ from oai_agentspec._adapters import (
     mock_spec_tools,
     resume_with_observation,
 )
+from oai_agentspec.runtime.deterministic import text_response, tool_call_response
 
 from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool
-from _helpers.responses import text_response, tool_call_response
 
 pytestmark = pytest.mark.integration
 

@@ -6,9 +6,9 @@ import pytest
 from agents import Runner
 
 from oai_agentspec import AgentRegistry, AgentSpec, HandoffGraph
+from oai_agentspec.runtime.deterministic import text_response, tool_call_response
 
 from _helpers.fake_model import FakeModel
-from _helpers.responses import text_response, tool_call_response
 
 
 @pytest.mark.asyncio

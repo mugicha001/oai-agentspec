@@ -19,10 +19,10 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from oai_agentspec import AgentRegistry, AgentSpec  # noqa: E402
 from oai_agentspec.runtime.conversation import ConversationService, SessionPolicy  # noqa: E402
+from oai_agentspec.runtime.deterministic import text_response, tool_call_response  # noqa: E402
 from oai_agentspec.runtime.serve import create_app  # noqa: E402
 
 from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool  # noqa: E402
-from _helpers.responses import text_response, tool_call_response  # noqa: E402
 
 pytestmark = pytest.mark.integration
 

@@ -14,7 +14,11 @@ from typing import Any
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
-from .responses import text_response, text_response_with_usage, tool_call_response
+from oai_agentspec.runtime.deterministic import (
+    text_response,
+    text_response_with_usage,
+    tool_call_response,
+)
 
 
 @dataclass
