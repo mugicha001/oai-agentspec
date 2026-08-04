@@ -24,10 +24,35 @@ from typing import Any
 
 import pytest
 
+import oai_agentspec
 from oai_agentspec import AgentRegistry, AgentSpec
 from oai_agentspec.agent_names import AgentNames, validate_agent_names
 
 pytestmark = pytest.mark.unit
+
+
+# ---------------------------------------------------------------------------
+# コア公開窓口（`oai_agentspec` トップレベル）経由の解決
+# ---------------------------------------------------------------------------
+def test_コア公開窓口から_AgentNames_と_validate_agent_names_を_import_できる() -> None:
+    """docs が案内する `from oai_agentspec import AgentNames, validate_agent_names` を pin する。
+
+    `src/oai_agentspec/__init__.py` の再エクスポート行が消えると `ImportError` になる
+    （内部モジュール直接 import のテストだけでは検知できない）。
+    """
+    from oai_agentspec import AgentNames as PublicAgentNames
+    from oai_agentspec import validate_agent_names as public_validate_agent_names
+
+    assert PublicAgentNames is AgentNames
+    assert public_validate_agent_names is validate_agent_names
+
+
+def test_AgentNames_と_validate_agent_names_は_all_に載り_getattr_で解決できる() -> None:
+    """`__all__` への掲載と `getattr` 解決可能性の両方を positive に確認する。"""
+    assert "AgentNames" in oai_agentspec.__all__
+    assert "validate_agent_names" in oai_agentspec.__all__
+    assert oai_agentspec.AgentNames is AgentNames
+    assert oai_agentspec.validate_agent_names is validate_agent_names
 
 
 class _Names(AgentNames):
