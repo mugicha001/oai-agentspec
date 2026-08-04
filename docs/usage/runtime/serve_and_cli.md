@@ -79,4 +79,4 @@ start_server(registry, host="127.0.0.1", port=8000)
 
 ## 次
 
-以上でガイドは終了です。より深い設計・不変条件は [docs/architecture.md](../../architecture.md) を参照してください。
+実 API を呼ばずに決定的な応答で動かす方法は [runtime/deterministic.md](./deterministic.md) を参照してください。より深い設計・不変条件は [docs/architecture.md](../../architecture.md) を参照してください。
