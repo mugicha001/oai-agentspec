@@ -99,7 +99,13 @@ def tool_call_response(
         arguments: tool 引数の JSON 文字列。`json.dumps()` で生成すること。
             `ModelRequest` 由来の値を文字列連結・f-string で埋め込むと、入力に含まれる
             引用符で JSON を脱出して実 tool へ想定外のキーを渡せる。
-        call_id: tool_call と tool_result を対応づける id。
+        call_id: tool_call と tool_result を対応づける id。既定値 `DEFAULT_CALL_ID` は
+            全呼び出しで共有される固定値のため、1 つのルール関数で tool 実行と
+            `transfer_to_*`（handoff）の双方を発行する場合は呼び出しごとに一意な
+            `call_id` を指定すること（既定のままだと両者の `function_call_output` が
+            同じ `call_id` を持ち、`call_id` による絞り込みが判別できなくなる）。
+            `multi_tool_call_response` / `mixed_response` は `call_id` が必須引数なので
+            この落とし穴はない。
 
     Returns:
         単一の function ToolCall を持つ ModelResponse。
@@ -178,7 +184,10 @@ class ModelRequest:
         user_text: 入力から抽出した直近の user テキスト。抽出できない場合（画像のみの
             user メッセージ・user ロールのアイテムが無い履歴等）は空文字列になる
             （生の入力は `input` から取得する）。
-        turn: 入力に含まれるモデル応答の件数（初回 0）。`input` から純粋に導出する。
+        turn: 入力（Session 併用時は履歴を含む）に含まれるモデル応答の件数。`input` から
+            純粋に導出する。Session を使う構成では前ターンまでの応答も数に入るため、
+            `runtime.conversation` や `Runner.run(session=...)` 併用時は「run ごとの
+            初回 = 0」にはならない（2 ターン目以降の初回呼び出しは `turn >= 1`）。
         tool_outputs: 入力中の tool 実行結果アイテムの列。`input` から純粋に導出する。
         model_settings: SDK の `ModelSettings`。
         tools: 提示されている Tool の列。
@@ -231,21 +240,29 @@ def _input_items(model_input: Any) -> list[Any]:
     1 箇所に集約することで、同じ正規化と同じ例外処理が複数箇所へ散らないようにする。
 
     `ItemHelpers.input_to_new_input_list` は文字列を user メッセージ 1 件へ展開し、
-    それ以外は要素を dict 化して返すだけで、`None` や非 iterable はそのまま返す。
-    その値を `list()` する時点で `TypeError` になるため、捕捉対象はこれに限定する
-    （SDK 由来の想定外例外を無言で握り潰さない）。
+    それ以外は要素を dict 化して返すだけで、list へ正規化できない入力（`None` や
+    非 iterable・単体 dict 等）はそのまま返す。その値を `list()` すると `TypeError` に
+    なるか（非 iterable）、item 列でない列ができる（単体 dict はキー文字列の列になる）ため、
+    例外捕捉と戻り値の list 検査の双方で空列へ倒す（SDK 由来の想定外例外は握り潰さない）。
 
     Args:
         model_input: `Model.get_response` が受ける input（文字列 / input-list）。
 
     Returns:
-        input item のリスト。input が `None` や非 iterable で正規化できない場合は空列。
+        input item のリスト。input が list へ正規化できない場合は空列。
         このとき `user_text` は空文字列・`turn` は 0・`tool_outputs` は空になる。
     """
     try:
-        return list(ItemHelpers.input_to_new_input_list(model_input))
+        items = ItemHelpers.input_to_new_input_list(model_input)
     except TypeError:
         return []
+    # 本検査は `_count_turns` の非 item ガードと帰結が重なるため、現時点では `ModelRequest` の
+    # どのフィールドからも観測できない。それでも残すのは「input-list を返す」という本関数の
+    # 戻り値契約を型で担保するためで、将来 `ModelRequest` へ導出フィールドを足したときに
+    # キー文字列列（単体 dict を list 化した残骸）が再露出するのを防ぐ。
+    if not isinstance(items, list):
+        return []
+    return list(items)
 
 
 def _latest_user_text(items: list[Any]) -> str | None:
@@ -302,7 +319,14 @@ def _is_turn_boundary(item: Any) -> bool:
     （hosted tool 系の `web_search_call` / `file_search_call` / `computer_call` 等）、
     allowlist だと追随漏れした種別が 1 応答の途中でグループを分断し、1 応答が 2 ターンとして
     数えられる。境界側（有限で安定した user / system / developer と `*_output`）を列挙して
-    残りを assistant 由来として扱えば、SDK の item 種別追加へ追随漏れしない。
+    残りを assistant 由来として扱う denylist 方式は、allowlist より追随漏れに強い。
+
+    ただし無条件に安全というわけではない。role を持たない承認応答系 item
+    （`mcp_approval_response`）は user（承認者）側でありながら role も `*_output` 接尾辞も
+    持たないため、本判定では assistant 由来として扱われ、承認要求 item と承認応答 item が
+    1 グループへ連結して `turn` が過少計上される既知の限界がある。実運用影響は限定的
+    （決定的モデル自身は hosted MCP item を生成できないため、記録済み履歴の再生用途に
+    限られる）。
 
     Args:
         item: 正規化済みの input item。
@@ -324,6 +348,11 @@ def _count_turns(items: list[Any]) -> int:
     数えると 1 応答で 2 ターン進み、ルール関数の `turn` 分岐が静かに外れるため、assistant 由来
     item（= ターン境界でない item）の**連続グループ数**を 1 ターンとして数える。
 
+    role も type も取れない要素は SDK item と見なせないため計上しない。単体 dict が
+    list 化されてキー文字列（`["role", "content"]` 等）だけが届く経路で、非 item 要素が
+    assistant 由来として数えられ初回ターンが 0 にならなくなるのを防ぐ。正常な item は
+    role か type のいずれかを必ず持つため、この除外は通常の入力では発火しない。
+
     Args:
         items: 正規化済みの input item 列。
 
@@ -333,6 +362,9 @@ def _count_turns(items: list[Any]) -> int:
     turns = 0
     previous_is_assistant = False
     for item in items:
+        role, item_type = _item_fields(item)
+        if role is None and item_type is None:
+            continue
         current_is_assistant = not _is_turn_boundary(item)
         if current_is_assistant and not previous_is_assistant:
             turns += 1
