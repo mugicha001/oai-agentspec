@@ -80,8 +80,6 @@ uv run ruff format src/ tests/
 <Issue 参照（例: refs #123 / closes #123）>
 ```
 
-詳細なテンプレートは `.github/commit_template.md` を参照してください。
-
 ## Pull Request フロー
 
 1. base ブランチは `main`
