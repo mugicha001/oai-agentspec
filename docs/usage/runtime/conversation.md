@@ -134,6 +134,7 @@ chat = ConversationService(registry, session_policy=policy)
 
 - compaction は OpenAI Responses API 専用。`client` は `AsyncOpenAI` / `AsyncAzureOpenAI` で Responses を叩ければ動くが、`model` は OpenAI 形式名
 - `enabled=True` かつ `client` 欠落は構築時 `ValueError`（暗黙有効化しない）
+- `CompactionConfig.enabled` / `SessionPolicy.persist` に bool 以外（`None` / 文字列 / int の `0` `1`）を渡すと構築時 `ValueError`。`enabled` の型検証は `client` 整合の検証より先に走るため、`enabled="true"` は client 欠落の指摘ではなく型エラーになる
 - 未解決の承認待ちがある間は `send` / `stream` が新ターンを開始しない（P1・安全性）
 
 ## 参照

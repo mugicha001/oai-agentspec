@@ -12,6 +12,8 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from ..._validation import validate_bool
+
 if TYPE_CHECKING:
     from .types import PendingApproval
 
@@ -45,6 +47,14 @@ class ConversationEntry:
     persist: bool = False
     pending_state: Any = None
     pending_approvals: list[PendingApproval] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """`persist` が bool であることを構築時に検証する（構築後の代入は対象外）。
+
+        Raises:
+            ValueError: `persist` が bool でない場合。
+        """
+        validate_bool(self.persist, "persist")
 
 
 class ConversationStore:

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from ..._validation import validate_bool
+
 
 class CriterionStatus(StrEnum):
     """観点 1 件の判定状態。
@@ -138,6 +140,14 @@ class ObservedRun:
     tool_calls: list[ObservedToolCall] = field(default_factory=list)
     pending_approvals: list[ObservedApproval] = field(default_factory=list)
     interrupted: bool = False
+
+    def __post_init__(self) -> None:
+        """`interrupted` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `interrupted` が bool でない場合。
+        """
+        validate_bool(self.interrupted, "interrupted")
 
 
 @dataclass(frozen=True)

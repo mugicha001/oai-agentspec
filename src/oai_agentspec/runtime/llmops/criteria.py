@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final
 
+from ..._validation import validate_bool
+
 # 観点名（CriterionResult.criterion の値・内部定数。公開はファクトリ経由）。
 _FACTUAL_GROUNDING: Final[str] = "factual_grounding"
 _SAFETY: Final[str] = "safety"
@@ -77,6 +79,15 @@ class Criterion:
     rubric: str | None = None
     requires: frozenset[str] = field(default_factory=frozenset)
     deterministic: bool = False
+
+    def __post_init__(self) -> None:
+        """`knockout` / `deterministic` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `knockout` または `deterministic` が bool でない場合。
+        """
+        validate_bool(self.knockout, "knockout")
+        validate_bool(self.deterministic, "deterministic")
 
 
 def Relevance(*, knockout: bool = False) -> Criterion:  # noqa: N802 - 観点ファクトリ（型名様の API）

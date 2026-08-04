@@ -17,6 +17,8 @@ import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
+from ..._validation import validate_bool
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
@@ -64,6 +66,14 @@ class Detection:
     triggered: bool
     reason: str | None = None
     info: Any = field(default=None)
+
+    def __post_init__(self) -> None:
+        """`triggered` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `triggered` が bool でない場合。
+        """
+        validate_bool(self.triggered, "triggered")
 
 
 def canary_detector(canary: str | Iterable[str]) -> Callable[[str], Detection]:

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, ClassVar, Final
 
+from ..._validation import validate_bool
 from ...constants import RESILIENCE_LOGGER_NAME
 
 logger = logging.getLogger(RESILIENCE_LOGGER_NAME)
@@ -354,11 +355,13 @@ class FailsafePolicy:
         検証対象と格納対象が食い違わない（検証の迂回を構造的に防ぐ）。
 
         Raises:
-            ValueError: `handlers` のキーが例外クラスでない / 禁止列挙のいずれかそのもの /
-                `Exception` を継承しない `BaseException` 系、`handlers` の値が
-                `RUNNING_AGENT` そのもの、または `on_apply` が None でも callable でも
-                ない場合。
+            ValueError: `log_on_apply` が bool でない、`handlers` のキーが例外クラスでない /
+                禁止列挙のいずれかそのもの / `Exception` を継承しない `BaseException` 系、
+                `handlers` の値が `RUNNING_AGENT` そのもの、または `on_apply` が None でも
+                callable でもない場合。
         """
+        validate_bool(self.log_on_apply, "log_on_apply")
+
         normalized = dict(self.handlers)
         for key, value in normalized.items():
             self._validate_handler_key(key)

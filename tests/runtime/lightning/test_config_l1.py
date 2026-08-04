@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from oai_agentspec.runtime.lightning import OptimizeConfig
@@ -64,6 +66,33 @@ def test_optimize_config_skip_coverage_check_default_false() -> None:
 def test_optimize_config_skip_coverage_check_can_be_true() -> None:
     """skip_coverage_check=True で opt-out できる。"""
     assert OptimizeConfig(skip_coverage_check=True).skip_coverage_check is True
+
+
+# ----------------------------------------------------------------------
+# skip_coverage_check の構築時 bool 型検証
+# ----------------------------------------------------------------------
+
+
+def test_optimize_config_skip_coverage_check_none_raises() -> None:
+    """skip_coverage_check=None は bool でないため構築時 ValueError（メッセージ全文を pin）。"""
+    with pytest.raises(
+        ValueError, match=re.escape("skip_coverage_check must be a bool, got 'NoneType'")
+    ):
+        OptimizeConfig(skip_coverage_check=None)  # type: ignore[arg-type]
+
+
+def test_optimize_config_skip_coverage_check_str_raises() -> None:
+    """skip_coverage_check="no" は truthy な文字列だが ValueError で弾く（誤 skip 防止）。"""
+    with pytest.raises(
+        ValueError, match=re.escape("skip_coverage_check must be a bool, got 'str'")
+    ):
+        OptimizeConfig(skip_coverage_check="no")  # type: ignore[arg-type]
+
+
+def test_optimize_config_skip_coverage_check_int_zero_raises() -> None:
+    """skip_coverage_check=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="skip_coverage_check"):
+        OptimizeConfig(skip_coverage_check=0)  # type: ignore[arg-type]
 
 
 def test_optimize_config_apo_api_defaults_none() -> None:

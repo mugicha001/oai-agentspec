@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from oai_agentspec.runtime.llmops import (
@@ -106,6 +108,46 @@ def test_criterion_is_frozen() -> None:
     c = Relevance()
     with pytest.raises(AttributeError):
         c.name = "other"  # type: ignore[misc]
+
+
+def test_criterion_knockout_none_raises() -> None:
+    """knockout=None は bool でないため構築時 ValueError（メッセージ全文を pin）。
+
+    fail-closed の knockout フラグが黙って OFF になる silent failure を排除する。
+    """
+    with pytest.raises(ValueError, match=re.escape("knockout must be a bool, got 'NoneType'")):
+        Criterion(name="x", knockout=None)  # type: ignore[arg-type]
+
+
+def test_criterion_knockout_str_raises() -> None:
+    """knockout="no" は truthy な文字列だが ValueError で弾く。"""
+    with pytest.raises(ValueError, match=re.escape("knockout must be a bool, got 'str'")):
+        Criterion(name="x", knockout="no")  # type: ignore[arg-type]
+
+
+def test_criterion_knockout_int_zero_raises() -> None:
+    """knockout=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="knockout"):
+        Criterion(name="x", knockout=0)  # type: ignore[arg-type]
+
+
+def test_criterion_deterministic_none_raises() -> None:
+    """deterministic=None は bool でないため ValueError（判定経路の取り違えを構築時に弾く）。"""
+    with pytest.raises(ValueError, match=re.escape("deterministic must be a bool, got 'NoneType'")):
+        Criterion(name="x", deterministic=None)  # type: ignore[arg-type]
+
+
+def test_criterion_deterministic_str_raises() -> None:
+    """deterministic="no" は truthy な文字列だが ValueError で弾く。"""
+    with pytest.raises(ValueError, match=re.escape("deterministic must be a bool, got 'str'")):
+        Criterion(name="x", deterministic="no")  # type: ignore[arg-type]
+
+
+def test_criterion_bool_fields_accept_bool() -> None:
+    """knockout / deterministic へ True / False を渡した構築は成功する（正常系の維持）。"""
+    c = Criterion(name="x", knockout=True, deterministic=False)
+    assert c.knockout is True
+    assert c.deterministic is False
 
 
 def test_default_criteria_is_standard_quality_set() -> None:

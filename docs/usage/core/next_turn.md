@@ -105,7 +105,7 @@ result = await Runner.run(solo, user_input, session=session)
 | `no_handoff_on_arrival` | `bool` | `False` | 到達時ハンドオフ禁止の opt-in。`True` で、ハンドオフによる X 到達以降そのターン中は X の全 handoff が無効化される |
 | `source` | `str \| None` | `None` | 到達元条件。指定した遷移元からのハンドオフ到達に限定する（未指定は到達元不問の包括ルール。1 ルールに 1 名） |
 
-`next_agent` と `no_handoff_on_arrival` のいずれも持たないルール、同一 X のルール列内の `source` 重複・包括ルール 2 件以上・空列は build-time `ValueError`。
+`next_agent` と `no_handoff_on_arrival` のいずれも持たないルール、同一 X のルール列内の `source` 重複・包括ルール 2 件以上・空列は build-time `ValueError`。`no_handoff_on_arrival` に bool 以外（`None` / 文字列 / int の `0` `1`）を渡した場合も `NextTurnRule` の構築時 `ValueError`。
 
 ### `resolve_next_agent(policy, result)`
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from ..._validation import validate_bool
+
 
 @dataclass(frozen=True)
 class StreamDelta:
@@ -84,6 +86,14 @@ class ApprovalDecision:
     call_id: str
     approve: bool
     rejection_message: str | None = None
+
+    def __post_init__(self) -> None:
+        """`approve` が bool であることを構築時に検証する。
+
+        Raises:
+            ValueError: `approve` が bool でない場合。
+        """
+        validate_bool(self.approve, "approve")
 
 
 class SendStatus(StrEnum):

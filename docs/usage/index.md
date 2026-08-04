@@ -77,6 +77,7 @@
 - **build-don't-run**: 実行は SDK `Runner.run` に委譲。lib は公開の実行 API を持たない
 - **環境変数は CLI 境界のみ**: `SessionPolicy` / `ConversationService` / `serve` / `_adapters` は env 非依存
 - **プロンプトは lib 非同梱**: 利用側 root を `PromptStore` に渡す
+- **`bool` フィールドは構築時に型検証**: 宣言 dataclass の `bool` / `bool | None` 注釈フィールドは構築時に型検証され、非 bool 値（`None` / 文字列 / int の `0` `1`）は `ValueError` で拒否される。`bool | None` は `None` を正当値として受理する（`docs/adr/0021-declarative-bool-field-validation.md`）
 
 ## 詳細設計 SoT
 

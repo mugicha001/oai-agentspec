@@ -12,10 +12,14 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from oai_agentspec._validation import (
+    validate_bool,
     validate_instructions_callable,
+    validate_optional_bool,
     validate_realtime_handoff_options,
 )
 from oai_agentspec.realtime.spec import RealtimeHandoffConfig
@@ -129,3 +133,61 @@ def test_フィールドラベル指定でメッセージが_base_instructions_�
 def test_フィールドラベル指定でも2引数_callable_は通過() -> None:
     """field_label を指定しても (context, agent) の 2 引数 callable は検証を通過する。"""
     validate_instructions_callable("a", lambda c, a: "x", field_label="base_instructions")
+
+
+# ------------------------------------------------------------------
+# validate_bool / validate_optional_bool: 宣言的 bool フィールド検証（Issue #58 T1・RED 先行）
+# ------------------------------------------------------------------
+def test_正常系_validate_bool_は真偽値を受理() -> None:
+    """validate_bool は True / False をそのまま受理し例外を出さない。"""
+    validate_bool(True, "enabled")
+    validate_bool(False, "enabled")
+
+
+def test_正常系_validate_optional_bool_は真偽値とNoneを受理() -> None:
+    """validate_optional_bool は True / False / None を受理し例外を出さない。"""
+    validate_optional_bool(True, "strict_mode")
+    validate_optional_bool(False, "strict_mode")
+    validate_optional_bool(None, "strict_mode")
+
+
+def test_異常系_validate_bool_に_None_はメッセージ全文つき_ValueError() -> None:
+    """None は拒否し、label 名と型名 'NoneType' を含むメッセージ全文を固定する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'NoneType'")):
+        validate_bool(None, "enabled")
+
+
+def test_異常系_validate_bool_に文字列は_ValueError() -> None:
+    """文字列（truthy な 'no' 等）は型名 'str' 入りの ValueError で拒否する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'str'")):
+        validate_bool("no", "enabled")
+
+
+def test_異常系_validate_bool_に_int_の_0_と_1_は_ValueError() -> None:
+    """bool は int の subclass だが、int の 0 / 1 は strict 判定で拒否する（Issue の核心）。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'int'")):
+        validate_bool(0, "enabled")
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'int'")):
+        validate_bool(1, "enabled")
+
+
+def test_異常系_validate_bool_に_float_は_ValueError() -> None:
+    """float の 1.0 は型名 'float' 入りの ValueError で拒否する。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'float'")):
+        validate_bool(1.0, "enabled")
+
+
+def test_異常系_validate_optional_bool_に文字列はメッセージ全文つき_ValueError() -> None:
+    """文字列は拒否し、label 名と型名 'str' を含むメッセージ全文（or None 形）を固定する。"""
+    with pytest.raises(
+        ValueError, match=re.escape("strict_mode must be a bool or None, got 'str'")
+    ):
+        validate_optional_bool("strict", "strict_mode")
+
+
+def test_異常系_validate_optional_bool_に_int_は_ValueError() -> None:
+    """int の 0 は strict 判定で拒否する（None 許容でも bool 以外の型は通さない）。"""
+    with pytest.raises(
+        ValueError, match=re.escape("strict_mode must be a bool or None, got 'int'")
+    ):
+        validate_optional_bool(0, "strict_mode")

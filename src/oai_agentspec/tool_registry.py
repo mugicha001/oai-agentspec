@@ -14,6 +14,7 @@ import keyword
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._validation import validate_bool, validate_optional_bool
 from .constants import TOOL_UNSET
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,19 @@ class ToolSpec:
     description_override: str | None = None
     strict_mode: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """構築時の bool フィールド検証を行い、型不正を `ValueError` で fail-fast する。
+
+        構築時のみの検証（ADR 0021）。構築後の属性代入（`enabled` の動的トグル等）は
+        検証対象外とする（`__setattr__` フックは設けない）。
+
+        Raises:
+            ValueError: `enabled` が bool でない場合、または `strict_mode` が
+                bool / None のいずれでもない場合。
+        """
+        validate_bool(self.enabled, "enabled")
+        validate_optional_bool(self.strict_mode, "strict_mode")
 
 
 class ToolRegistry:

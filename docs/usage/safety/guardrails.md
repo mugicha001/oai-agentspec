@@ -177,7 +177,9 @@ if canary_detector(CANARY)(webhook_body).triggered:
 
 ### `Detection`（dataclass）
 
-`triggered: bool`, `reason: str | None = None`, `info: dict[str, Any] = {}`。
+`triggered: bool`, `reason: str | None = None`, `info: Any = None`。
+
+`triggered` は真の `bool` が必須で、truthy な非 bool（`re.Match` 等）を渡すと構築時 `ValueError` になる。`Detection` は検知関数が run 中に構築する型のため、この `ValueError` は build 時ではなく**実行時**に出る。`InputGuardrailTripwireTriggered` / `OutputGuardrailTripwireTriggered` ではないので tripwire を捕捉するコードでは拾えない。自作の検知関数では `Detection(triggered=bool(...))` のように明示変換する。
 
 ## helper の framework 分類と既定危険度
 

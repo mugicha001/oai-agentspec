@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from ._validation import validate_bool
 from .constants import NEXT_TURN_LOGGER_NAME
 
 if TYPE_CHECKING:
@@ -70,9 +71,11 @@ class NextTurnRule:
         """build-time 検証を行い、不正・無効果な宣言を `ValueError` で fail-fast する。
 
         Raises:
-            ValueError: `next_agent` / `source` が str でない / 空文字の場合、または
-                次ターン指定も到達時ハンドオフ禁止も持たない（効果のない）宣言の場合。
+            ValueError: `no_handoff_on_arrival` が bool でない場合、`next_agent` /
+                `source` が str でない / 空文字の場合、または次ターン指定も到達時
+                ハンドオフ禁止も持たない（効果のない）宣言の場合。
         """
+        validate_bool(self.no_handoff_on_arrival, "no_handoff_on_arrival")
         if self.next_agent is not None:
             _validate_name(self.next_agent, "next_agent")
         if self.source is not None:

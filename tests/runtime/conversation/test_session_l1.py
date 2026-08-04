@@ -9,6 +9,7 @@ client 欠落の早期検知（`__post_init__`）・frozen 性を確認する。
 from __future__ import annotations
 
 import dataclasses
+import re
 
 import pytest
 
@@ -55,6 +56,59 @@ def test_is_frozen() -> None:
     cfg = CompactionConfig()
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.enabled = True  # type: ignore[misc]
+
+
+# ----------------------------------------------------------------------
+# CompactionConfig.enabled / SessionPolicy.persist の構築時 bool 型検証
+# ----------------------------------------------------------------------
+
+
+def test_compaction_enabled_none_raises_type_error() -> None:
+    """enabled=None は client 整合検証より前に bool 型エラーになる（メッセージ全文を pin）。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'NoneType'")):
+        CompactionConfig(enabled=None)  # type: ignore[arg-type]
+
+
+def test_compaction_enabled_str_raises() -> None:
+    """enabled="no" は truthy な文字列だが ValueError で弾く（silent 有効化を防ぐ）。"""
+    with pytest.raises(ValueError, match=re.escape("enabled must be a bool, got 'str'")):
+        CompactionConfig(enabled="no", client=_FakeClient())  # type: ignore[arg-type]
+
+
+def test_compaction_enabled_int_zero_raises() -> None:
+    """enabled=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="enabled"):
+        CompactionConfig(enabled=0)  # type: ignore[arg-type]
+
+
+def test_compaction_enabled_bool_constructs() -> None:
+    """enabled へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    assert CompactionConfig(enabled=False).enabled is False
+    assert CompactionConfig(enabled=True, client=_FakeClient()).enabled is True
+
+
+def test_session_policy_persist_none_raises() -> None:
+    """SessionPolicy.persist=None は bool でないため ValueError（メッセージ全文を pin）。"""
+    with pytest.raises(ValueError, match=re.escape("persist must be a bool, got 'NoneType'")):
+        SessionPolicy(persist=None)  # type: ignore[arg-type]
+
+
+def test_session_policy_persist_str_raises() -> None:
+    """SessionPolicy.persist="no" は ValueError（揮発モードの取り違えを構築時に弾く）。"""
+    with pytest.raises(ValueError, match=re.escape("persist must be a bool, got 'str'")):
+        SessionPolicy(persist="no")  # type: ignore[arg-type]
+
+
+def test_session_policy_persist_int_zero_raises() -> None:
+    """SessionPolicy.persist=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="persist"):
+        SessionPolicy(persist=0)  # type: ignore[arg-type]
+
+
+def test_session_policy_persist_bool_constructs() -> None:
+    """persist へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    assert SessionPolicy(persist=True).persist is True
+    assert SessionPolicy(persist=False).persist is False
 
 
 def test_compaction_kwargs_none_returns_disabled_only() -> None:

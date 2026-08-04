@@ -56,6 +56,7 @@ import dataclasses
 import inspect
 import logging
 import pickle
+import re
 import warnings
 from collections.abc import Mapping
 from typing import Any
@@ -189,6 +190,35 @@ def test_failsafe_policy_on_applyはNoneとcallableを許容する() -> None:
 
     assert FailsafePolicy(handlers={MyError: _fallback}).on_apply is None
     assert FailsafePolicy(handlers={MyError: _fallback}, on_apply=_on_apply).on_apply is _on_apply
+
+
+# ---------------------------------------------------------------------------
+# FailsafePolicy: log_on_apply の構築時 bool 型検証
+# ---------------------------------------------------------------------------
+
+
+def test_failsafe_policy_log_on_apply_Noneは_ValueError() -> None:
+    """`log_on_apply=None` は bool でないため build-time で ValueError（メッセージ全文を pin）。"""
+    with pytest.raises(ValueError, match=re.escape("log_on_apply must be a bool, got 'NoneType'")):
+        FailsafePolicy(handlers={MyError: _fallback}, log_on_apply=None)  # type: ignore[arg-type]
+
+
+def test_failsafe_policy_log_on_apply_文字列noは_ValueError() -> None:
+    """`log_on_apply="no"` は truthy な文字列だが ValueError で弾く（silent 受理しない）。"""
+    with pytest.raises(ValueError, match=re.escape("log_on_apply must be a bool, got 'str'")):
+        FailsafePolicy(handlers={MyError: _fallback}, log_on_apply="no")  # type: ignore[arg-type]
+
+
+def test_failsafe_policy_log_on_apply_int0は_ValueError() -> None:
+    """`log_on_apply=0`（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="log_on_apply"):
+        FailsafePolicy(handlers={MyError: _fallback}, log_on_apply=0)  # type: ignore[arg-type]
+
+
+def test_failsafe_policy_log_on_apply_boolは許容() -> None:
+    """`log_on_apply` へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    assert FailsafePolicy(handlers={MyError: _fallback}, log_on_apply=True).log_on_apply is True
+    assert FailsafePolicy(handlers={MyError: _fallback}, log_on_apply=False).log_on_apply is False
 
 
 # ---------------------------------------------------------------------------

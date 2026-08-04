@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
@@ -46,6 +47,33 @@ def test_detection_defaults() -> None:
     d = Detection(triggered=False)
     assert d.reason is None
     assert d.info is None
+
+
+def test_detection_triggered_none_raises() -> None:
+    """triggered=None は bool でないため構築時 ValueError（メッセージ全文を pin）。
+
+    tripwire フラグが黙って falsy になる（検知が効かない）silent failure を排除する。
+    """
+    with pytest.raises(ValueError, match=re.escape("triggered must be a bool, got 'NoneType'")):
+        Detection(triggered=None)  # type: ignore[arg-type]
+
+
+def test_detection_triggered_str_raises() -> None:
+    """triggered="no" は truthy な文字列だが ValueError で弾く（誤検知の防止）。"""
+    with pytest.raises(ValueError, match=re.escape("triggered must be a bool, got 'str'")):
+        Detection(triggered="no")  # type: ignore[arg-type]
+
+
+def test_detection_triggered_int_zero_raises() -> None:
+    """triggered=0（int）は bool でないため ValueError。"""
+    with pytest.raises(ValueError, match="triggered"):
+        Detection(triggered=0)  # type: ignore[arg-type]
+
+
+def test_detection_triggered_bool_constructs() -> None:
+    """triggered へ True / False を渡した構築は従来どおり成功する（正常系の維持）。"""
+    assert Detection(triggered=True).triggered is True
+    assert Detection(triggered=False, reason="r").triggered is False
 
 
 # ----------------------------------------------------------------------
