@@ -26,7 +26,7 @@
 - [ ] 変更に対するテストを追加・更新した（カバレッジ 80% 維持）
 - [ ] `from agents` / `import agents` は `_adapters/` 配下のみ (NFR-1)
 - [ ] ブランチ命名 (`<type>/<issue>-<summary>`) / コミットメッセージ (`<type>(<scope>): ...`) が規約通り（[CONTRIBUTING.md](../CONTRIBUTING.md) 参照）
-- [ ] 絵文字・AI 生成示唆 (`Co-Authored-By: Claude` / `Generated with Claude Code` 等) を含まない
+- [ ] 絵文字・AI 生成示唆の文言（co-author 表記・生成ツール名の言及等）を含まない
 
 <!-- ## Breaking Changes -->
 <!-- 後方互換性に影響がある場合のみコメント解除して記載 -->
