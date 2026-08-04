@@ -17,6 +17,10 @@ openai-agents の `Agent` の薄い宣言的 Wrapper（`AgentSpec`）と、ハ�
   （`str | callable`）と同じ使い心地になる。
 - 名前参照（handoffs / sub_agents）のタイポは `registry.validate()` と遅延構築時の
   文脈付きエラーで検出する（無音事故を防ぐ）。
+- 宣言 dataclass の `bool` / `bool | None` 注釈フィールド（`_adapters/` 配下を除く・`init=True`）は
+  構築時に型検証され、非 bool 値は `ValueError` で拒否される（`0` / `1` などの int も拒否する）。
+  None-omission を持つ `bool | None` フィールドは `None` を正当値として受理する。truthiness 評価に
+  よる「宣言したのに効かない」無音事故を構造的に防ぐための横断規則である（ADR-0021）。
 
 ## レイヤー構成と依存方向
 
@@ -65,7 +69,8 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
    │                 ├─→ spec.py (AgentSpec。agents 非依存・最下層)
    │                 │
    │                 └─→ _validation.py (共有バリデーションヘルパ。agents 非依存・最下層。
-   │                           │          realtime/registry・_adapters も下向き参照)
+   │                           │          realtime/registry・_adapters・コア宣言層 (next_turn /
+   │                           │          tool_registry)・runtime 各 extra も下向き参照)
    ├────────────────→ agent_names.py (AgentNames / validate_agent_names。stdlib のみ・最下層リーフ)
    └────────────────→ _adapters/ (agents / 外部クライアント への import 単一窓口) ◄── 会話サービス / LLMOps 評価 / Agent Lightning 最適化
                               │ runtime import
@@ -92,7 +97,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -103,7 +108,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 |---|---|
 | `spec.py` | `AgentSpec` の定義。`agents.Agent` の薄い Wrapper。`agents` 非依存の宣言的データ。最下層 |
 | `protocols.py` | `AgentBuilder` の Protocol 定義。`agents` 非依存 |
-| `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
+| `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有）・宣言 dataclass の `bool` / `bool \| None` フィールドの構築時型検証（ADR-0021。コア宣言層と runtime 各 extra が共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
 | `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
 | `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
 | `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ Tool メタデータの `function_tool` 結線（tools。`build_function_tool` = メタデータの SDK 引数流し込み・is_enabled callable 結線）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
@@ -692,7 +697,8 @@ RunResult ─ extract_turn_observation ─▶ plain 観測（最終回答者名 
 正規化・検証し `MappingProxyType` へ差し替えて不変化する（`FailsafePolicy.handlers` と同一方針）。
 `NextTurnRule` は次ターン指定（`next_agent`）・到達時ハンドオフ禁止の opt-in（`no_handoff_on_arrival`）・
 到達元条件（`source`）を持ち、次ターン指定と禁止のいずれも持たない宣言・同一 X のルール列内の到達元重複・
-包括ルール 2 件以上・空列は build-time `ValueError` で fail-fast する。
+包括ルール 2 件以上・空列は build-time `ValueError` で fail-fast する。`no_handoff_on_arrival` は bool
+以外（`None` / 文字列等）を構築時に `ValueError` で拒否する（横断規則。ADR-0021）。
 
 ### 発動ルールの選定規則
 
@@ -1325,7 +1331,8 @@ import しない単方向依存を保ち、`StreamEvent` 等は `from oai_agents
   `CompactionConfig` の `enabled` フラグで有効化を明示制御し、有効化判定と client / model の受け渡しを
   分離する。`compaction=None` または `enabled=False` なら plain `SQLiteSession`（このとき client / model
   を渡しても圧縮しない）。`enabled=True` かつ `client` 欠落は `ValueError`（`CompactionConfig.__post_init__`
-  で型構築時に早期検知し、`make_session` 側でも防御する）。compaction は OpenAI Responses 専用で、`client` は
+  で型構築時に早期検知し、`make_session` 側でも防御する）。`enabled` が bool でない場合は、この整合検証
+  より前に型検証で `ValueError` になる（横断規則。ADR-0021）。compaction は OpenAI Responses 専用で、`client` は
   `AsyncOpenAI` / `AsyncAzureOpenAI` のいずれでも Responses API を叩ければ動く。`CompactionConfig`
   （`@dataclass(frozen=True)`・`enabled` / `client` / `model` / 素通しオプション）は会話層の plain 型で
   `_adapters` を import せず、`SessionPolicy` が `make_session` の plain 引数へ展開して渡す（依存方向は
@@ -2264,7 +2271,9 @@ Model 呼び出しの retry 条件（回数・backoff・条件）を宣言する
   （エスケープハッチ・条件の組み立ては利用者責務）
 - build-time 検証（`ValueError` で fail-fast）: `max_retries` 負数 / `backoff_multiplier < 1` /
   `initial_delay > max_delay`。**有効条件ゼロ（全フラグ False かつ `extra_retry_statuses` なしかつ
-  生 `policy` なし）で `max_retries` が正の場合も矛盾宣言として `ValueError`**
+  生 `policy` なし）で `max_retries` が正の場合も矛盾宣言として `ValueError`**。セマンティックフラグ
+  5 件は bool 以外を、`backoff_jitter`（`bool | None`）は bool / `None` 以外を、いずれも構築時に
+  `ValueError` で拒否する（横断規則。ADR-0021）
 - backoff 値の未指定は SDK 既定に委譲する（lib 側で既定値をハードコードしない）
 - Agent 単位（`Agent.model_settings`）/ Runner 単位（`RunConfig.model_settings`）の両方で設定でき、
   両方指定時のマージは SDK `_merge_retry_settings` に完全委譲する（Runner 側が Agent 側を上書き。

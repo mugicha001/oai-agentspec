@@ -262,6 +262,7 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 - `RunBudgetPolicy` は `on_llm_end` 判定。stream 中の暴走には `asyncio.wait_for` を併用する
 - `ModelRetrySettings` の silent no-op に頼らない。フラグは既定 True 前提で組む
 - `max_retries > 0` かつ有効な retry 条件がゼロは build-time `ValueError`
+- `retry_on_network_error` / `retry_on_timeout` / `retry_on_rate_limit` / `retry_on_server_error` / `retry_on_retry_after`（`bool`）と `backoff_jitter`（`bool | None`）に bool 以外を渡すと構築時 `ValueError`。設定ファイル / env 由来の `"false"` のような文字列が truthy として通ることはない（`backoff_jitter` のみ `None` を「SDK 既定へ委譲」の正当値として受理）
 - `FailsafePolicy.handlers` は宣言順 first-match。より specific な型を先に宣言する責務は利用者側にある
 - `Exception` / `BaseException` / `ExceptionGroup` / `KeyboardInterrupt` / `SystemExit` / `asyncio.CancelledError` / `GeneratorExit` は `handlers` のキーにできない（build-time `ValueError`）。`ExceptionGroup` は `isinstance` マッチのため `TaskGroup` が束ねた無関係な例外まで丸ごと着地させる広すぎる捕捉になるため禁止する（利用者定義のサブクラスは捕捉範囲が限定されるので許容）
 - `log_on_apply`（既定 True）の warning ログには例外メッセージとトレースバックがそのまま出る。機密を含みうる例外を扱う場合は `log_on_apply=False` にし `on_apply` でマスキングしたうえで記録する（`on_apply` 側でも result を丸ごと文字列化・シリアライズしない）
