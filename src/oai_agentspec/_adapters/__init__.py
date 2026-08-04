@@ -101,7 +101,6 @@ from .next_turn import (
     read_last_agent,
     validate_recorded_edge_declaration,
 )
-from .resilience import build_model_retry, build_run_budget_hooks
 from .responses import (
     _completed_event as _completed_event,
 )
@@ -161,8 +160,6 @@ __all__ = [
     "Usage",
     "build_agent",
     "build_function_tool",
-    "build_model_retry",
-    "build_run_budget_hooks",
     "mock_spec_tools",
     "DefaultAgentBuilder",
     "DefaultRunnerAdapter",
