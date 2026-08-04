@@ -358,8 +358,32 @@ async def test_user_text_は抽出できない入力では空文字列になる(
 
     request = recorder.requests[0]
     assert request.user_text == ""
+    # `system` はターン境界（user / tool 側の発話）なのでモデル応答として数えない。
+    assert request.turn == 0
     # 生の入力は input から取れる（情報は失われない）
     assert request.input == [{"role": "system", "content": "x"}]
+
+
+async def test_developer_ロールの_item_はモデル応答として数えない() -> None:
+    """`developer` ロールはターン境界（user / tool 側の発話）で `turn` を進めない。
+
+    境界ロール集合から漏れると assistant 由来と見なされ、初回入力でも `turn` が 1 になり、
+    `if request.turn == 0:` を前提にしたルール関数の初回分岐が静かに外れる。
+    """
+    recorder = _RuleRecorder(_echo_rule)
+    model = _deterministic().DeterministicResponseModel(recorder)
+
+    await model.get_response(
+        system_instructions=None,
+        input=[
+            {"role": "developer", "content": "開発者向け指示"},
+            {"role": "user", "content": "hello"},
+        ],
+    )
+
+    request = recorder.requests[0]
+    assert request.turn == 0
+    assert request.user_text == "hello"
 
 
 async def test_user_text_に_tool_実行結果が混入しない() -> None:
@@ -380,6 +404,32 @@ async def test_user_text_に_tool_実行結果が混入しない() -> None:
     )
 
     assert "TOOL-SECRET" not in recorder.requests[0].user_text
+
+
+async def test_user_text_は_content_のテキストパートを宣言順に連結する() -> None:
+    """content が parts 形の user メッセージは、テキストパートを宣言順に連結して載せる。
+
+    Responses API の user メッセージは `input_text` / `text` の 2 系統でテキストを運ぶ。
+    片方だけを拾うと、その形で届いた発話が `user_text` から丸ごと欠落し、抽出不能
+    （空文字列）と区別できなくなる。
+    """
+    recorder = _RuleRecorder(_echo_rule)
+    model = _deterministic().DeterministicResponseModel(recorder)
+
+    await model.get_response(
+        system_instructions=None,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "a"},
+                    {"type": "text", "text": "b"},
+                ],
+            }
+        ],
+    )
+
+    assert recorder.requests[0].user_text == "ab"
 
 
 async def test_turn_は入力中のモデル応答件数と一致し同じ入力なら同じ値になる() -> None:
@@ -413,6 +463,8 @@ async def test_turn_は入力中のモデル応答件数と一致し同じ入力
     await model.get_response(system_instructions=None, input=first_turn)
 
     assert recorder.turns == [0, 0, 1, 1, 0]
+    # `user_text` は入力中の**直近**の user メッセージ（先頭の "1" ではない）。
+    assert recorder.requests[2].user_text == "2"
 
 
 async def test_turn_は複数_item_の応答でも_1_ターンとして数える() -> None:
@@ -474,25 +526,80 @@ async def test_tool_outputs_は入力中の_function_call_output_を列挙する
     assert without_outputs.tool_outputs == ()
 
 
+async def test_list_へ正規化できない_dict_単体入力では導出フィールドが空値になる() -> None:
+    """input-list でない dict 単体を渡しても `turn` / `user_text` / `tool_outputs` は空値になる。
+
+    `ItemHelpers.input_to_new_input_list` は dict をそのまま返すため、素朴に `list()` すると
+    `TypeError` にはならずキー文字列の列（`["role", "content"]`）ができる。これが
+    `_input_items` の戻り値 list 検査（`list()` を適用せず空列へ倒す）の根拠で、検査が無い
+    まま item 列として扱うと `turn` がキー件数由来で 1 になり、`if request.turn == 0:` を
+    前提にしたルール関数の初回分岐が静かに外れる。生の入力は `input` から取れるため情報は
+    失われない。
+    """
+    recorder = _RuleRecorder(_echo_rule)
+    model = _deterministic().DeterministicResponseModel(recorder)
+    dict_input = {"role": "user", "content": "x"}
+
+    await model.get_response(system_instructions=None, input=dict_input)
+    # 正しい input-list を渡した場合との対比（従来どおりであることの pin）。
+    await model.get_response(system_instructions=None, input=[{"role": "user", "content": "x"}])
+
+    from_dict, from_list = recorder.requests
+    assert from_dict.turn == 0
+    assert from_dict.user_text == ""
+    assert from_dict.tool_outputs == ()
+    # 生の入力は input から取れる（情報は失われない）。
+    assert from_dict.input == dict_input
+    assert from_list.turn == 0
+    assert from_list.user_text == "x"
+
+
+async def test_Runner_経由の_dict_単体入力でも導出フィールドが空値になる() -> None:
+    """`Runner.run(agent, input=<dict>)` という公開入口からも導出フィールドは空値になる。
+
+    Runner は input を `list()` してからモデルへ渡すため、モデルには dict ではなく
+    キー文字列の列（`["role", "content"]`）が「正しい list」として届く。item と見なせない
+    要素（role も type も取れない）を assistant 由来として数えると `turn` が 1 になり、
+    `if request.turn == 0:` を前提にしたルール関数の初回分岐が静かに外れる。
+    """
+    recorder = _RuleRecorder(_echo_rule)
+    model = _deterministic().DeterministicResponseModel(recorder)
+    agent = Agent(name="a", instructions="指示文", model=model)
+
+    await Runner.run(agent, input={"role": "user", "content": "x"})
+    # 正しい input-list を渡した場合との対比（従来どおりであることの pin）。
+    await Runner.run(agent, input=[{"role": "user", "content": "x"}])
+
+    from_dict, from_list = recorder.requests
+    assert from_dict.turn == 0
+    assert from_dict.user_text == ""
+    assert from_dict.tool_outputs == ()
+    assert from_list.turn == 0
+    assert from_list.user_text == "x"
+
+
 async def test_get_response_は位置引数とキーワード引数の双方で正規化される() -> None:
     """SDK の呼び出し形（全キーワード / 位置）の双方で同じ `ModelRequest` になる。
 
     SDK は `get_response` を全キーワードで、`stream_response` を 7 位置引数 + 3 kw-only で
     呼ぶ。将来の呼び出し形変更に備え、両様で同じ正規化結果になることを固定する。
+    位置引数側は互いに区別できる番兵値を渡し、位置番号の割り当て（tools は 1・
+    output_schema は 2・handoffs は 3）が入れ替わっていないことまで固定する。
     """
     recorder = _RuleRecorder(_echo_rule)
     model = _deterministic().DeterministicResponseModel(recorder)
     settings = ModelSettings()
-    tools: list[Any] = []
-    handoffs: list[Any] = []
+    tools: list[Any] = ["T"]
+    handoffs: list[Any] = ["H"]
+    schema = object()
 
-    await model.get_response("sys", "hello", settings, tools, None, handoffs, None)
+    await model.get_response("sys", "hello", settings, tools, schema, handoffs, None)
     await model.get_response(
         system_instructions="sys",
         input="hello",
         model_settings=settings,
         tools=tools,
-        output_schema=None,
+        output_schema=schema,
         handoffs=handoffs,
         tracing=None,
     )
@@ -502,9 +609,33 @@ async def test_get_response_は位置引数とキーワード引数の双方で�
     assert positional.system_instructions == "sys"
     assert positional.user_text == "hello"
     assert positional.model_settings is settings
-    assert positional.tools == ()
-    assert positional.handoffs == ()
-    assert positional.output_schema is None
+    assert positional.tools == ("T",)
+    assert positional.handoffs == ("H",)
+    assert positional.output_schema is schema
+
+
+async def test_run_streamed_の位置引数呼び出しで_tools_と_handoffs_が取り違えられない() -> None:
+    """SDK が `stream_response` を 7 位置引数で呼ぶ実経路で、位置番号の割り当てが保たれる。
+
+    `stream_response` は `*args` をそのまま `get_response` へ渡すため、tools（位置 1）と
+    handoffs（位置 3）の割り当てを取り違えても run は成功し続け、ルール関数だけが
+    入れ替わった列を受け取る。実 Agent に tool と handoff を両方持たせて固定する。
+    """
+    recorder = _RuleRecorder(_constant_text("done"))
+    model = _deterministic().DeterministicResponseModel(recorder)
+    target = Agent(name="b", instructions="b エージェント")
+    source = Agent(name="a", instructions="指示文", model=model, tools=[add_one], handoffs=[target])
+
+    streamed = Runner.run_streamed(source, input="hello")
+    async for _event in streamed.stream_events():
+        pass
+
+    request = recorder.requests[0]
+    assert streamed.final_output == "done"
+    assert [getattr(tool, "name", None) for tool in request.tools] == ["add_one"]
+    assert [getattr(item, "agent_name", None) for item in request.handoffs] == ["b"]
+    assert request.model_settings is not None
+    assert request.output_schema is None
 
 
 # ---------------------------------------------------------------------------
