@@ -22,7 +22,12 @@ from agents import (
 )
 from agents.sandbox import SandboxAgent
 
-from .._validation import validate_extra_kwargs, validate_instructions_callable
+from .._validation import (
+    ensure_appendable_instructions,
+    validate_extra_kwargs,
+    validate_instructions_append_shape,
+    validate_instructions_callable,
+)
 
 # isinstance 分岐・フィールド集合の導出に使うため実行時 import（spec.py は最下層で
 # 他モジュールを import しないため循環しない）。型ヒント専用の HandoffConfig は
@@ -108,6 +113,50 @@ _DEDICATED_SANDBOX_AGENT_KWARGS = _DEDICATED_AGENT_KWARGS | _SANDBOX_FIELD_KWARG
 _SANDBOX_AGENT_FIELD_NAMES = frozenset(f.name for f in _dataclass_fields(SandboxAgent) if f.init)
 
 
+def _make_composed_instructions(
+    agent_name: str, static: str | None, appends: list[Callable[..., Any]]
+) -> Callable[[Any, Any], Awaitable[str]]:
+    """静的本文と追記関数を run ごとに連結する動的 instructions callable を生成する。
+
+    生成する callable は SDK の動的 instructions 機構（`Agent.get_system_prompt`）へ載せる
+    ため、厳密に 2 つの名前付き引数 `(context, agent)` を取る `async def` とする
+    （SDK はパラメータ数を検査するため `*args` 形は不可）。各追記は宣言順に評価し、戻り値が
+    awaitable なら await する。空文字列の断片はスキップし、残りを `"\\n\\n"` で連結する。
+    追記関数が送出した例外は縮退させずそのまま伝播させる（fail-fast）。
+
+    `static` が `None` かつ全断片が空文字列の場合の戻り値は `None` ではなく `""`
+    （連結結果をそのまま返し `None` へ畳み込まない）。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名。
+        static: 静的な instructions 本文（`None` / 空文字列なら先頭断片を持たない）。
+        appends: 追記関数のリスト（宣言順）。
+
+    Returns:
+        `(context, agent) -> Awaitable[str]` の合成 callable。
+    """
+
+    async def _composed(context: Any, agent: Any) -> str:
+        """静的本文 + 各追記断片を宣言順に `"\\n\\n"` で連結した文字列を返す。"""
+        parts: list[str] = []
+        if static:
+            parts.append(static)
+        for i, fn in enumerate(appends):
+            fragment = fn(context, agent)
+            if inspect.isawaitable(fragment):
+                fragment = await fragment
+            if not isinstance(fragment, str):
+                raise TypeError(
+                    f"agent {agent_name!r}: instructions_append[{i}] は str を返す必要が"
+                    f"ありますが {type(fragment).__name__!r} を返しました"
+                )
+            if fragment:
+                parts.append(fragment)
+        return "\n\n".join(parts)
+
+    return _composed
+
+
 def build_agent(spec: AgentSpec) -> Agent:
     """spec から handoffs 空の Agent を 1 つ構築する（デフォルト AgentBuilder 実装）。
 
@@ -118,6 +167,11 @@ def build_agent(spec: AgentSpec) -> Agent:
     （`default_manifest` / `capabilities` / `run_as` / `base_instructions`）を
     None-omission（未指定なら SDK 既定に委ねる）で渡す。
 
+    `spec.instructions_append` が非空の場合は、静的 `instructions` と追記関数を run ごとに
+    連結する動的 instructions callable を合成して `Agent` へ渡す（空の場合は
+    `spec.instructions` をそのまま渡す）。`SandboxAgentSpec.base_instructions` は追記の
+    対象外で素通しする。
+
     Args:
         spec: 構築対象の AgentSpec（`SandboxAgentSpec` 可）。
 
@@ -127,10 +181,20 @@ def build_agent(spec: AgentSpec) -> Agent:
 
     Raises:
         ValueError: extra に専用フィールド名と同名のキー、または対象 Agent が受け付けない
-            未知のキーが含まれる場合。または `base_instructions` の callable が
-            (context, agent) の 2 引数で呼び出せない場合。
+            未知のキーが含まれる場合。`base_instructions` の callable が (context, agent) の
+            2 引数で呼び出せない場合。callable な `instructions` に `instructions_append` を
+            併用した場合。または `instructions_append` が素の `str`・`Sequence` 以外の容器・
+            非 callable 要素を含む場合。
     """
     is_sandbox = isinstance(spec, SandboxAgentSpec)
+    instructions: Any = spec.instructions
+    if spec.instructions_append:
+        # registry を経由しない直接 build に対する第二防御（判定・文言は register 時と共有）。
+        validate_instructions_append_shape(spec.name, spec.instructions_append)
+        ensure_appendable_instructions(spec.name, instructions, spec.instructions_append)
+        instructions = _make_composed_instructions(
+            spec.name, instructions, list(spec.instructions_append)
+        )
     extra = dict(spec.extra)
     validate_extra_kwargs(
         spec.name,
@@ -142,7 +206,7 @@ def build_agent(spec: AgentSpec) -> Agent:
 
     kwargs: dict[str, Any] = {
         "name": spec.name,
-        "instructions": spec.instructions,
+        "instructions": instructions,
         "tools": list(spec.tools),
         "handoffs": [],
         "input_guardrails": list(spec.input_guardrails),

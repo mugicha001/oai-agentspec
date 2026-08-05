@@ -1,10 +1,11 @@
 """L1: `AgentSpec.guardrails`（名前参照による宣言的 guardrail 装着）の宣言面検証。
 
 `guardrails` フィールドの存在・`kw_only`・既定値の非共有・フィールド集合の固定（既存 15 +
-`guardrails` = 16 件）・既存フィールドの位置引数束縛が不変であること・宣言値が正規化されず
-そのまま保持されること・`SandboxAgentSpec` への継承を pin する（解決・検証は build / validate の
-責務なので本層では扱わない）。`spec.py` 自体の SDK 隔離は `tests/test_sandbox_spec.py` の
-`test_spec_module_does_not_import_agents_sdk` が既に pin しているため重複させない。
+`guardrails` + `instructions_append` = 17 件）・既存フィールドの位置引数束縛が不変であること・
+宣言値が正規化されずそのまま保持されること・`SandboxAgentSpec` への継承を pin する
+（解決・検証は build / validate の責務なので本層では扱わない）。`spec.py` 自体の SDK 隔離は
+`tests/test_sandbox_spec.py` の `test_spec_module_does_not_import_agents_sdk` が既に pin して
+いるため重複させない。
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from oai_agentspec.spec import AgentSpec, SandboxAgentSpec
 
 pytestmark = pytest.mark.unit
 
-#: `AgentSpec` の宣言フィールド全件（既存 15 + `guardrails`）。
+#: `AgentSpec` の宣言フィールド全件（既存 15 + `guardrails` + `instructions_append`）。
 EXPECTED_FIELDS = {
     "name",
     "instructions",
@@ -35,6 +36,7 @@ EXPECTED_FIELDS = {
     "dynamic_handoffs",
     "extra",
     "guardrails",
+    "instructions_append",
 }
 
 
@@ -56,8 +58,26 @@ def test_guardrails_defaults_to_empty_list_not_shared() -> None:
     assert a.guardrails is not b.guardrails
 
 
+def test_instructions_append_field_is_kw_only() -> None:
+    """`instructions_append` フィールドが存在し `kw_only`（位置引数束縛を壊さない）。"""
+    fields_by_name = {f.name: f for f in dataclasses.fields(AgentSpec)}
+    assert "instructions_append" in fields_by_name
+    assert fields_by_name["instructions_append"].kw_only is True
+
+
+def test_instructions_append_defaults_to_empty_list_not_shared() -> None:
+    """既定は空 list で、インスタンス間で共有されない（default_factory）。"""
+    a = AgentSpec(name="a", instructions="i")
+    b = AgentSpec(name="b", instructions="i")
+    assert a.instructions_append == []
+    assert b.instructions_append == []
+    a.instructions_append.append(lambda ctx, agent: "x")
+    assert b.instructions_append == []
+    assert a.instructions_append is not b.instructions_append
+
+
 def test_agent_spec_field_set_is_pinned() -> None:
-    """フィールド集合を `==` で 16 件に固定する（追加・削除の両方向を検知する）。"""
+    """フィールド集合を `==` で 17 件に固定する（追加・削除の両方向を検知する）。"""
     assert {f.name for f in dataclasses.fields(AgentSpec)} == EXPECTED_FIELDS
 
 
