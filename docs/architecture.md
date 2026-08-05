@@ -1680,12 +1680,21 @@ extra 未導入契約・SDK 隔離方針に従う。プロンプト最適化（A
   明示）。`build` 省略時の既定 build は registry 登録 `AgentSpec` を複製し `instructions` のみ候補で差し替える
   （tools / handoffs / model は複製で保持・registry 未解決かつ build 省略は fail-closed）。出力は `${var}` 保持の
   最適化済みテキスト（複数スロット時は名前付き mapping）。`PromptStore` は読み取りのみで内省・書き換えしない。
-- **`instructions_append` を宣言した spec の APO は未サポート**であり、`prompt_slot` の構築時に `ValueError` で
-  早期に拒否する（rollout まで遅延させない）。既定 build は候補テキストを `instructions` に据える
-  （`vars=callable` 経路では lib が生成した動的 callable を据える）ため、追記との併用が成立しない。回避手段は
-  「追記を宣言しない spec を対象にする」または「追記の合成を含めて自前で組み立てる `build=` を明示する」。
-  対象 spec が registry に未登録の場合は本検査では何もしない（未登録の診断は既存の build 呼び出し時の解決が
-  担う契約を変えないため）。
+- **`instructions_append` を宣言した spec の APO は未サポート**であり、**lib が既定 build を生成する 2 経路の
+  双方**が構築時に早期拒否する（rollout まで遅延させない）: `prompt_slot` / `prompt_slot_factory` の既定 build
+  構築時（`ValueError`）と、`optimize(target=<静的 AgentSpec>, slot=None)` の既定スロット導出時
+  （`OptimizeError`・`FailureKind.CONFIG_MISSING`）。例外型が経路で異なるのは、後者が `optimize` の失敗契約
+  （利用者が `kind` で分岐する）に載るため。理由文は単一のヘルパへ集約し経路間で食い違わせない。
+  拒否する理由は、既定 build が候補テキストを `instructions` に据えるだけで追記断片を含まないため:
+  静的経路（`vars=None`）では追記が無言に合成されて `OptimizeResult.prompt` が rollout 時の実 instructions と
+  乖離し（契約 drift）、`vars=callable` 経路では lib 生成の動的 callable を据えるため rollout 中の `build_agent`
+  が併用不可エラーを出すが、そのエラーは利用者が制御できない callable を指しており原因が分からない。
+  **拒否しないのは build が利用者責務の経路**（`slot=` に利用者の `Slot` / `build=` を明示した `prompt_slot` /
+  生 seed + `rebind`）で、追記の合成責務を利用者が引き受ける形として許容する。回避手段は「追記を宣言しない
+  spec を対象にする」または「追記の合成を含めて自前で組み立てた `build=` を渡す」。なお `prompt_slot` 経路は
+  registry から spec を解決するため、対象 spec が未登録の場合は本検査では何もしない（未登録の診断は既存の
+  build 呼び出し時の解決が担う契約を変えないため）。`optimize(slot=None)` 経路は `target` spec を直接受け取る
+  ため、この no-op は該当しない。
 
 ### データフロー
 

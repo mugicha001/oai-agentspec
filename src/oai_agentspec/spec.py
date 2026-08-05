@@ -113,6 +113,8 @@ class AgentSpec:
         instructions_append: 静的 `instructions` の末尾へ run ごとに評価される断片を宣言順に
             連結する追記関数のリスト。各要素は (context, agent) の 2 引数 callable
             （async 可）で `str` を返す。`instructions` が callable の場合は併用できない。
+            容器は `list` / `tuple` を受理し、`set` や generator は宣言時に拒否する
+            （順序が保証されない・検証で消費されて追記が無言に消えるのを防ぐため）。
         prompt: `Agent.prompt`（agents.Prompt / DynamicPromptFunction。Responses API 用）。
         tools: Agent に渡すツール（SDK の Tool）。
         model: モデル指定（str | agents.Model | None）。

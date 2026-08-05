@@ -14,6 +14,11 @@
 `Runner.run(context=...)` に渡した値を開く。カナリアの発行と会話単位の管理は利用側の責務で、
 埋め込み文言（「絶対に出力するな」の一節）も利用側が持つ（lib はプロンプトを同梱しない）。
 
+本例は検知の発火を観測するため、開示を明示的に許可した埋め込み文言を持つバリアント
+（`LEAKY_TEMPLATE` / `build_leaky_agent`）を含む。**本番では使わない**。実運用の埋め込みは
+`CANARY_TEMPLATE`（出力を禁じる一節を含む）側で、トークンはログ・観測系へ出さない前提の値として
+扱う（本例の表示も先頭数文字に切っている）。
+
 Azure OpenAI の環境変数（AZURE_OPENAI_* 。examples/_shared/_azure.py 参照）を設定して実行:
     uv run python examples/guardrails/08_canary_run_scoped.py
 
@@ -145,12 +150,14 @@ async def _ask(
         agent_name: 実行する登録名（既定は本番相当の `internal-bot`）。
     """
     agent = registry.get(agent_name)
+    # トークンは秘密として扱う値なので、識別できる先頭数文字だけを表示する。
+    shown = f"{conversation.canary_token[:10]}..." if conversation.canary_token else "(なし)"
     try:
         result = await Runner.run(agent, input=text, context=conversation)
-        print(f"[pass] token={conversation.canary_token}  input={text!r}")
+        print(f"[pass] token={shown}  input={text!r}")
         print(f"       output: {result.final_output[:80]}")
     except OutputGuardrailTripwireTriggered:
-        print(f"[trip] token={conversation.canary_token}  input={text!r}")
+        print(f"[trip] token={shown}  input={text!r}")
         print("       -> この会話のカナリア漏洩を検知して応答を停止しました")
 
 
