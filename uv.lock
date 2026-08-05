@@ -1697,6 +1697,49 @@ wheels = [
 ]
 
 [[package]]
+name = "microsoft-agents-a365-observability-core"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "microsoft-agents-a365-runtime" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-exporter-otlp" },
+    { name = "opentelemetry-sdk" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+    { name = "wrapt" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/bb/47d1571e427b5d6e60a4081161f83b629c7e2acb8264aaaae06595096739/microsoft_agents_a365_observability_core-1.0.0-py3-none-any.whl", hash = "sha256:d922ef8be2bbce17f387e53400745e05cff94e127460d144910d53a77d64d516", size = 56431, upload-time = "2026-05-01T02:59:53.542Z" },
+]
+
+[[package]]
+name = "microsoft-agents-a365-observability-extensions-openai"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "microsoft-agents-a365-observability-core" },
+    { name = "openai-agents" },
+    { name = "opentelemetry-api" },
+    { name = "opentelemetry-instrumentation" },
+    { name = "opentelemetry-sdk" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/bc/89/9e00a281fd7bab6dcd7dcf1415beb28f8be5df995492c9ed7b31b2466a6a/microsoft_agents_a365_observability_extensions_openai-1.0.0-py3-none-any.whl", hash = "sha256:22b148d93d206bc8c1f2518872f87baa0370ccde64ae0612d43702954e262a9d", size = 16167, upload-time = "2026-05-01T02:59:57.509Z" },
+]
+
+[[package]]
+name = "microsoft-agents-a365-runtime"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyjwt" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2c/3b/9912007bd969b7d0e376b138a7bf05e80d8989a977b03f193228635e5f22/microsoft_agents_a365_runtime-1.0.0-py3-none-any.whl", hash = "sha256:da4d5e3e74f1303391d440ce99144afb711867bee606911a5ec56b74a714fa5c", size = 10926, upload-time = "2026-05-01T03:00:01.333Z" },
+]
+
+[[package]]
 name = "msal"
 version = "1.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1977,6 +2020,11 @@ llmops-langfuse = [
     { name = "deepeval" },
     { name = "langfuse" },
 ]
+observability = [
+    { name = "microsoft-agents-a365-observability-extensions-openai" },
+    { name = "opentelemetry-exporter-otlp-proto-http" },
+    { name = "opentelemetry-sdk" },
+]
 serve = [
     { name = "fastapi" },
     { name = "uvicorn" },
@@ -2002,15 +2050,18 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'cli'", specifier = ">=0.27" },
     { name = "langfuse", marker = "extra == 'llmops-langfuse'", specifier = ">=4.0" },
+    { name = "microsoft-agents-a365-observability-extensions-openai", marker = "extra == 'observability'", specifier = ">=1.0" },
     { name = "oai-agentspec", extras = ["llmops"], marker = "extra == 'llmops-langfuse'" },
     { name = "openai-agents", specifier = ">=0.17.4" },
+    { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'observability'", specifier = ">=1.36" },
+    { name = "opentelemetry-sdk", marker = "extra == 'observability'", specifier = ">=1.36" },
     { name = "pydantic", marker = "extra == 'intent'", specifier = ">=2" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "rich", marker = "extra == 'cli'", specifier = ">=13" },
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.27" },
     { name = "websockets", marker = "extra == 'cli'", specifier = ">=12" },
 ]
-provides-extras = ["conversation", "guardrails", "resilience", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "governance", "intent"]
+provides-extras = ["conversation", "guardrails", "resilience", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "governance", "intent", "observability"]
 
 [package.metadata.requires-dev]
 dev = [

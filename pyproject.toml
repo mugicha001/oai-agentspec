@@ -65,6 +65,16 @@ intent = [
     # openai-agents の推移依存として既に入っているが、runtime/intent/ 配下が直接依存する意図で明示宣言する。
     "pydantic>=2",
 ]
+observability = [
+    # Agent 365 トレース連携（SDK トレーシングへのグローバルフック）と、標準 logging の
+    # OTel Logs 連携をまとめた単一 extra。前者が opentelemetry-api/sdk (>=1.36) を推移的に
+    # 引き込むが、後者が LoggerProvider / LoggingHandler を直接構築するため明示宣言する。
+    "microsoft-agents-a365-observability-extensions-openai>=1.0",
+    "opentelemetry-sdk>=1.36",
+    # OTLP 併用（`OtelLoggingConfig(otlp_enabled=True)`）で直接構築する。opentelemetry-sdk には
+    # 含まれない別配布物で、現状は上記 MS 拡張の推移依存でしか入らないため明示宣言する。
+    "opentelemetry-exporter-otlp-proto-http>=1.36",
+]
 
 [dependency-groups]
 dev = [
