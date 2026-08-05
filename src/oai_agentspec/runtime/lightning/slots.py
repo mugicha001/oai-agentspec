@@ -93,6 +93,9 @@ def _new_default_build(
     対象 spec を解決して `_copy_spec` で独立コピーし、`instructions` だけ差し替えた新 `AgentSpec`
     を返す（tools / handoffs / model 等は複製で保持）。
 
+    対象 spec が `instructions_append`（run スコープの追記）を宣言している場合、その spec の APO は
+    未サポートであり本関数の呼び出し時点（rollout を待たず）に `ValueError` で拒否する。
+
     Args:
         registry: 既定 build の spec 解決元。None なら fail-closed（呼び出し時に build できない）。
         name: 対象エージェント名（registry から解決する spec 名）。
@@ -106,7 +109,8 @@ def _new_default_build(
         候補テキスト → `AgentSpec` の build 関数。
 
     Raises:
-        ValueError: registry 未供給で既定 build が spec を解決できない場合（fail-closed）。
+        ValueError: registry 未供給で既定 build が spec を解決できない場合（fail-closed）、または
+            対象 spec が `instructions_append` を宣言している場合（APO 未サポート）。
     """
     if registry is None:
         raise ValueError(
@@ -114,6 +118,7 @@ def _new_default_build(
             "optimize / prompt_slot / prompt_slot_factory に registry を渡すか build= を明示"
             "してください"
         )
+    _reject_instructions_append(registry, name)
 
     def build(candidate: str) -> AgentSpec:
         import dataclasses
@@ -191,6 +196,59 @@ def _build_marked_seed(segments: tuple[SlotSegment, ...]) -> str:
     for index, text in enumerate(tune_texts[1:], start=1):
         joined += f"\n\n${{{BOUNDARY_PREFIX}{index}}}\n\n{text}"
     return joined
+
+
+def _instructions_append_rejection_message(name: str) -> str:
+    """追記付き spec の APO 対象化を拒否する理由文を組む（拒否 2 経路が共有する SoT）。
+
+    lib が既定 build を生成する経路（`prompt_slot` / `prompt_slot_factory` と
+    `optimize(target=<静的 AgentSpec>, slot=None)`）は候補テキストを `instructions` に据えるだけで
+    追記断片を含まない。文言を 1 か所に集約し、経路間で理由が食い違わないようにする。逃げ道の
+    案内は経路ごとに異なるため本文には含めず、呼び出し側が付す。
+
+    Args:
+        name: 対象エージェント名。
+
+    Returns:
+        不変条件と理由を述べた拒否メッセージ（逃げ道の案内は含まない）。
+    """
+    return (
+        f"AgentSpec {name!r} は instructions_append（run スコープの追記）を宣言しており、"
+        "その spec の APO（プロンプト最適化）は未サポートです。既定 build は候補テキストを"
+        " instructions に据えるだけで追記断片を含まないため、受理すると OptimizeResult.prompt が"
+        " rollout 時の実 instructions と乖離します。"
+    )
+
+
+def _reject_instructions_append(registry: AgentRegistry, name: str) -> None:
+    """対象 spec が `instructions_append` を宣言していれば早期に fail-closed で拒否する。
+
+    既定 build は候補テキストを `instructions` に据えるため、`instructions_append` を持つ spec を
+    対象にすると静的経路（`vars=None`）では追記が無言に合成され、`OptimizeResult.prompt` が
+    rollout 時の実 instructions と乖離する（契約 drift）。`vars=callable` 経路では lib が生成した
+    動的 callable を据えるため rollout 中の `build_agent` が併用不可エラーを出すが、そのエラーは
+    利用者が制御できない callable を指しており原因が分からない。いずれも rollout まで遅延させず、
+    原因の分かるメッセージで構築時に倒す。
+
+    spec が registry に未登録の場合は何もしない（未登録の診断は build 呼び出し時の
+    `_resolve_spec` が担う契約を変えないため）。本 no-op は registry 解決を伴う本経路固有の
+    性質で、`target` spec を直接受け取る `_slots_norm` 側の拒否には該当しない。
+
+    Args:
+        registry: spec 解決元の registry。
+        name: 対象エージェント名。
+
+    Raises:
+        ValueError: 対象 spec が `instructions_append` を宣言している場合。
+    """
+    spec = registry._specs.get(name)
+    if spec is None or not spec.instructions_append:
+        return
+    raise ValueError(
+        _instructions_append_rejection_message(name)
+        + "追記を宣言しない spec を対象にするか、追記の合成を含めて自前で組み立てる build= を"
+        "明示してください"
+    )
 
 
 def _resolve_spec(registry: AgentRegistry, name: str) -> AgentSpec:
@@ -291,7 +349,9 @@ def prompt_slot(
         OptimizeError: `agent=` / `layout=` のいずれも未指定、または fail-closed 検証違反
             （`FailureKind.CONFIG_MISSING`）。
         KeyError: セグメントが store で解決できない場合（`PromptResolutionError` の伝搬を含む）。
-        ValueError: build 省略かつ registry 未供給の場合（既定 build が spec を解決できない）。
+        ValueError: build 省略かつ registry 未供給の場合（既定 build が spec を解決できない）、
+            または対象 spec が `instructions_append` を宣言している場合（追記を持つ spec の APO は
+            未サポート・rollout を待たず構築時に拒否する）。
     """
     if agent is None and layout is None:
         raise OptimizeError(
@@ -570,7 +630,8 @@ def _new_shape_slot(
     Raises:
         OptimizeError: 構成 / tune 照合 / 予約接頭辞のいずれかで fail-closed 条件に該当する場合。
         KeyError: セグメントが store で解決できない場合（`PromptResolutionError` の伝搬）。
-        ValueError: build 省略かつ registry 未供給の場合。
+        ValueError: build 省略かつ registry 未供給の場合、または対象 spec が
+            `instructions_append` を宣言している場合（追記を持つ spec の APO は未サポート）。
     """
     refs = _construction_refs(agent, base=base, parts=parts, layout=layout)
     name = _resolve_slot_name(agent, refs)

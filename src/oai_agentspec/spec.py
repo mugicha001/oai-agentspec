@@ -110,6 +110,11 @@ class AgentSpec:
         name: エージェント名（registry 内で一意）。
         instructions: システムプロンプト。文字列、または (context, agent) の 2 引数
             callable（`PromptStore.compose` の戻り値を渡せる）。
+        instructions_append: 静的 `instructions` の末尾へ run ごとに評価される断片を宣言順に
+            連結する追記関数のリスト。各要素は (context, agent) の 2 引数 callable
+            （async 可）で `str` を返す。`instructions` が callable の場合は併用できない。
+            容器は `list` / `tuple` を受理し、`set` や generator は宣言時に拒否する
+            （順序が保証されない・検証で消費されて追記が無言に消えるのを防ぐため）。
         prompt: `Agent.prompt`（agents.Prompt / DynamicPromptFunction。Responses API 用）。
         tools: Agent に渡すツール（SDK の Tool）。
         model: モデル指定（str | agents.Model | None）。
@@ -141,6 +146,7 @@ class AgentSpec:
     input_guardrails: list[Any] = field(default_factory=list, kw_only=True)
     output_guardrails: list[Any] = field(default_factory=list, kw_only=True)
     guardrails: list[str] = field(default_factory=list, kw_only=True)
+    instructions_append: list[Callable[..., Any]] = field(default_factory=list, kw_only=True)
     handoffs: list[str] = field(default_factory=list)
     handoff_options: dict[str, HandoffConfig] = field(default_factory=dict)
     sub_agents: list[str] = field(default_factory=list)

@@ -296,7 +296,7 @@ class GuardrailRegistry:
 
     def canary_guardrail(
         self,
-        canary: str | Iterable[str],
+        canary: str | Iterable[str] | Callable[..., Any],
         *,
         name: str,
         labels: dict[str, Any] | None = None,
@@ -309,7 +309,8 @@ class GuardrailRegistry:
         利用者宣言が優先）。
 
         Args:
-            canary: 照合する canary 値（単一 or 複数）。
+            canary: 照合する canary 値（単一 or 複数）、または run ごとに解決する resolver
+                （`(context, agent) -> str | Iterable[str] | None`・検知呼び出しごとに再評価）。
             name: 登録名（実体の可視名にも注入する・キーワード必須）。
             labels: 任意のラベル（既定 labels とキー単位でマージする）。
             severity: 深刻度（`Severity` メンバまたは None。None で既定を付与）。
@@ -318,7 +319,8 @@ class GuardrailRegistry:
             登録された宣言（`metadata()` と同一インスタンス）。
 
         Raises:
-            ValueError: name / severity が値域外、または登録名が重複する場合。
+            ValueError: name / severity が値域外、登録名が重複する場合、または resolver が
+                `(context, agent)` の 2 引数で呼び出せない場合・`async def` の場合。
         """
         self._validate_declaration(name, severity)
         guardrail = factories.canary_guardrail(canary, name=name)

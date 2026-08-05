@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from ._placeholders import extract_placeholders, substitute_braced
+from .slots import _instructions_append_rejection_message
 from .types import FailureKind, OptimizeError, Slot
 
 if TYPE_CHECKING:
@@ -59,14 +60,25 @@ def _normalize_slots(
 
     Raises:
         OptimizeError: `slot` の dict に `Slot` と生 seed(str) が混在する場合、`slot` の列が空、
-            列に `Slot` 以外の要素が混在する場合、列内の `Slot.name` が重複する場合、または
+            列に `Slot` 以外の要素が混在する場合、列内の `Slot.name` が重複する場合、
             `target` が `AgentSpec` のときに `slot.name`（列は各要素名）が `target.name` と
-            不一致の場合（`FailureKind.CONFIG_MISSING`・fail-closed）。
+            不一致の場合、または既定スロットを導出する `target` が `instructions_append` を
+            宣言している場合（`FailureKind.CONFIG_MISSING`・fail-closed）。
     """
     from ...spec import AgentSpec
 
     if slot is None:
         if isinstance(target, AgentSpec) and isinstance(target.instructions, str):
+            if target.instructions_append:
+                # 既定 build は候補テキストを instructions に据えるだけで追記断片を含まないため、
+                # 受理すると追記が無言に合成され OptimizeResult.prompt と実 instructions が乖離
+                # する。利用者が build を供給する経路（Slot / build= / 生 seed）は拒否しない。
+                raise OptimizeError(
+                    FailureKind.CONFIG_MISSING,
+                    _instructions_append_rejection_message(target.name)
+                    + "追記を宣言しない spec を対象にするか、追記の合成を含めて自前で組み立てた"
+                    " build= を持つ slot=（Slot / prompt_slot(..., build=...)）を渡してください",
+                )
             seed = target.instructions
 
             def _build(candidate: str) -> AgentSpec:
