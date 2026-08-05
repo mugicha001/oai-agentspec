@@ -1498,6 +1498,54 @@ def test_normalize_slots_iterable_agentspec_name_mismatch_fails_closed() -> None
     assert exc.value.kind == FailureKind.CONFIG_MISSING
 
 
+def _append_spec(name: str = "bot") -> AgentSpec:
+    """`instructions_append`（run スコープの追記）を宣言した静的 `AgentSpec` を作る。"""
+    return AgentSpec(
+        name=name,
+        instructions="static body",
+        instructions_append=[lambda ctx, agent: "fragment"],
+        model=FakeModel(),
+    )
+
+
+@pytest.mark.unit
+def test_normalize_slots_default_rejects_instructions_append_spec() -> None:
+    """slot=None + 追記付き静的 AgentSpec は既定スロット導出を CONFIG_MISSING で拒否する。
+
+    既定 Slot の build は候補テキストを `instructions` に据えるだけで追記断片を含まないため、
+    受理すると `OptimizeResult.prompt`（候補のみ）と rollout 実プロンプト（候補 + 追記断片）が
+    silent に乖離する（`prompt == rollout instructions` 契約の破れ）。
+    """
+    with pytest.raises(OptimizeError) as exc:
+        _normalize_slots(_append_spec(), None)
+    assert exc.value.kind is FailureKind.CONFIG_MISSING
+    message = str(exc.value)
+    assert "instructions_append" in message
+    assert "サポート" in message
+
+
+@pytest.mark.unit
+def test_normalize_slots_user_supplied_slot_is_not_rejected_for_append_spec() -> None:
+    """追記付き spec でも利用者が build を供給した `Slot` は拒否しない（過剰拒否の検知）。
+
+    追記の合成を含めて自前で組み立てる build= を明示する経路は ADR の逃げ道であり、追記の
+    宣言だけを理由に塞いではならない。
+    """
+    spec = _append_spec()
+    slot = Slot(name="bot", seed="seed body", build=lambda c: _append_spec())
+    assert _normalize_slots(spec, slot) == {"bot": slot}
+
+
+@pytest.mark.unit
+def test_normalize_slots_raw_seed_is_not_rejected_for_append_spec() -> None:
+    """追記付き spec + 生 seed(str) は rebind 必須経路として None を返す（拒否しない）。
+
+    生 seed 経路は build を利用者が rebind で供給するため既定 build の乖離は起きない。追記検査を
+    `slot is None` 分岐の外へ持ち上げる変異をここで kill する。
+    """
+    assert _normalize_slots(_append_spec(), "SEED") is None
+
+
 async def test_optimize_consumes_slot_generator_end_to_end(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1061,11 +1061,12 @@ def _registry_with_append() -> AgentRegistry:
 def test_prompt_slot_rejects_target_spec_with_instructions_append(tmp_path: Path) -> None:
     """`instructions_append` を持つ spec の APO 対象化は rollout 前に `ValueError` で拒否される。
 
-    既定 build は候補テキストを `instructions` に据える（`vars=callable` 経路では lib が生成した
-    動的 callable を据える）ため、`instructions_append` を持ち越すと rollout 中の `build_agent` で
-    「callable instructions と instructions_append は併用不可」エラーになる。そのエラーは利用者が
-    制御できない lib 生成 callable を指しており原因が分からないうえ、失敗が rollout まで遅延する。
-    構築時に原因の分かるメッセージで倒すことを pin する（内部の経路分岐には結合しない）。
+    既定 build は候補テキストを `instructions` に据えるため、`instructions_append` を持ち越すと
+    静的経路（`vars=None`）では追記が無言に合成され、`OptimizeResult.prompt` が rollout 時の実
+    instructions と乖離する（契約 drift）。`vars=callable` 経路では lib が生成した動的 callable を
+    据えるため rollout 中の `build_agent` が併用不可エラーを出すが、そのエラーは利用者が制御できない
+    callable を指しており原因が分からない。いずれも rollout まで遅延させず、構築時に原因の分かる
+    メッセージで倒すことを pin する（内部の経路分岐には結合しない）。
     """
     with pytest.raises(ValueError) as exc:
         prompt_slot(
