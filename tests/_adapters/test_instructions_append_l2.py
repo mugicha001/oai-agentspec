@@ -264,6 +264,56 @@ async def test_non_str_fragment_result_raises_type_error() -> None:
         await _system_prompt(agent, Ctx())
 
 
+async def test_non_str_fragment_error_message_locates_the_fragment() -> None:
+    """非 str 断片の `TypeError` はエージェント名・添字・型名を示し、先行断片の値を漏らさない。
+
+    メッセージから情報が落ちると、複数断片のうちどれが壊れたか特定できない（2 断片目を壊して
+    添字 `[1]` が報告されることを確かめ、`[0]` 固定や添字なしへの退行を kill する）。同時に、
+    正常に返った 1 断片目の値（カナリア相当）をメッセージへ載せない（L1 の
+    `test_bare_str_error_message_does_not_leak_the_value` と同じ漏洩面の pin）。
+    """
+    token = "CT-SECRET-TOKEN"
+    spec = AgentSpec(
+        name="bot",
+        instructions="STATIC",
+        instructions_append=[lambda ctx, agent: token, lambda ctx, agent: 42],
+    )
+    agent = build_agent(spec)
+    with pytest.raises(TypeError) as excinfo:
+        await _system_prompt(agent, Ctx())
+    message = str(excinfo.value)
+    assert "'bot'" in message
+    assert "instructions_append[1]" in message
+    assert "int" in message
+    assert token not in message
+
+
+async def test_fragments_receive_exactly_the_context_and_agent_objects() -> None:
+    """断片は `(context, agent)` の 2 位置引数で呼ばれ、SDK から渡る実体をそのまま受ける。
+
+    `fn(context, agent)` を `fn(context, None)` へ落とす変異では、断片が agent
+    （`instructions` / `name` / `model` 等）を参照できなくなる。canary resolver 側が
+    `args[1] is agent` を pin しているのと対称に、追記側でも同一性で押さえる。
+    """
+    seen: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def recorder(*args: Any, **kwargs: Any) -> str:
+        seen.append((args, kwargs))
+        return "frag"
+
+    spec = AgentSpec(name="bot", instructions="STATIC", instructions_append=[recorder])
+    agent = build_agent(spec)
+    wrapper = RunContextWrapper(Ctx())
+    assert await agent.get_system_prompt(wrapper) == "STATIC\n\nfrag"
+
+    assert len(seen) == 1
+    args, kwargs = seen[0]
+    assert kwargs == {}
+    assert len(args) == 2
+    assert args[0] is wrapper
+    assert args[1] is agent
+
+
 # ---------------------------------------------------------------------------
 # build_agent 側の防御チェック（registry 迂回）
 # ---------------------------------------------------------------------------

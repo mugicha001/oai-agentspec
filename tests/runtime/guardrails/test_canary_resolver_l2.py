@@ -7,19 +7,28 @@
 SDK の `OutputGuardrail.run` 越しに駆動する（`context` / `agent` は SDK と同じ経路で届く）。
 
 resolver の戻り値型の制約（`str` / `Iterable[str]` / `None` 以外は検知時 `TypeError`）と、async
-resolver の構築時拒否（公開契約は同期のみ・ADR 0023 判断 9）も本ファイルで pin する。型不正の
-例外メッセージにトークン値を載せないこと（漏洩面を広げないこと）も併せて検証する。
+resolver の構築時拒否（公開契約は同期のみ・ADR 0023 判断 9・`functools.partial(async def)` を
+含む・ADR 0023 判断 14）も本ファイルで pin する。型不正の例外メッセージにトークン値を載せない
+こと（漏洩面を広げないこと）も併せて検証する。
+
+さらに、registry 構築 + FakeModel + `Runner.run` の実経路で、型不正 resolver の `TypeError` が
+run まで伝播すること・漏洩出力で `OutputGuardrailTripwireTriggered` が上がることを pin する
+（guardrail 直接駆動だけでは run loop 側の握り潰しを検知できないため）。
 """
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import pytest
-from agents import OutputGuardrail, RunContextWrapper
+from agents import OutputGuardrail, OutputGuardrailTripwireTriggered, RunContextWrapper, Runner
 
+from oai_agentspec import AgentRegistry, AgentSpec
 from oai_agentspec.runtime.guardrails._detectors import Detection, canary_detector
 from oai_agentspec.runtime.guardrails.factories import canary_guardrail
+
+from _helpers.fake_model import FakeModel
 
 pytestmark = pytest.mark.integration
 
@@ -355,6 +364,35 @@ def test_同期resolverは型検証の追加後も従来どおり受理される
     assert isinstance(canary_guardrail(lambda c, a: "TOKEN", name="canary"), OutputGuardrail)
 
 
+def test_async_defをpartialで包んだresolverも構築時にValueErrorで拒否される() -> None:
+    """`functools.partial(async def)` も構築時に弾く（ADR 0023 判断 14 が名指す形）。
+
+    `partial` は `async def` を隠す最も普通の包み方であり、通すと検知時に未 await coroutine が
+    照合へ流れる。`inspect.iscoroutinefunction` の partial unwrap に依存した契約であることを
+    明示的に pin する（unwrap しない自前判定へ差し替える変異を kill する）。
+    """
+
+    async def resolver(context: Any, agent: Any) -> str:
+        return "CT-7f3a"
+
+    with pytest.raises(ValueError) as excinfo:
+        canary_guardrail(functools.partial(resolver), name="canary")
+    assert "同期" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_同期defをpartialで包んだresolverは受理され照合できる() -> None:
+    """`functools.partial(同期 def)` は受理される（partial 一律拒否への過剰拡張の検知）。"""
+
+    def resolver(prefix: str, context: Any, agent: Any) -> str:
+        return f"{prefix}-TOKEN"
+
+    guardrail = canary_guardrail(functools.partial(resolver, "PT"), name="canary")
+    assert isinstance(guardrail, OutputGuardrail)
+    assert await _triggered(guardrail, "leaked PT-TOKEN") is True
+    assert await _triggered(guardrail, "clean output") is False
+
+
 def test_async_callable_objectのresolverも構築時にValueErrorで拒否される() -> None:
     """`async def __call__` を持つ callable object も構築時に弾く（関数形だけの検査では漏れる）。
 
@@ -392,3 +430,55 @@ async def test_同期callable_objectのresolverは従来どおり受理され照
     assert isinstance(guardrail, OutputGuardrail)
     assert await _triggered(guardrail, "leaked OBJ-TOKEN") is True
     assert await _triggered(guardrail, "clean output") is False
+
+
+# ----------------------------------------------------------------------
+# Runner.run 経由（registry 構築 + FakeModel・SDK 実経路での結合）
+# ----------------------------------------------------------------------
+
+
+def _bot(resolver: Any, model: FakeModel) -> Any:
+    """resolver 付き canary guardrail を宣言した spec を registry 経由で構築する。"""
+    registry = AgentRegistry()
+    registry.register(
+        AgentSpec(
+            name="bot",
+            instructions="STATIC",
+            model=model,
+            output_guardrails=[canary_guardrail(resolver, name="canary")],
+        )
+    )
+    return registry.get("bot")
+
+
+@pytest.mark.asyncio
+async def test_型不正resolverのTypeErrorはRunner_run越しに伝播する() -> None:
+    """型不正 resolver の `TypeError` は `Runner.run` まで伝播する（縮退・握り潰しなし）。
+
+    guardrail 直接駆動だけでは、SDK の run loop 側で例外が握り潰されて「trip しないまま正常
+    終了する（恒久 fail-open）」退行を検知できない。
+    """
+    model = FakeModel().queue_text("leaked CT-7f3a")
+    agent = _bot(lambda c, a: {"session": "CT-7f3a"}, model)
+    with pytest.raises(TypeError) as excinfo:
+        await Runner.run(agent, input="hi")
+    message = str(excinfo.value)
+    assert "dict" in message
+    assert "CT-7f3a" not in message
+
+
+@pytest.mark.asyncio
+async def test_正常resolverの漏洩検知はRunner_run越しにtripwireを上げる() -> None:
+    """正常 resolver + 漏洩出力は `Runner.run` で `OutputGuardrailTripwireTriggered` になる。"""
+    model = FakeModel().queue_text("oops RUN-TOKEN leaked")
+    agent = _bot(lambda c, a: "RUN-TOKEN", model)
+    with pytest.raises(OutputGuardrailTripwireTriggered):
+        await Runner.run(agent, input="hi")
+
+
+@pytest.mark.asyncio
+async def test_漏洩がなければRunner_runは通常完了する() -> None:
+    """resolver 経路でも漏洩のない出力は trip せず run が完了する（常時 trip への退行の検知）。"""
+    model = FakeModel().queue_text("clean answer")
+    result = await Runner.run(_bot(lambda c, a: "RUN-TOKEN", model), input="hi")
+    assert result.final_output == "clean answer"

@@ -289,6 +289,30 @@ def test_register_does_not_consume_the_append_container() -> None:
     assert list(spec.instructions_append) == [_fragment, second]
 
 
+def test_iterator_container_is_rejected_before_any_element_is_consumed() -> None:
+    """使い切り容器の拒否は要素走査より**前**に行う（容器を消費してから落ちない）。
+
+    `list` 容器では反復が非破壊なため「消費しないこと」を観測できない。消費可能な
+    `iter([...])` を渡し、`ValueError` 送出後も容器が未消費であることで検証順序（容器型判定 →
+    要素ループ）を pin する（ADR 0023 判断 11）。順序を入れ替える変異では、拒否の前に要素が
+    読み出されて容器が空になる。
+    """
+    reg = AgentRegistry()
+    container = iter([_fragment])
+    with pytest.raises(ValueError) as excinfo:
+        reg.register(
+            AgentSpec(
+                name="bot",
+                instructions="static",
+                instructions_append=container,  # type: ignore[arg-type]
+            )
+        )
+    assert "instructions_append" in str(excinfo.value)
+    # 拒否時点で 1 要素も読み出されていない（未消費のまま残っている）。
+    assert list(container) == [_fragment]
+    assert reg.names() == []
+
+
 # ---------------------------------------------------------------------------
 # 登録・validate の時点では追記関数を評価しない
 # ---------------------------------------------------------------------------
