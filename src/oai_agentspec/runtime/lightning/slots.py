@@ -105,8 +105,12 @@ def _new_default_build(
     Returns:
         候補テキスト → `AgentSpec` の build 関数。
 
+    対象 spec が `instructions_append`（run スコープの追記）を宣言している場合、その spec の APO は
+    未サポートであり本関数の呼び出し時点（rollout を待たず）に `ValueError` で拒否する。
+
     Raises:
-        ValueError: registry 未供給で既定 build が spec を解決できない場合（fail-closed）。
+        ValueError: registry 未供給で既定 build が spec を解決できない場合（fail-closed）、または
+            対象 spec が `instructions_append` を宣言している場合（APO 未サポート）。
     """
     if registry is None:
         raise ValueError(
@@ -114,6 +118,7 @@ def _new_default_build(
             "optimize / prompt_slot / prompt_slot_factory に registry を渡すか build= を明示"
             "してください"
         )
+    _reject_instructions_append(registry, name)
 
     def build(candidate: str) -> AgentSpec:
         import dataclasses
@@ -191,6 +196,36 @@ def _build_marked_seed(segments: tuple[SlotSegment, ...]) -> str:
     for index, text in enumerate(tune_texts[1:], start=1):
         joined += f"\n\n${{{BOUNDARY_PREFIX}{index}}}\n\n{text}"
     return joined
+
+
+def _reject_instructions_append(registry: AgentRegistry, name: str) -> None:
+    """対象 spec が `instructions_append` を宣言していれば早期に fail-closed で拒否する。
+
+    既定 build は候補テキストを `instructions` に据える（`vars=callable` 経路では lib が生成した
+    動的 callable を据える）ため、`instructions_append` を持つ spec を対象にすると rollout 中の
+    `build_agent` で「callable instructions と instructions_append は併用不可」エラーになる。その
+    エラーは利用者が制御できない lib 生成 callable を指しており原因が分からず、失敗が rollout まで
+    遅延する。原因の分かるメッセージで構築時に倒す。
+
+    spec が registry に未登録の場合は何もしない（未登録の診断は build 呼び出し時の
+    `_resolve_spec` が担う契約を変えないため）。
+
+    Args:
+        registry: spec 解決元の registry。
+        name: 対象エージェント名。
+
+    Raises:
+        ValueError: 対象 spec が `instructions_append` を宣言している場合。
+    """
+    spec = registry._specs.get(name)
+    if spec is None or not spec.instructions_append:
+        return
+    raise ValueError(
+        f"AgentSpec {name!r} は instructions_append（run スコープの追記）を宣言しており、"
+        "その spec の APO（prompt_slot による最適化）は未サポートです。既定 build は候補テキストを"
+        " instructions に据えるため追記との併用が成立しません。追記を宣言しない spec を"
+        "対象にするか、追記の合成を含めて自前で組み立てる build= を明示してください"
+    )
 
 
 def _resolve_spec(registry: AgentRegistry, name: str) -> AgentSpec:
@@ -291,7 +326,9 @@ def prompt_slot(
         OptimizeError: `agent=` / `layout=` のいずれも未指定、または fail-closed 検証違反
             （`FailureKind.CONFIG_MISSING`）。
         KeyError: セグメントが store で解決できない場合（`PromptResolutionError` の伝搬を含む）。
-        ValueError: build 省略かつ registry 未供給の場合（既定 build が spec を解決できない）。
+        ValueError: build 省略かつ registry 未供給の場合（既定 build が spec を解決できない）、
+            または対象 spec が `instructions_append` を宣言している場合（追記を持つ spec の APO は
+            未サポート・rollout を待たず構築時に拒否する）。
     """
     if agent is None and layout is None:
         raise OptimizeError(
@@ -570,7 +607,8 @@ def _new_shape_slot(
     Raises:
         OptimizeError: 構成 / tune 照合 / 予約接頭辞のいずれかで fail-closed 条件に該当する場合。
         KeyError: セグメントが store で解決できない場合（`PromptResolutionError` の伝搬）。
-        ValueError: build 省略かつ registry 未供給の場合。
+        ValueError: build 省略かつ registry 未供給の場合、または対象 spec が
+            `instructions_append` を宣言している場合（追記を持つ spec の APO は未サポート）。
     """
     refs = _construction_refs(agent, base=base, parts=parts, layout=layout)
     name = _resolve_slot_name(agent, refs)
