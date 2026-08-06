@@ -1,0 +1,42 @@
+# Trivy の期限付き ignore（`make sca` のリリース前ゲートを機能させるための例外登録）
+#
+# 登録の条件: 上流依存の制約により当該リポジトリ側では解消できない検出のみを、期限と解除条件を
+# 明記して登録する。自分たちで版を上げられるものは ignore せず依存を更新する。
+# 期限（`expired_at`）を過ぎると Trivy は当該 ignore を無効化し検出が再浮上する。棚卸しの契機。
+# フィールド名は snake_case の `expired_at` である（`expiredAt` は未知フィールドとして黙って
+# 無視され、ignore が無期限に効いてしまう。追加・編集時は必ず過去日で再浮上を実測して確認する）。
+#
+# 検知経路の限界（重要）: 下記の解除条件は Dependabot では検知できない。`pyproject.toml` が
+# `agent-governance-toolkit[openai-agents]>=4.0,<5` と major 上限で pin しているため、上流が
+# 5.x を公開しても更新候補にならず PR は作られない。したがって解除の契機は本ファイルの
+# `expired_at` による再浮上のみ（pull 型）である。期限到来時は解除条件の成否を手で確認する。
+#
+# YAML 形式の ignore は Trivy 側で experimental 扱い（後方互換なく変わりうる）であり、`--ignorefile`
+# での明示指定が必須。Trivy 更新時は本ファイルが依然有効かを `make sca` の挙動で確認する。
+#
+# 運用手順は `docs/security-scanning.md` を参照。
+
+vulnerabilities:
+  # cryptography を 49.0.0 以上へ上げれば解消するが、governance extra の依存鎖が上限を課している:
+  #   agent-governance-toolkit[openai-agents] (最新 4.1.0)
+  #     -> agent-governance-toolkit-integrations <5.0
+  #        -> agent-governance-toolkit-core <5.0
+  #           -> cryptography <49.0
+  # integrations 5.0.0 / core 5.0.0 は公開済みだが、傘パッケージ agent-governance-toolkit の
+  # 最新が 4.1.0 で `<5.0` を課すため到達できない。
+  # 解除条件: agent-governance-toolkit が 5.x を公開し、core >=5.0 へ到達できるようになった時点。
+  - id: CVE-2026-69249
+    statement: >-
+      cryptography>=49.0.0 が必要だが governance extra の依存鎖（agent-governance-toolkit 4.1.0
+      -> integrations <5.0 -> core <5.0 -> cryptography <49.0）により到達不能。
+      傘パッケージの 5.x 公開待ち。
+    expired_at: 2026-11-06
+
+  # こちらは cryptography 50.0.0 以上が必要で、core 5.0.0 でも `cryptography <50.0` のため
+  # 上記の傘パッケージ更新だけでは解消しない。
+  # 解除条件: agent-governance-toolkit-core が cryptography>=50.0 を許容する版を公開した時点。
+  - id: CVE-2026-69247
+    statement: >-
+      cryptography>=50.0.0 が必要だが agent-governance-toolkit-core は最新 5.0.0 でも
+      cryptography<50.0 を課すため到達不能。core 側の上限緩和待ち。
+    expired_at: 2026-11-06

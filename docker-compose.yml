@@ -81,12 +81,16 @@ services:
     volumes:
       - ./src:/scan/src:ro
       - ./uv.lock:/scan/uv.lock:ro
+      # 期限付き ignore（上流制約で解消できない検出のみを期限と解除条件付きで登録）。
+      # スキャン対象 /scan の外へ置き、ignore ファイル自身がスキャン対象に入らないようにする。
+      - ./.trivyignore.yaml:/config/.trivyignore.yaml:ro
       - ./.security/reports:/output
       - trivy-cache:/root/.cache
     command: >
       fs --scanners vuln,secret,misconfig
       --severity HIGH,CRITICAL
       --exit-code 1
+      --ignorefile /config/.trivyignore.yaml
       -f json -o /output/trivy-fs-report.json
       /scan
 
