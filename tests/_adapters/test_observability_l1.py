@@ -10,7 +10,9 @@ pin する不変条件（ADR 0022 Confirmation）:
 - 順序契約: `configure()` は `OpenAIAgentsTraceInstrumentor` 生成より先に呼ばれる。
 - パススルー: `Agent365TracingConfig` の各フィールドが `configure()` へそのまま渡る
   （`logger_name=None` のときだけ引数を渡さず SDK 既定に委ねる）。
-- 構成失敗: 警告して継続する（例外にしない）。ただし未構成のままでは計装へ進まない。
+- 構成失敗: 警告のみで例外にせず、かつ計装へ進まない（`configure()` が偽・`is_configured()` が
+  偽のいずれでも同じ着地。計装は既定のトレースプロセッサ列を置換するため、半端な構成のまま
+  進むと既定の送信先まで失われる）。正常系で計装へ到達することは別テストが pin する。
 - 冪等: `enable_otel_logging` を複数回呼んでも root logger への `LoggingHandler` 付与は 1 回だけ。
 - 再設定検知: 初回と異なる設定での 2 回目は `RuntimeWarning` のみで、適用済みの結線は変えない。
 - 非接触: 既存 handler オブジェクト・フォーマッタ・登録順・root logger の level は変更しない
@@ -446,15 +448,21 @@ def test_enable_agent365_tracing_twice_does_not_raise(
 def test_enable_agent365_tracing_warns_when_configure_returns_false(
     monkeypatch: pytest.MonkeyPatch, tracing: None
 ) -> None:
-    """`configure()` が False でも `is_configured()` が True なら警告しつつ計装へ進む。
+    """`configure()` が False なら `is_configured()` が True でも計装へ進まない。
 
     実 SDK の `configure()` は内部例外を握り潰して False を返すため、戻り値を見なければ
-    「構成に失敗したのに無警告で進む」silent failure になる。一方で計装へ進めるかどうかを
-    決めるのは `is_configured()` 側であり、2 つの失敗ケースは扱いが異なる:
+    「構成に失敗したのに無警告で進む」silent failure になる。さらに構成失敗のまま計装すると
+    実害が出る: 計装は `set_trace_processors` で SDK のトレースプロセッサ列を**置換**するため、
+    Agent 365 側が半端な構成（span processor 未登録）の場合、SDK 既定の送信先まで失われて
+    トレースがどこにも到達しなくなる。`_uninstrument` は既定列を復元しないため事後修復も
+    できない。したがって構成失敗と未構成は**同じ扱い**（警告して計装せず return）とする。
 
-    - `configure()` が False / `is_configured()` が True: 警告し、計装は続行する（本テスト）。
-    - `is_configured()` が False: 警告し、計装は行わず return する（未構成で instrumentor を
-      生成すると実 SDK が `RuntimeError` を送出するため。`..._warns_when_not_configured`）。
+    - `configure()` が False かつ `is_configured()` が True の組: 本テスト（分岐自体は
+      `is_configured()` の真偽を問わず同じ着地になる）。
+    - `is_configured()` が False: `..._warns_when_not_configured`（同じ着地）。
+
+    正常系で計装へ到達すること（= 本条件を過剰に塞ぐ退行の検知）は
+    `..._configures_before_instrumentor` / `..._does_not_warn_when_tracing_enabled` が pin する。
     """
     spy = _TracingSpy(configure_result=False)
     monkeypatch.setattr(obs, "_require_agent365_tracing", spy.as_tuple)
@@ -462,7 +470,8 @@ def test_enable_agent365_tracing_warns_when_configure_returns_false(
     with pytest.warns(RuntimeWarning, match="構成に失敗"):
         obs.enable_agent365_tracing(_tracing_config())
 
-    assert spy.calls == ["configure", "instrumentor_init", "instrument"]
+    # instrumentor は生成しない（既定のトレースプロセッサ列を置換させないため）。
+    assert spy.calls == ["configure"]
 
 
 def test_enable_agent365_tracing_warns_when_not_configured(

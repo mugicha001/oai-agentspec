@@ -177,9 +177,10 @@ def enable_agent365_tracing(config: Agent365TracingConfig) -> None:
     冪等化は Agent 365 側へ委譲する（再構成は警告付きで無視され、再計装も no-op になる）ため、
     本関数は独自の状態を持たない。
 
-    構成に失敗した場合は `RuntimeWarning` で通知して計装を行わずに戻る（未構成のまま計装を
-    生成すると Agent 365 側が `RuntimeError` を送出するため。観測の失敗で利用者のアプリを
-    停止させない）。
+    構成に失敗した場合は `RuntimeWarning` で通知して計装を行わずに戻る（観測の失敗で利用者の
+    アプリを停止させない）。計装しないため SDK 既定のトレースプロセッサ列はそのまま残り、
+    既定のエクスポート先への送信は継続する。Agent 365 の計装経路にのみ効く本文抑止
+    （`suppress_invoke_agent_input`）や span enricher はこの経路には適用されない。
 
     Args:
         config: トレース連携の宣言的設定（接続先・認証手段は本設定経由でのみ受領する）。
@@ -214,13 +215,16 @@ def enable_agent365_tracing(config: Agent365TracingConfig) -> None:
     if not configure_ok or not configured:
         # 構成失敗は送信不能を意味するが、エージェント実行自体は妨げない（ベストエフォート）。
         warnings.warn(
-            "Agent 365 の構成に失敗したためトレースは送信されません。"
-            "service_name / service_namespace と接続設定を確認してください。",
+            "Agent 365 の構成に失敗したため Agent 365 へトレースは送信されません。"
+            "service_name / service_namespace と接続設定を確認してください。"
+            "計装しないため SDK 既定の送信先への送信は継続します"
+            "（Agent 365 の計装経路にのみ効く本文抑止・span enricher は適用されません）。",
             RuntimeWarning,
             stacklevel=2,
         )
-    if not configured:
-        # 未構成のまま計装を生成すると Agent 365 側が RuntimeError を送出するため進まない。
+        # 計装は行わない。構成失敗のまま計装すると `set_trace_processors` が SDK 既定の
+        # トレースプロセッサ列を置換して既定の送信先まで失われ（`_uninstrument` は既定列を
+        # 復元しない）、未構成のまま生成すると Agent 365 側が RuntimeError を送出する。
         return
 
     instrumentor_cls().instrument()
