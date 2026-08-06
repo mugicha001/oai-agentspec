@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..runtime.observability.config import Agent365TracingConfig, OtelLoggingConfig
 
+logger = logging.getLogger(__name__)
+
 # observability extra（Agent 365 拡張 / opentelemetry-sdk）未導入時の案内。
 _OBSERVABILITY_INSTALL_HINT = (
     "オブザーバビリティ連携には microsoft-agents-a365-observability-extensions-openai と "
@@ -220,16 +222,25 @@ def enable_agent365_tracing(config: Agent365TracingConfig) -> None:
     # 除外できる（exporter_options 未指定 = None も属性を持たないため同じ経路で除外される）。
     # 属性の読み取りは 1 回だけ行い、あらゆる例外を吸収する: 利用者が渡す不透明値は property や
     # `__getattr__` を持ちうるため、`hasattr` では `AttributeError` 以外が呼び出し元へ伝播して
-    # 観測の構成ミスがアプリを停止させてしまう（ベストエフォート方針に反する）。
+    # 観測の構成ミスがアプリを停止させてしまう（ベストエフォート方針に反する）。吸収した例外は
+    # 警告にせず DEBUG ログへ残す: 判定不能な構成へ誤警告しないまま、番兵へ倒れた事実を
+    # 「判定対象外（sidecar 構成・options 未指定）」と区別できるようにする。
+    # 番兵を先に代入するのは、fail-safe 側（判定不能 = 警告しない）の着地点を初期化の 1 か所へ
+    # 寄せるため。`getattr` の既定値も同じ番兵であり、どちらを `None` へ変えても誤検知側へ倒れる
+    # ため、両方向を変異注入で pin している。
     # 断定形を避けるのは、2 回目以降の configure() が渡した設定を丸ごと無視して真を返すため
     # （上流 core/config.py の再構成ガード）。その経路では実際の exporter は初回構成のものになる。
+    options_resolver: Any = _MISSING
     if config.token_resolver is not None:
         try:
-            options_resolver: Any = getattr(config.exporter_options, "token_resolver", _MISSING)
+            options_resolver = getattr(config.exporter_options, "token_resolver", _MISSING)
         except Exception:  # noqa: BLE001 - 観測の判定失敗で利用者のアプリを停止させない
-            options_resolver = _MISSING
-    else:
-        options_resolver = _MISSING
+            logger.debug(
+                "exporter_options.token_resolver の読み取りに失敗したため到達先の判定を"
+                "行いません: options_type=%s",
+                type(config.exporter_options).__name__,
+                exc_info=True,
+            )
     if options_resolver is None:
         warnings.warn(
             "exporter_options を指定したため token_resolver は Agent 365 側で参照されません"
