@@ -690,27 +690,6 @@ def test_enable_agent365_tracing_does_not_warn_without_options(
     assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
 
 
-def test_enable_agent365_tracing_does_not_warn_for_options_without_top_level_resolver(
-    tracing_spy: _TracingSpy, tracing: None
-) -> None:
-    """resolver をどこにも渡していない options 単独指定では警告しない。
-
-    上流はバッチ処理パラメータを全エクスポータ分岐で使うため、コンソール出力のままバッチ挙動を
-    調整する目的で `Agent365ExporterOptions(max_queue_size=...)` を渡すのは正当な用途であり、
-    ここで警告すると「動いている構成へのノイズ」になる。
-
-    検知する退行: 条件から `config.token_resolver is not None` を落とし、バッチ調整目的の
-    options 単独指定へ誤警告する変異（M3）。
-    """
-    config = _tracing_config(exporter_options=SimpleNamespace(token_resolver=None))
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
-        obs.enable_agent365_tracing(config)
-
-    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
-
-
 class _CountingOptions:
     """`token_resolver` の読み取り回数を数える options のスタブ（値は `None` を返す）。"""
 
@@ -723,6 +702,34 @@ class _CountingOptions:
         """読み取りのたびに回数を数え、resolver 未設定を表す `None` を返す。"""
         self.reads += 1
         return None
+
+
+def test_enable_agent365_tracing_does_not_warn_for_options_without_top_level_resolver(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """resolver をどこにも渡していない options 単独指定では警告せず、属性も読まない。
+
+    上流はバッチ処理パラメータを全エクスポータ分岐で使うため、コンソール出力のままバッチ挙動を
+    調整する目的で `Agent365ExporterOptions(max_queue_size=...)` を渡すのは正当な用途であり、
+    ここで警告すると「動いている構成へのノイズ」になる。
+
+    読み取り回数が 0 であることも併せて固定する。ADR 0024 Consequences は「属性は上流より広い
+    経路で 1 回評価される」ことを利用者契約として開示しているため、その**上限**（判定が不要な
+    構成では評価しない）も契約の一部になる。
+
+    検知する退行: 条件から `config.token_resolver is not None` を落とし、バッチ調整目的の
+    options 単独指定へ誤警告する変異（M3）。および `getattr` をガード外へホイストし、警告条件
+    だけを現状どおりに保つ変形（発火・非発火は一切変わらないため回数でしか検知できない）。
+    """
+    options = _CountingOptions()
+    config = _tracing_config(exporter_options=options)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    assert options.reads == 0
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
 
 
 def test_enable_agent365_tracing_reads_options_token_resolver_once(
@@ -825,6 +832,9 @@ def test_enable_agent365_tracing_logs_debug_when_options_attribute_access_fails(
     # 原因の例外を追跡できること（`exc_info=True` の欠落を検知する）。
     assert records[0].exc_info is not None
     assert records[0].exc_info[0] is ValueError
+    # docs / docstring が利用者へ `logging.getLogger(...)` の引数として提示しているリテラル。
+    # 判定を `obs.__name__` で行うとモジュール改名にテストが追随して緑のまま docs だけ偽になる。
+    assert records[0].name == "oai_agentspec._adapters.observability"
     message = records[0].getMessage()
     assert "token_resolver" in message, message
     # どの options で失敗したかが 1 行で分かること（型情報が落ちる退行を検知する）。

@@ -105,6 +105,11 @@ def test_agent365_exporter_options_exposes_token_resolver() -> None:
     依存する（`isinstance` による型判別はしない）。属性の消失・改名は判定を無音で成立しなく
     するため、存在・既定値・コンストラクタ経由の設定の 3 点を実 SDK で固定する。
 
+    `cluster_category` の既定も併せて固定する。`exporter_options` を渡すとトップレベルの
+    `cluster_category` も参照されず options 側の既定が使われる、という前提を docs / docstring /
+    examples の 4 か所で公開しているが、この既定値が変わると当該記述だけが静かに偽になる
+    （`token_resolver` と違い警告と結びつかないため実行時には現れない）。
+
     検知する退行: 実装が読む属性名の drift、および pin が実際に属性存在を見ているか（M11）。
     """
     core = _a365_core()
@@ -112,6 +117,7 @@ def test_agent365_exporter_options_exposes_token_resolver() -> None:
     default_options = core.Agent365ExporterOptions()  # type: ignore[attr-defined]
     assert hasattr(default_options, "token_resolver")
     assert default_options.token_resolver is None
+    assert default_options.cluster_category == "prod"
 
     async def resolver(scope: str, tenant: str) -> str | None:
         return None
@@ -223,11 +229,16 @@ def test_upstream_ignores_top_level_token_resolver_when_exporter_options_given()
     without_options = _composition_probe("without_options")
 
     # 正の対照: options を渡さなければトップレベル resolver は使われ実 exporter が選ばれる。
-    # この assert が無いと、有効化フラグが効いていないだけの環境でも本テストが緑になる。
+    # この assert が無いと、有効化フラグが効いていないだけの環境でも本テストが緑になる
+    # （有効化フラグ名が上流で改名された場合も対照側が Console へ倒れて RED になる）。
     assert without_options.startswith("True:"), without_options
     assert "Console" not in without_options, without_options
     # 本題: options を渡すとトップレベル resolver は捨てられ、コンソールへフォールバックする。
-    assert with_options == "True:ConsoleSpanExporter", with_options
+    # 具象クラス名の完全一致は避ける（OpenTelemetry はこの種のクラスを改名する実績があり、
+    # 無関係な改名で「上流が合成規則を変えた」と読める誤 RED になるため）。対照側と同じ粒度で
+    # 判定する。
+    assert with_options.startswith("True:"), with_options
+    assert "Console" in with_options, with_options
 
 
 def test_require_opentelemetry_returns_documented_namespace() -> None:
