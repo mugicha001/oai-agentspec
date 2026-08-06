@@ -25,8 +25,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..runtime.observability.config import Agent365TracingConfig, OtelLoggingConfig
 
-logger = logging.getLogger(__name__)
-
 # observability extra（Agent 365 拡張 / opentelemetry-sdk）未導入時の案内。
 _OBSERVABILITY_INSTALL_HINT = (
     "オブザーバビリティ連携には microsoft-agents-a365-observability-extensions-openai と "
