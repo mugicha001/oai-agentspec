@@ -56,6 +56,8 @@ logging.getLogger(__name__).info("handoff resolved")  # OTel LogRecord として
 
 `service_name` / `service_namespace` が必須で、残りは MS 拡張 `configure()` へのパススルー引数です（sidecar 向け `exporter_options`・実 Agent365 API 向け `token_resolver`・`cluster_category`・`logger_name`・`suppress_invoke_agent_input`）。エクスポータ選択の列挙型は持たず、切替仕様は委譲先（MS 拡張）が正です。
 
+**`exporter_options` を渡すと `token_resolver` は参照されません**: MS 拡張は `exporter_options` を渡された場合その値のみを使い、`Agent365TracingConfig.token_resolver` を参照しません。両方を渡し、かつ `exporter_options` 側に `token_resolver` を設定していない構成では認証手段がどこにも残らず、実 Agent365 API へは届きません（`configure()` は成功を返します）。この構成は `RuntimeWarning` で通知されます。`exporter_options` を使う場合は resolver も `exporter_options` 側へ設定してください。
+
 `suppress_invoke_agent_input=True` は本文送出の全面的な抑止手段ではありません（InvokeAgent スパンの `gen_ai.input.messages` 完全一致キーのみが対象で、instructions・chat スパン・ツール入出力は残ります）。本文を落としたい場合は下記「送出されるデータ」を参照してください。
 
 ### `enable_otel_logging(config=None)`
@@ -82,6 +84,46 @@ logging.getLogger(__name__).info("handoff resolved")  # OTel LogRecord として
 
 いずれの OTLP も**併用（additive）**であり、コンソール出力を置換しません。
 
+### トレースの到達先を判定する
+
+`configure()` と `is_configured()` は**どの到達先でも真を返します**。戻り値は到達の証拠になりません。意図した宛先へ送るための前提条件は次のとおりです（**切替仕様の SoT は MS 拡張側**であり、下表は到達先を判定するために必要な最小の条件のみを示します。詳細は MS 拡張のドキュメントが正です）。
+
+| 条件 | 到達先 |
+|---|---|
+| `exporter_options` に `SpectraExporterOptions` を渡した | sidecar（OTLP）。`ENABLE_A365_OBSERVABILITY_EXPORTER` は無視されます |
+| 上記以外で、`ENABLE_A365_OBSERVABILITY_EXPORTER` が真（`true` / `1` / `yes` / `on`）**かつ** 実効の `token_resolver` が設定済み | 実 Agent365 API |
+| それ以外 | **コンソール出力へフォールバック**（既定の確認用パス） |
+
+「実効の `token_resolver`」は、`exporter_options` を渡した場合は `exporter_options.token_resolver`、渡していない場合は `Agent365TracingConfig.token_resolver` です（前者を渡すと後者は参照されません）。`exporter_options` 側へ渡す resolver の callable の形は MS 拡張の宣言が一致していないため（同期形と `Awaitable` の両方の宣言が存在します）、MS 拡張のドキュメントで確認してください。
+
+### 届いているかを確認する
+
+**コンソールに span が出ているかで判別できます**。実 Agent365 API と sidecar へ送っているときは標準出力に span が出ません。逆に「実 API へ切り替えたはずなのにコンソールへ span が出続けている」場合はフォールバックしています。
+
+前提条件を起動時に自分で確認する例（本ライブラリは環境変数を読まないため、env の確認は利用側で行います）:
+
+```python
+import os
+
+from oai_agentspec.runtime.observability import Agent365TracingConfig
+
+config = Agent365TracingConfig(service_name="my-app", service_namespace="my-team")
+
+# 実効の token_resolver は上流の合成規則に従う（exporter_options を渡すと後者は参照されない）
+if config.exporter_options is not None:
+    effective_resolver = getattr(config.exporter_options, "token_resolver", None)
+else:
+    effective_resolver = config.token_resolver
+
+# 実 Agent365 API へ送るつもりなら、有効化フラグと実効 resolver の両方が必要
+if os.getenv("ENABLE_A365_OBSERVABILITY_EXPORTER", "").lower() not in ("true", "1", "yes", "on"):
+    raise SystemExit("ENABLE_A365_OBSERVABILITY_EXPORTER が未設定のためコンソールへ出力されます")
+if effective_resolver is None:
+    raise SystemExit("実効の token_resolver が未設定のためコンソールへ出力されます")
+```
+
+sidecar（`SpectraExporterOptions`）を使う場合は resolver も有効化フラグも不要なため、上の確認は実 Agent365 API 宛の構成にのみ適用してください。
+
 ## 送出されるデータ
 
 スパンにはユーザー入力・モデル出力・エージェントの instructions・ツールの引数と結果が載ります。ログは root logger 経由のため、アプリケーション全体と依存ライブラリのログが対象になります。
@@ -105,7 +147,10 @@ logging.getLogger(__name__).info("handoff resolved")  # OTel LogRecord として
 - **環境変数 `OPENAI_AGENTS_DISABLE_TRACING` による無効化は検知できません**（SDK が内部フラグを最初のスパン生成まで更新しないため）。警告が無いことは送信されていることの保証になりません
 - **構成失敗時も例外にしません**: MS 拡張の `configure()` が失敗した場合・未構成の場合は `RuntimeWarning` を出して計装せずに戻ります（観測の失敗で利用者のアプリを止めないベストエフォート方針）
 - **構成失敗時は既定の送信先が生き続けます**: 計装しないため SDK 既定のトレースプロセッサ列はそのまま残り、既定のエクスポート先（OpenAI プラットフォーム）へは送信が継続します。このとき本文抑止（`suppress_invoke_agent_input`）と span enricher は MS 拡張の計装経路にのみ効くため**適用されません**。ユーザー入力・instructions・ツール入出力を外部へ出したくない場合は、構成失敗時の送出も止まるよう `agents.set_tracing_disabled(True)` を併用するか、SDK 側の機微データ抑止設定を使ってください
-- **`configure()` が成功しても Agent 365 へ届かない場合があり、本連携はそれを検知しません**: 委譲先の内部フォールバック（エクスポート先が解決できないときのコンソール出力）や、同一プロセスで 2 回目以降の有効化が既存構成を保ったまま無視されること、アプリ側で用意済みのトレースプロバイダへ相乗りしたときのそのプロバイダの状態などにより、警告が出ないまま Agent 365 へ届かないことがあります（ベストエフォート）
+- **`configure()` が成功しても Agent 365 へ届かない場合があります**（`configure()` / `is_configured()` はどの到達先でも真を返すため、戻り値では判別できません）。検知の範囲は次のとおりです
+  - **検知して警告するもの**: `token_resolver` を渡しているのに `exporter_options`（Agent365 形式・resolver 未設定）を併用したため、実効の resolver がどこにも残らない構成。`RuntimeWarning` で通知します（処理は継続します）
+  - **検知しないもの**: 有効化フラグ（`ENABLE_A365_OBSERVABILITY_EXPORTER`）が未設定によるフォールバック、同一プロセスで 2 回目以降の有効化が既存構成を保ったまま無視されること、アプリ側で用意済みのトレースプロバイダへ相乗りしたときのそのプロバイダの状態、`exporter_options` の属性取得が例外になる構成（判定不能として警告しません）
+  - **検知しない理由**: 判定に必要な委譲先の関数が公開 API ではなく、本ライブラリは環境変数を読まない方針のためです（`SessionPolicy` 等と同じく本体は env 非依存）。判定材料は上記「トレースの到達先を判定する」「届いているかを確認する」で提供します。設計判断の詳細は `docs/adr/0024-agent365-export-target-detection-scope.md` を参照してください
 - **MS 拡張は import しただけで root logger にハンドラを 1 つ追加します**（拡張側が `logging.basicConfig` を呼ぶため）。本ライブラリからは制御できません。書式を自分で決めたい場合は有効化より前に `logging.basicConfig(...)` を呼んでください（`force=True` は本連携のハンドラも消すため使わない）
 - **相関はアクティブ span がある時だけ**: span が無い時点のログは無効 trace_id 相当となり、相関情報は付きません
 - 有効化はプロセスグローバルに効きます。エージェント単位の opt-in / opt-out はできません

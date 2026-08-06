@@ -2775,6 +2775,15 @@ build-don't-run の例外 3 例目にあたる（rationale と却下案は
   「トレース未送信」を通知し処理は継続する（環境変数 `OPENAI_AGENTS_DISABLE_TRACING` による無効化は
   SDK が内部フラグを最初のスパン生成まで更新しないため検知できない）。構成に失敗した場合・未構成の
   場合も `RuntimeWarning` で通知し、計装せずに戻る（観測の失敗でアプリを停止させない）。
+  さらに `configure()` を呼ぶ前に config の自己矛盾を 1 点だけ判定する: `token_resolver` を渡して
+  いるのに `token_resolver` 属性を持つ `exporter_options`（Agent365 形式）を併用し、その属性が未設定
+  である構成は、MS 拡張がトップレベル `token_resolver` を参照しないため実サービスへ到達しない
+  （`configure()` は成功を返すため戻り値では検知できない）。この構成を `RuntimeWarning` で通知する
+  が、構成失敗とは異なり処理は継続する。判定は専用の番兵を既定値とする `getattr` で属性を 1 回だけ
+  読み、あらゆる例外を吸収する（利用者が渡す不透明値の属性アクセスで有効化を失敗させない）。
+  `isinstance` による型判別は行わないため sidecar 構成（`SpectraExporterOptions`・当該属性を持たない）
+  は番兵で除外される。有効化フラグ未設定に起因する未達は検知しない（本層は環境変数を読まない。
+  詳細は `docs/adr/0024-agent365-export-target-detection-scope.md`）。
 - `enable_otel_logging(config)`: `LoggerProvider` / `LogExporter` を構築し、OTel `LoggingHandler` を
   root logger へ冪等に付与する（モジュールフラグでプロセス内 1 回に限定）。既存ハンドラ・
   フォーマッタには触れず追加のみを行う。付与時の設定を保持し、2 回目以降に異なる設定で呼ばれた場合は
