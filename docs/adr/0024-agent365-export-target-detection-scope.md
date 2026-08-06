@@ -176,50 +176,39 @@ usage docs は「エクスポート先は既定でコンソール（実バック
 
 ## Confirmation
 
-以下が本決定の強制手段である（いずれも実装済みで、`docs/QUALITY-GUARANTEES.md` へ
-source = `ADR-0024` として登録済み。台帳側の source 列を安定アンカーとして相互参照する）。
+本決定を機械強制するテストは実装済みである。**個々のテスト node ID は
+`docs/QUALITY-GUARANTEES.md` の source = `ADR-0024` の行を参照する**（テスト名は改名されうる可変な
+情報であり、`/spec-sync` が鮮度維持を担う台帳側を単一の置き場とする）。本節は改名で古くならない
+「何を pin する必要があるか・なぜその形でないと無音化するか」だけを記す。
 
-- 発火の強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_warns_when_exporter_options_drops_token_resolver`
-  （通常発火。警告後も `configure` -> 計装へ到達することを併せて検査する）/
-  `::test_enable_agent365_tracing_warns_about_dropped_resolver_even_when_configure_fails`
-  （構成失敗時でも発火すること = 警告を `configure()` の前に置く順序判断の pin）。前者は警告文面の
-  3 点（原因・結果を断定しない条件節・是正指示）を個別に照合し、単一の `match=` では条件節と是正
-  指示が消えても緑になる穴を塞ぐ。加えて `stacklevel=2`（警告が利用者の呼び出し位置へ帰属すること）を
-  本モジュールの全 `RuntimeWarning` について検査する（帰属の退行は警告を出し続けるためメッセージ
-  照合では検知できない）。
-- 誤検知しないことの強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_does_not_warn_when_exporter_options_carries_token_resolver`
-  / `::test_enable_agent365_tracing_does_not_warn_for_options_without_resolver_attribute`
-  / `::test_enable_agent365_tracing_does_not_warn_without_options`
-  / `::test_enable_agent365_tracing_does_not_warn_for_options_without_top_level_resolver`。
-  sidecar 構成の除外は L1（`token_resolver` 属性を持たないスタブで番兵分岐を pin）と L2（実
-  `SpectraExporterOptions` が当該属性を持たないことを pin）の**合成**で保証する。L1 側を実 SDK の
-  クラスで書くと observability extra 未導入環境で skip され、番兵分岐の変異検知が黙って失われる。
-  本リポジトリは `filterwarnings` 未設定のため、非発火テストは `warnings.catch_warnings()` +
-  `simplefilter("error")` または `record=True` での 0 件 assert を必須とする（指定しないと
-  「発火しないこと」を検査できない）。
-- 上流前提の強制手段: `tests/_adapters/test_observability_l2.py::test_agent365_exporter_options_exposes_token_resolver`
-  （公開属性 `token_resolver` の存在と既定 `None`）/ `::test_spectra_exporter_options_has_no_token_resolver`
-  （当該属性の不在）。後者は「存在しない属性の不在」を主張するだけでは属性名の typo で無音成立する
-  ため、実在する属性に対する正の assert を併記する。加えて
-  `::test_upstream_ignores_top_level_token_resolver_when_exporter_options_given` が、子プロセスで
-  `configure()` を 1 回だけ呼び「`exporter_options` 指定時にトップレベル `token_resolver` が使われ
-  ない」ことを実測で pin する。これは本決定の唯一の前提であり、上流が両者を合成する実装へ変われば
-  本警告は「届いている構成への誤警告」へ反転するため、`exporter_options` 未指定時に実 exporter が
-  選ばれることを正の対照として併置する（対照が無いと有効化フラグが効いていないだけの環境でも緑に
-  なる）。span を生成しないため外部通信は発生しない。
-- 例外吸収の強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_does_not_raise_when_options_attribute_access_fails`
-  （`token_resolver` が `AttributeError` 以外を投げる options で、例外を伝播させず・誤警告もせず・
-  計装まで到達すること）。属性取得を囲む `try` / `except Exception` の削除で RED になる。同テストと
-  `::test_enable_agent365_tracing_reads_options_token_resolver_once` が読み取り回数を数え、属性を
-  2 回読む退行（`hasattr` 相当の判定を足す変異）を検知する。判定不能時の痕跡は
-  `::test_enable_agent365_tracing_logs_debug_when_options_attribute_access_fails` が pin する
-  （DEBUG レベル・`exc_info` の存在・options の型情報を個別に照合し、無音化への逆戻り・原因例外の
-  欠落・レベル引き上げ・型情報の欠落を検知する）。
-- 上記の各 pin は変異注入で実効性を確認済みである（最終判定の緩和・番兵既定値を `None` へ置換（初期化
-  側と `getattr` 側の両方向）・トップレベル resolver ガードの削除・無条件化・警告ブロック削除・例外化・
-  警告カテゴリ変更・警告後の `return` 追加・構成失敗判定の後ろへの移動・照合語の削除・警告本文の断定形
-  への置換・`stacklevel` の引き下げ（警告ごとに個別注入）・属性取得の例外吸収の削除・属性の二重評価・
-  DEBUG ログの削除と `exc_info` / 型情報の欠落・L2 pin の属性名改変・合成規則 probe の空振り化）。
-  いずれも対象テストが RED になることを実行で確認しており生存はゼロである。
-  「テストが実在する」「スイートが全緑」のみでは確認済みとしない。変異の復元は退避した全文の `cp`
-  で行い、`git checkout` / `git restore` / `git stash` / `git reset` は使わない。
+- **発火**: 通常発火と、構成失敗時にも発火すること（判定材料は config のみで構成の成否と独立して
+  いるため、警告は `configure()` の前に置く）。警告文面は原因・結果を断定しない条件節・是正指示の
+  3 点を個別に照合する（単一の `match=` では条件節と是正指示が消えても緑になる）。警告の帰属
+  （`stacklevel=2`）も検査する（帰属の退行は警告を出し続けるためメッセージ照合では検知できない）。
+- **誤検知しないこと**: 意図された既定（`exporter_options` 未指定）・sidecar 構成・options 側に
+  resolver 設定済み・バッチ調整目的の options 単独指定の 4 経路。sidecar 構成の除外は L1
+  （`token_resolver` 属性を持たないスタブで番兵分岐を pin）と L2（実 `SpectraExporterOptions` が
+  当該属性を持たないことを pin）の**合成**で保証する。L1 側を実 SDK のクラスで書くと observability
+  extra 未導入環境で skip され、番兵分岐の変異検知が黙って失われる。本リポジトリは `filterwarnings`
+  未設定のため、非発火テストは `warnings.catch_warnings()` + `simplefilter("error")` または
+  `record=True` での 0 件 assert を必須とする（指定しないと「発火しないこと」を検査できない）。
+- **上流前提**: `Agent365ExporterOptions` が `token_resolver` を持ち既定が `None` であること、
+  `SpectraExporterOptions` が持たないこと。後者は「存在しない属性の不在」を主張するだけでは属性名の
+  typo で無音成立するため、実在する属性に対する正の assert を併記する。加えて本決定の唯一の前提
+  （`exporter_options` 指定時にトップレベル `token_resolver` が使われないこと）を、子プロセスで
+  `configure()` を 1 回だけ呼ぶ probe で実測する。上流が両者を合成する実装へ変われば本警告は
+  「届いている構成への誤警告」へ反転するため、`exporter_options` 未指定時に実 exporter が選ばれる
+  ことを正の対照として併置する（対照が無いと有効化フラグが効いていないだけの環境でも緑になる）。
+  span を生成しないため外部通信は発生しない。
+- **例外吸収と痕跡**: `token_resolver` が `AttributeError` 以外を投げる options で、例外を伝播させず・
+  誤警告もせず・計装まで到達すること。属性の読み取り回数は判定する構成で 1 回・判定しない構成で 0 回
+  （評価の広さそのものが Consequences で開示した利用者契約であり、その上限も契約に含まれる）。
+  判定不能時の DEBUG ログは、レベル・`exc_info` の存在・options の型・logger 名リテラルを個別に
+  照合する（logger 名は docs が `logging.getLogger(...)` の引数として公開しているため、モジュール
+  改名にテストが追随すると docs だけが静かに偽になる）。
+- **確認の方法**: 上記の各 pin は変異注入で実効性を確認する。「テストが実在する」「スイートが全緑」
+  のみでは確認済みとしない。集合の一致を主張する pin は過大側・過小側の両方向を注入する。変異の
+  復元は退避した全文の `cp` で行い、`git checkout` / `git restore` / `git stash` / `git reset` は
+  使わない。
+- **保守条件**: 本モジュールへ 5 番目以降の `RuntimeWarning` を追加する場合、帰属の検査ヘルパの
+  適用を必須とする（強制手段が列挙方式のため、適用漏れは全緑のまま帰属だけを失う）。
