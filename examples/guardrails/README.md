@@ -108,6 +108,7 @@ guardrail を名前で参照したい場合（UI からの有効 / 無効切り�
 | `05_moderation_external.py` | LLM01/05 | input / `external_detector_guardrail` | A（モデレーション） | なし（openai は本体同梱） |
 | `06_tool_output_guardrail.py` | LLM02/05 | tool 出力 / `tool_guardrail` + `function_tool`（後付けは `guard_tool`） | C（regex）他 DI 可 | なし |
 | `07_guardrail_registry.py` | LLM01/02/07 | `Boundary` 4 値すべて / `GuardrailRegistry`（facade 9 + register 経路 + 名前参照 + run 単位） | A（DI 検知器）/ B（判定 LLM）/ C（6 種）+ 自作 | なし |
+| `08_canary_run_scoped.py` | LLM07 | output / `canary_guardrail`（resolver）+ `AgentSpec.instructions_append` | C（カナリア） | なし |
 
 `07` は登録簿（`GuardrailRegistry`）で「名前の強制・適用境界の宣言・分類メタデータの宣言・名前
 参照」を 1 本で通す例で、`oai_agentspec.runtime.guardrails` の公開シンボル 27 件・facade 9 件・
@@ -117,6 +118,12 @@ guardrail を名前で参照したい場合（UI からの有効 / 無効切り�
 照合したい・境界とメタデータを宣言として保持したい場合の追加経路）。`07` の各フェーズは
 `docs/usage/safety/guardrails.md` の「名前で参照する」「適用範囲を選ぶ」「危険度と一覧」
 「検知器を単独で使う」に対応する。
+
+`08` は `02` の固定値カナリアを会話ごとに一意な値へ広げる例で、埋め込み
+（`AgentSpec.instructions_append`）と検知（`canary_guardrail` の resolver）の両方が run スコープの
+値を読む形を通す。どちらも構築・build の時点では評価されず、run / 検知呼び出しごとに再解決される
+ため、同じ Agent 実体を使い回したまま会話ごとのトークンを逐語照合できる（近似照合へ劣化させない）。
+カナリアの発行と会話単位の管理、埋め込み文言はいずれも利用側の責務。
 
 facade は `on` から適用境界を導出する。framework ラベルと既定危険度が自動で付くのは、**分類が
 helper 名で一意に定まる 2 件**（`canary_guardrail` / `injection_baseline_guardrail`）に限る。残りの

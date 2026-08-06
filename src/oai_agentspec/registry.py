@@ -13,7 +13,11 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Final
 
 from ._registry_core import build_two_pass, collect_reachable
-from ._validation import validate_instructions_callable
+from ._validation import (
+    ensure_appendable_instructions,
+    validate_instructions_append_shape,
+    validate_instructions_callable,
+)
 from .spec import AgentSpec, HandoffConfig
 
 if TYPE_CHECKING:
@@ -747,20 +751,33 @@ class AgentRegistry:
 
     @staticmethod
     def _validate_spec(spec: AgentSpec) -> None:
-        """callable instructions の arity と `guardrails` のコンテナ型を検証する。
+        """callable instructions / 追記関数の arity と `guardrails` のコンテナ型を検証する。
 
         `guardrails` に素の `str` を渡す取り違え（`["a"]` と `"a"`）は、`str` が反復可能なため
         1 文字ずつ名前参照として解釈され、`validate()` が偽の「未登録」を大量に報告する。
         `GuardrailRegistry.run_config_kwargs` と同じ守りを宣言側にも置く。
 
+        `instructions_append` の容器型・要素型（素の `str` / `Sequence` 以外の容器 / 非 callable
+        要素の拒否）は `validate_instructions_append_shape` へ委譲する（`build_agent` 側の第二
+        防御と判定・文言を共有するため）。本メソッドはさらに callable `instructions` との併用
+        拒否（`ensure_appendable_instructions`）と、各要素が (context, agent) の 2 引数で
+        呼び出せることを `instructions_append[i]` ラベル付きで検証する。追記関数は本検証で
+        評価しない（評価は run ごとの SDK 側責務）。
+
         Args:
             spec: 検証対象の `AgentSpec`。
 
         Raises:
-            ValueError: callable instructions の arity が不正な場合、または `guardrails` が
-                素の `str` の場合。
+            ValueError: callable instructions / 追記要素の arity が不正な場合、callable
+                `instructions` に `instructions_append` を併用した場合、`instructions_append`
+                が素の `str`・`Sequence` 以外の容器・非 callable 要素を含む場合、または
+                `guardrails` が素の `str` の場合。
         """
         validate_instructions_callable(spec.name, spec.instructions)
+        validate_instructions_append_shape(spec.name, spec.instructions_append)
+        ensure_appendable_instructions(spec.name, spec.instructions, spec.instructions_append)
+        for i, fn in enumerate(spec.instructions_append):
+            validate_instructions_callable(spec.name, fn, field_label=f"instructions_append[{i}]")
         if isinstance(spec.guardrails, str):
             raise ValueError(
                 f"agent {spec.name!r} の guardrails must be a sequence of str, "

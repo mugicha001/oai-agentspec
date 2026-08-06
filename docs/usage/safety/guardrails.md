@@ -97,6 +97,42 @@ result = await Runner.run(registry.get("assistant"), input=text, run_config=cfg)
 
 解決元そのものを差し替える経路（`GuardrailProvider` の自作実装を `AgentRegistry(guardrail_registry=...)` へ注入する）も取れますが、構築済み Agent への反映に `update()` が必要になるため、値だけを入れ替えたい用途では run 単位のほうが単純です。
 
+### run ごとにカナリアを解決する（resolver）
+
+登録簿を作り直さずに run ごとの値を扱いたい場合は、`canary_guardrail` へ固定値ではなく resolver
+（`(context, agent) -> str | Iterable[str] | None`）を渡します。resolver は登録時に評価されず、検知
+呼び出しのたびに再解決されるため、登録簿・guardrail の実体を共有したまま run ごとのトークンを逐語
+照合できます。
+
+```python
+guardrails = GuardrailRegistry()
+guardrails.canary_guardrail(
+    lambda ctx, agent: ctx.context.canary_token,   # run ごとに再解決される
+    name="session_canary",
+    severity=Severity.CRITICAL,
+)
+```
+
+- `ctx.context.<attr>` で run context を開きます（`AgentSpec.instructions_append` と同じ引数規約）。
+  resolver は同期関数として書いてください。`async def` の関数（および `async def __call__` を持つ
+  オブジェクト）は登録時に拒否されます。
+- resolver が返せるのは `str` / 文字列の iterable / `None` のみです。dict を返すとキーが照合対象に
+  なってしまうため拒否されます（`TypeError`）。
+- resolver が `None` や空を返した run では発火しません（「この run にはカナリアが無い」扱い）。
+- トークンは lib の外で発行した**高エントロピーな値**にしてください。短い値はほぼ全出力に含まれて
+  しまい、任意発火によるアラート疲弊を作れます。
+- 発火時の情報（`RunResult.output_guardrail_results` と tripwire 例外の `output_info`）には
+  マッチしたトークンが含まれます。SDK のトレースへ出るのは guardrail 名と発火の真偽だけなので、
+  トークンが外部へ出るのは**これらを自分でログ・監視へ転記したとき**です。転記する場合はマスク
+  してください。
+- 合成後のシステムプロンプト（カナリアを含む）は、Chat Completions 系モデルを使う場合に
+  `trace_include_sensitive_data`（既定は有効）のもとでトレースへ送られます。トークンを機密として
+  扱う場合は同設定と送信先を確認してください（Responses 系では instructions はトレースに載りません）。
+- 固定値（`str` / `Iterable[str]`）を渡す既存の書き方は変わりません。セッション境界で値が固定される
+  なら、登録簿をセッション毎に作り直す上記の形でも構いません。
+- プロンプト側へ同じトークンを埋め込む書き方は
+  [agents](../core/agents.md) の `instructions_append` を参照してください。
+
 ### 危険度と一覧
 
 危険度は `low` < `medium` < `high` < `critical` の順序を持ちます（未宣言は順序比較の対象外）。監査や UI 表示のために登録済みの宣言を一覧で取り出せます。
@@ -217,6 +253,7 @@ if canary_detector(CANARY)(webhook_body).triggered:
 
 - 詳細設計: `docs/architecture.md`（内容ガードレール節）
 - 検討経緯: `docs/rationale/content-guardrails-coverage.md`
+- 設計判断: `docs/adr/0015-declarative-guardrail-registry.md`（登録簿）/ `docs/adr/0023-run-scoped-instructions-and-canary-resolver.md`（カナリアの run スコープ解決）
 - 具体例: `examples/guardrails/01_injection_baseline.py` 〜 `06_tool_output_guardrail.py`
 
 ## 次

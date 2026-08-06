@@ -9,10 +9,11 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence  # isinstance 判定で使うため実行時 import
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
     # 型ヒント専用の一方向参照であり実行時依存はない（_validation は最下層のまま）。
     from .realtime.spec import RealtimeHandoffConfig
@@ -50,6 +51,71 @@ def validate_instructions_callable(
             f"agent {agent_name!r}: {field_label} callable は (context, agent) の "
             f"2 引数で呼び出せる必要があります"
         ) from None
+
+
+def ensure_appendable_instructions(
+    agent_name: str, instructions: Any, instructions_append: Sequence[Any]
+) -> None:
+    """`instructions_append` が非空のとき `instructions` が callable でないことを検証する。
+
+    追記は静的な `instructions`（`str` / `None`）の末尾へ連結する機構であり、callable な
+    `instructions` との合成は受理しない。register 時（前倒し検証）と build 時（第二防御）の
+    両層が本ヘルパを共有し、同一の判定・同一のエラーメッセージを維持する。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名。
+        instructions: spec の instructions 値。
+        instructions_append: spec の instructions_append 値（空なら何もしない）。
+
+    Raises:
+        ValueError: `instructions` が callable かつ `instructions_append` が非空の場合。
+    """
+    if not instructions_append or not callable(instructions):
+        return
+    raise ValueError(
+        f"agent {agent_name!r}: instructions が callable の場合は instructions_append を"
+        f"併用できません（instructions callable 内で断片を連結してください）"
+    )
+
+
+def validate_instructions_append_shape(agent_name: str, instructions_append: Any) -> None:
+    """`instructions_append` の容器型と各要素が callable であることを検証する。
+
+    素の `str` は反復可能なため 1 文字ずつ追記関数として解釈され、run で
+    `TypeError: 'str' object is not callable` という原因の分かりにくい失敗になる。`Sequence`
+    以外の容器（generator / iterator 等の使い切り iterable）は走査で消費され、build 側の
+    `list(...)` で追記が silent に消える（同一 spec の 2 回目の build で追記が欠落する）。
+    `set` 等の無順序容器も「宣言順に連結」契約を非決定的に破るため同じ判定で拒否する。
+    エラーメッセージには渡された値を載せず型名のみを報告する（カナリア文字列の漏洩防止）。
+
+    register 時（前倒し検証）と build 時（registry を経由しない直接 build に対する第二防御）の
+    両層が本ヘルパを共有し、同一の判定・同一のエラーメッセージを維持する。要素の arity 検証
+    （`validate_instructions_callable`）は register 時のみが行うため本ヘルパには含めない
+    （本ヘルパの責務は容器型・要素型の shape に限る）。追記関数は本検証で評価しない。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名。
+        instructions_append: spec の instructions_append 値。
+
+    Raises:
+        ValueError: 素の `str`・`Sequence` 以外の容器・非 callable 要素を含む場合。
+    """
+    if isinstance(instructions_append, str):
+        raise ValueError(
+            f"agent {agent_name!r} の instructions_append must be a sequence of callables, "
+            f"not a bare str: got {type(instructions_append).__name__!r}"
+        )
+    if not isinstance(instructions_append, Sequence):
+        raise ValueError(
+            f"agent {agent_name!r} の instructions_append must be a sequence of callables "
+            f"(list / tuple), got {type(instructions_append).__name__!r}"
+        )
+    for i, fn in enumerate(instructions_append):
+        if not callable(fn):
+            raise ValueError(
+                f"agent {agent_name!r}: instructions_append[{i}] は callable である必要が"
+                f"ありますが {type(fn).__name__!r} が渡されました"
+            )
 
 
 def validate_extra_kwargs(

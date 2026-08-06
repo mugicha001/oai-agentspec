@@ -13,12 +13,14 @@ helper はファクトリに徹する。重い専門検知（PII / モデレー�
 from __future__ import annotations
 
 import inspect
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..._adapters.guardrails import (
     attach_tool_guardrails,
     build_async_input_guardrail,
     build_async_output_guardrail,
+    build_context_output_guardrail,
     build_input_guardrail,
     build_output_guardrail,
     build_tool_input_guardrail,
@@ -35,7 +37,7 @@ from ._detectors import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Callable
 
     # SDK 型は `_adapters.guardrails` 経由で参照する（`from agents` を直接書かず SDK 隔離を保つ・
     # 戻り型注釈の具体化用。実行時は不要なので TYPE_CHECKING に閉じる）。
@@ -137,20 +139,128 @@ def prompt_llm_guardrail(
     return _user_agent_guardrail(guardrail_name, _detect, on, run_in_parallel=run_in_parallel)
 
 
-def canary_guardrail(canary: str | Iterable[str], *, name: str | None = None) -> OutputGuardrail:
+def canary_guardrail(
+    canary: str | Iterable[str] | Callable[..., Any], *, name: str | None = None
+) -> OutputGuardrail:
     """canary（漏洩トークン）の出力漏洩検知 guardrail を作る（システムプロンプト漏洩・C 家族）。
 
     出力テキストに canary が逐語で含まれていれば trip する `OutputGuardrail` を返す。canary 値は
     利用者 DI（システムプロンプトへ埋め込んだトークン等）。
 
+    固定値（`str` / `Iterable[str]`）に加えて **resolver（callable）** を受ける。resolver の契約は
+    `(context, agent) -> str | Iterable[str] | None` で、`context` は SDK の `RunContextWrapper` の
+    まま渡る（動的 instructions / `is_enabled` と同じ鏡写し規約）。resolver は構築時には評価せず
+    **検知呼び出しごとに再評価**し、その回の戻り値で逐語照合する（run ごとに変わるトークンを扱う
+    ため）。`None` / 空文字列 / 空 iterable を返した場合は「この run にカナリアが無い」状態として
+    trip しない。resolver が上記以外の型（`Mapping` / `bytes` / スカラー / 非 str 要素を含む
+    iterable 等）を返した場合は検知呼び出しで `TypeError` を上げる（`Mapping` を通すとキー列が
+    照合対象になり、実トークンが一切照合されないまま恒久 fail-open になるため）。構築時に行うのは
+    引数規約の bind 検証と同期関数であることの検証のみ。
+
     Args:
-        canary: 照合する canary 値（単一 or 複数）。
+        canary: 照合する canary 値（単一 or 複数）、または run ごとに解決する resolver。
         name: guardrail 名（None で既定名）。
 
     Returns:
         SDK 互換 `OutputGuardrail`。
+
+    Raises:
+        ValueError: resolver が `(context, agent)` の 2 引数で呼び出せない場合、または
+            resolver が `async def`（コルーチン関数・`async def __call__` を持つ callable object を
+            含む）の場合。
     """
-    return build_output_guardrail(name or _CANARY_NAME, canary_detector(canary))
+    guardrail_name = name or _CANARY_NAME
+    if isinstance(canary, str) or not callable(canary):
+        return build_output_guardrail(guardrail_name, canary_detector(canary))
+
+    resolver = canary
+    _validate_canary_resolver(resolver)
+
+    def detect(context: Any, agent: Any, text: str) -> Detection:
+        tokens = _canary_tokens(resolver(context, agent))
+        return canary_detector(tokens)(text)
+
+    return build_context_output_guardrail(guardrail_name, detect)
+
+
+def _canary_tokens(resolved: Any) -> tuple[str, ...]:
+    """canary resolver の解決値を照合用トークン列へ正規化する（型制約の適用点）。
+
+    受理するのは `str` / `Iterable[str]` / `None` のみ。`Mapping` はキー列が照合対象になり
+    実トークンが一切照合されないまま恒久 fail-open になるため、iterable であっても拒否する
+    （`bytes` も反復すると int 列になるため拒否する）。使い切り iterable（generator 等）を
+    壊さないよう、要素検査の前に tuple 化して以降その tuple を使う。
+
+    例外メッセージには型名のみを載せ、解決値（トークン候補）は載せない（漏洩面を広げない）。
+
+    Args:
+        resolved: resolver の戻り値。
+
+    Returns:
+        逐語照合に使うトークンの tuple（`None` は空 tuple）。
+
+    Raises:
+        TypeError: `str` / `Iterable[str]` / `None` 以外の値を受けた場合。
+    """
+    if resolved is None:
+        return ()
+    if isinstance(resolved, str):
+        return (resolved,)
+    if isinstance(resolved, Mapping | bytes | bytearray) or not isinstance(resolved, Iterable):
+        raise TypeError(
+            "canary_guardrail の resolver は str / Iterable[str] / None を返す必要がありますが "
+            f"{type(resolved).__name__!r} を返しました"
+        )
+    tokens = tuple(resolved)
+    for token in tokens:
+        if not isinstance(token, str):
+            raise TypeError(
+                "canary_guardrail の resolver が返す iterable の要素は str である必要が"
+                f"ありますが {type(token).__name__!r} が含まれます"
+            )
+    return tokens
+
+
+def _validate_canary_resolver(resolver: Callable[..., Any]) -> None:
+    """canary resolver が同期関数かつ `(context, agent)` の 2 引数で呼び出せることを検証する。
+
+    `validate_instructions_callable` と同種の bind 検証（デフォルト引数・可変長は許容）に加え、
+    公開契約が同期のみ（ADR 0023 判断 9）であることを構築時に確かめる（`async def` を通すと検知時に
+    未 await の coroutine が照合へ流れ、guardrail が壊れたことに気付きにくい）。実行時まで遅延させ
+    ると、guardrail は登録済みで正常に見えるまま run で初めて壊れる。シグネチャ取得不能な callable
+    （builtin 等）は bind 検証をスキップする。
+
+    同期性の検査は関数形（`async def` / `functools.partial(async def)`）だけでなく
+    `type(resolver).__call__` も対象にする（`inspect.iscoroutinefunction` は `async def __call__`
+    を持つ callable object に対して False を返すため、関数形だけの検査ではすり抜けて検知時の
+    未 await coroutine 事故になる）。同期 `__call__` を持つ callable object は受理する。
+
+    Args:
+        resolver: 検証対象の resolver。
+
+    Raises:
+        ValueError: resolver が `async def`（コルーチン関数・`async def __call__` を持つ callable
+            object を含む）の場合、または `(context, agent)` の 2 引数で呼び出せない場合。
+    """
+    # resolver は callable であることが呼び出し側で保証されるため `type(resolver).__call__` は
+    # 必ず存在する（関数の場合は slot wrapper で非コルーチン扱いになる）。
+    if inspect.iscoroutinefunction(resolver) or inspect.iscoroutinefunction(
+        type(resolver).__call__
+    ):
+        raise ValueError(
+            "canary_guardrail の resolver は同期関数である必要があります"
+            "（async def は受理しません）"
+        )
+    try:
+        sig = inspect.signature(resolver)
+    except (ValueError, TypeError):
+        return
+    try:
+        sig.bind(object(), object())
+    except TypeError:
+        raise ValueError(
+            "canary_guardrail の resolver は (context, agent) の 2 引数で呼び出せる必要があります"
+        ) from None
 
 
 def predicate_guardrail(

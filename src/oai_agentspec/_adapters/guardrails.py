@@ -115,6 +115,36 @@ def build_output_guardrail(name: str, detect: Callable[[str], Detection]) -> Out
     return _guardrail
 
 
+def build_context_output_guardrail(
+    name: str, detect: Callable[[Any, Any, str], Any]
+) -> OutputGuardrail[Any]:
+    """context 対応の検知器を SDK 互換 `OutputGuardrail` へ接着する。
+
+    `build_output_guardrail` と異なり、SDK から渡る `(context, agent, agent_output)` のうち
+    `context` / `agent` を破棄せず検知器へそのまま渡す（run ごとに変わる値を検知に使う用途。
+    既存版は検知契約を `Callable[[str], Detection]` に保つため両者を捨てている）。`context` は
+    SDK の `RunContextWrapper` のまま渡し（鏡写し規約）、`agent_output` のみ `_text_of` で
+    テキスト化する。検知器の戻り値が awaitable なら await して正規化する（`_call_detect`）。
+
+    Args:
+        name: guardrail 名（トレース用）。
+        detect: `(context, agent, text)` を受けて `Detection` または `Awaitable[Detection]` を
+            返す検知器。
+
+    Returns:
+        SDK 互換 `OutputGuardrail`。
+    """
+
+    @output_guardrail(name=name)
+    async def _guardrail(context: Any, agent: Any, agent_output: Any) -> GuardrailFunctionOutput:
+        detection = await _call_detect(
+            lambda text: detect(context, agent, text), _text_of(agent_output)
+        )
+        return _to_guardrail_output(detection)
+
+    return _guardrail
+
+
 async def _call_detect(detect: Callable[[str], Any], text: str) -> Detection:
     """検知器を呼び、戻り値が awaitable なら await して `Detection` に正規化する。
 

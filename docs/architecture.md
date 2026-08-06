@@ -269,6 +269,7 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 |---|---|---|
 | `name` | `str` | エージェント名（registry 内で一意） |
 | `instructions` | `str \| Callable \| None` | システムプロンプト。文字列、または `(context, agent)` の 2 引数 callable。`PromptStore.compose` の戻り値を渡せる |
+| `instructions_append` | `list[Callable]` | run ごとに評価してシステムプロンプト末尾へ連結する追記関数（kw_only・既定は空） |
 | `prompt` | `agents.Prompt \| DynamicPromptFunction \| None` | `Agent.prompt`（Responses API 用。`dynamic_prompt` ヘルパーの戻り値） |
 | `tools` | `list` | Agent に渡すツール |
 | `model` | `str \| agents.Model \| None` | モデル指定 |
@@ -289,6 +290,38 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 `extra` に専用フィールド（name / instructions / prompt / tools / handoffs / model /
 model_settings / hooks）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
 場合は構築時に `ValueError` を送出する。
+
+#### run スコープの instructions 追記（`instructions_append`）
+
+`instructions_append` は、静的な `instructions` を `str` のまま保ったまま、run ごとに値が変わる
+断片（カナリートークン等）をシステムプロンプト末尾へ連結するための宣言である。要素は
+`(context, agent)` の 2 引数 callable で、`context` は SDK の `RunContextWrapper` がそのまま渡り、
+利用側は `ctx.context.<attr>` で run context を開く（動的 instructions / `is_enabled` と同じ流儀）。
+async な追記関数も渡せる。
+
+- **評価タイミング**: 追記関数は build 時にも registry 登録時にも評価されない。`instructions_append`
+  が非空のとき、`build_agent` は SDK の動的 instructions 機構に載る合成 callable を生成して
+  `Agent.instructions` へ渡し、SDK が run ごとに呼び出して評価する。lib 側に実行ループはない。
+- **連結規則**: 静的 `instructions` と各追記の戻り値を**宣言順**に `"\n\n"` で連結する。`""` を
+  返した追記は連結からスキップされる。`instructions=None` かつすべての追記が `""` を返した場合、
+  合成 callable は `None` ではなく空文字列 `""` を返す。
+- **`instructions` が callable の場合は併用を拒否する**。registry 登録時に `ValueError` とし、
+  `build_agent` にも同一チェックを防御として置く（registry を経由しない build 経路対策）。
+  `instructions=None` + 追記のみは許容する。
+- **容器型・要素型**: 受理する容器は `list` / `tuple`（`collections.abc.Sequence`）のみ。素の `str`、
+  および `Sequence` でない容器（generator / set / iterator / `dict_values` 等）は `ValueError` とする。
+  要素が callable でない場合も `ValueError`（`instructions_append[i]` のインデックス付きラベルで
+  位置を示す）。エラーメッセージには型名のみを載せ、渡された値は載せない（カナリア埋め込み文を
+  取り違えて渡した場合のトークン漏洩防止）。
+- **検証タイミング**: 上記の容器型・要素型検証は `_validation.py` の共有ヘルパに持ち、registry 登録時と
+  `build_agent`（registry を経由しない直接 build 経路）の両層が同一ヘルパを呼ぶため、どちらの経路でも
+  同一文言で弾かれる。要素の callable arity（`(context, agent)` の 2 引数）は既存 `instructions` と
+  同じく registry の register 時に検証する。
+- **例外時の挙動**: 追記関数が送出した例外はそのまま伝播する（fail-fast・縮退しない）。戻り値が
+  `str` でない場合は `TypeError`。カナリア埋め込みの失敗を無言で縮退させると検知側が沈黙するため、
+  run を落として顕在化させる。
+
+判断の経緯は `docs/adr/0023-run-scoped-instructions-and-canary-resolver.md` を参照する。
 
 ### SandboxAgentSpec
 
@@ -318,7 +351,10 @@ spec 側リストの事後 mutation が伝播しない（`tools` と同じ遮断
 `AgentRegistry` の register 時に検証されるのに対し、`base_instructions` の callable arity
 検証は `_adapters/builders.py` の build 時（`build_agent` 内）で行われる。これは `registry.py`
 が `SandboxAgentSpec` 固有の分岐を持たない（属性アクセスのみで動作する）方針を維持するための
-非対称である。`registry.py` は sandbox 固有の分岐を持たず、`AgentSpec` と `SandboxAgentSpec` を
+非対称である。`instructions_append` は継承した `instructions` 側にのみ効き（build 経路が
+`instructions` の kwargs を共有するため）、`base_instructions` には適用されない。
+`base_instructions` を run ごとに変えたい場合は callable を直接渡す。
+`registry.py` は sandbox 固有の分岐を持たず、`AgentSpec` と `SandboxAgentSpec` を
 混在登録・混在ハンドオフできる。spec 複製（`freeze` / `clone`）の外部 mutation 遮断は、spec の
 全 dataclass フィールドを走査して list / dict 値を新コンテナに複製する方式であり、サブクラス
 固有の可変フィールド（`capabilities` 等）にも列挙の手動同期なしで適用される。
@@ -1646,6 +1682,21 @@ extra 未導入契約・SDK 隔離方針に従う。プロンプト最適化（A
   明示）。`build` 省略時の既定 build は registry 登録 `AgentSpec` を複製し `instructions` のみ候補で差し替える
   （tools / handoffs / model は複製で保持・registry 未解決かつ build 省略は fail-closed）。出力は `${var}` 保持の
   最適化済みテキスト（複数スロット時は名前付き mapping）。`PromptStore` は読み取りのみで内省・書き換えしない。
+- **`instructions_append` を宣言した spec の APO は未サポート**であり、**lib が既定 build を生成する 2 経路の
+  双方**が構築時に早期拒否する（rollout まで遅延させない）: `prompt_slot` / `prompt_slot_factory` の既定 build
+  構築時（`ValueError`）と、`optimize(target=<静的 AgentSpec>, slot=None)` の既定スロット導出時
+  （`OptimizeError`・`FailureKind.CONFIG_MISSING`）。例外型が経路で異なるのは、後者が `optimize` の失敗契約
+  （利用者が `kind` で分岐する）に載るため。理由文は単一のヘルパへ集約し経路間で食い違わせない。
+  拒否する理由は、既定 build が候補テキストを `instructions` に据えるだけで追記断片を含まないため:
+  静的経路（`vars=None`）では追記が無言に合成されて `OptimizeResult.prompt` が rollout 時の実 instructions と
+  乖離し（契約 drift）、`vars=callable` 経路では lib 生成の動的 callable を据えるため rollout 中の `build_agent`
+  が併用不可エラーを出すが、そのエラーは利用者が制御できない callable を指しており原因が分からない。
+  **拒否しないのは build が利用者責務の経路**（`slot=` に利用者の `Slot` / `build=` を明示した `prompt_slot` /
+  生 seed + `rebind`）で、追記の合成責務を利用者が引き受ける形として許容する。回避手段は「追記を宣言しない
+  spec を対象にする」または「追記の合成を含めて自前で組み立てた `build=` を渡す」。なお `prompt_slot` 経路は
+  registry から spec を解決するため、対象 spec が未登録の場合は本検査では何もしない（未登録の診断は既存の
+  build 呼び出し時の解決が担う契約を変えないため）。`optimize(slot=None)` 経路は `target` spec を直接受け取る
+  ため、この no-op は該当しない。
 
 ### データフロー
 
@@ -1805,6 +1856,34 @@ helper はファクトリに徹し guardrail オブジェクトを返す。利�
 よく使う再利用 helper（決定的検知・注入ベースライン等）を同梱しつつ、判定 model / prompt・カナリア値・
 predicate・検知パターン・外部検知器はすべて利用者 DI で受け、上書き / 拡張できる。重い専門検知は外部 DI で
 ライブラリ非同梱とする。
+
+### カナリア値の run スコープ解決
+
+カナリアのファクトリは、固定値（`str` / `Iterable[str]`）に加えて **resolver**
+（`(context, agent) -> str | Iterable[str] | None`）を受け取る。resolver を渡すと、run ごとに値が変わる
+カナリートークンを逐語照合のまま扱える（正規表現による近似照合へ劣化させない）。
+
+- **評価タイミング**: resolver はファクトリ構築時にも登録簿への登録時にも評価されない。構築時に行うのは
+  引数 arity の検証のみで、実際の解決は SDK が guardrail を呼ぶ**検知呼び出しごと**に行われる。解決した
+  値でその都度検知器を組み、出力テキストと逐語照合する。
+- **引数規約**: `context` は SDK の `RunContextWrapper` がそのまま渡り、利用側は `ctx.context.<attr>` で
+  run context を開く（`AgentSpec.instructions_append` と同一規約）。公開契約としての resolver は同期関数
+  のみとする（トークン取得は run context の属性読み出しで I/O を伴わない前提）。この同期限定は**構築時に
+  拒否する**形で強制する。検査対象は関数自体（`inspect.iscoroutinefunction`）と `type(resolver).__call__` の
+  両方で、`async def` 関数・`functools.partial(async def)`・`async def __call__` を持つ callable object を
+  構築時 `ValueError` で弾く。同期 `__call__` を持つ callable object は受理する。
+- **戻り値の型制約**: 受理するのは `str` / `Iterable[str]` / `None` のみ。`Mapping`（dict 等）は iterable
+  であっても拒否する（キー列が照合対象になり、実トークンが一切照合されないまま恒久的な fail-open に
+  なるため）。`bytes` / `bytearray`・非 `Iterable`・非 str 要素を含む iterable も `TypeError` とする。
+  例外メッセージには型名のみを載せ、解決値は載せない。使い切り iterable（generator 等）を壊さないよう、
+  要素検査の前に tuple 化する。
+- **未解決時の挙動**: resolver が `None` または空を返した場合は発火しない（`triggered=False`）。
+  「この run にはカナリアが無い」状態として扱う。
+- **接着**: resolver 経路は `_adapters/guardrails.py` の context 対応 output guardrail ビルダ経由で
+  SDK 互換の `OutputGuardrail` を組む。検知器の契約（`Callable[[str], Detection]`）と固定値経路の接着は
+  不変で、既存の呼び出しは経路ごと変わらない。context 対応の接着は出力境界のみに持つ（カナリアは出力専用）。
+
+判断の経緯は `docs/adr/0023-run-scoped-instructions-and-canary-resolver.md` を参照する。
 
 ### 宣言の登録簿（`GuardrailRegistry`）
 

@@ -1040,6 +1040,70 @@ def test_prompt_slot_vars_dict_still_calls_fixed_vars_check(tmp_path: Path) -> N
 
 
 # ----------------------------------------------------------------------
+# APO 対象 spec の instructions_append: rollout を待たず早期に fail-closed で拒否する
+# ----------------------------------------------------------------------
+
+
+def _registry_with_append() -> AgentRegistry:
+    """`instructions_append` を宣言した triage spec を持つ registry（APO 対象化の拒否検証用）。"""
+    reg = AgentRegistry()
+    reg.register(
+        AgentSpec(
+            name="triage",
+            instructions="orig",
+            instructions_append=[lambda ctx, agent: "run-scoped fragment"],
+            model=FakeModel(),
+        )
+    )
+    return reg
+
+
+def test_prompt_slot_rejects_target_spec_with_instructions_append(tmp_path: Path) -> None:
+    """`instructions_append` を持つ spec の APO 対象化は rollout 前に `ValueError` で拒否される。
+
+    既定 build は候補テキストを `instructions` に据えるため、`instructions_append` を持ち越すと
+    静的経路（`vars=None`）では追記が無言に合成され、`OptimizeResult.prompt` が rollout 時の実
+    instructions と乖離する（契約 drift）。`vars=callable` 経路では lib が生成した動的 callable を
+    据えるため rollout 中の `build_agent` が併用不可エラーを出すが、そのエラーは利用者が制御できない
+    callable を指しており原因が分からない。いずれも rollout まで遅延させず、構築時に原因の分かる
+    メッセージで倒すことを pin する（内部の経路分岐には結合しない）。
+    """
+    with pytest.raises(ValueError) as exc:
+        prompt_slot(
+            _store_new_shape(tmp_path),
+            _registry_with_append(),
+            agent="triage",
+            vars=lambda ctx: {"tone": "polite"},
+        )
+    message = str(exc.value)
+    assert "instructions_append" in message
+    assert "サポート" in message  # 「未サポート」相当の説明（原因特定可能性の pin）
+
+
+def test_prompt_slot_accepts_target_spec_without_instructions_append(tmp_path: Path) -> None:
+    """`instructions_append` が空の spec は従来どおり APO 対象にできる（過剰拒否の検知）。"""
+    slot = prompt_slot(
+        _store_new_shape(tmp_path),
+        _registry(),
+        agent="triage",
+        vars=lambda ctx: {"tone": ctx.tone},
+    )
+    assert slot.vars_fn is not None
+
+    class FakeCtx:
+        tone = "polite"
+
+    agent_spec = slot.build("CANDIDATE_TEXT")
+    assert agent_spec.instructions(FakeCtx(), agent_spec) == "CANDIDATE_TEXT"
+
+
+def test_prompt_slot_static_path_accepts_spec_without_instructions_append(tmp_path: Path) -> None:
+    """静的 instructions 経路（`vars=None`）も追記なし spec では従来どおり成立する（非退行）。"""
+    slot = prompt_slot(_store_new_shape(tmp_path), _registry(), agent="billing")
+    assert slot.build("CANDIDATE_TEXT").instructions == "CANDIDATE_TEXT"
+
+
+# ----------------------------------------------------------------------
 # prompt_slot_factory: 共通既定値を束ねた per-agent Slot 生成（RED: Issue #41 T3・本テスト
 # 作成時点で未実装。実装は後段。）
 # ----------------------------------------------------------------------
