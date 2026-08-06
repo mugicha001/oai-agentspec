@@ -63,11 +63,11 @@ def _all_string_elements(init_path: Path) -> list[str]:
     return []
 
 
-def test_runtime直下のサブパッケージ件数は11件に固定される() -> None:
+def test_runtime直下のサブパッケージ件数は12件に固定される() -> None:
     """窓口追加時にこの pin が落ちることで列挙漏れを検知する。"""
     names = _runtime_subpackage_names()
 
-    assert len(names) == 11, names
+    assert len(names) == 12, names
 
 
 def test_runtime配下の各公開窓口のall要素に禁止語彙が含まれない() -> None:

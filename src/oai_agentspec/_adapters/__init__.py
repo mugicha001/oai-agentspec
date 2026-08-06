@@ -102,6 +102,10 @@ from .next_turn import (
     read_last_agent,
     validate_recorded_edge_declaration,
 )
+from .observability import (
+    enable_agent365_tracing,
+    enable_otel_logging,
+)
 from .responses import (
     _completed_event as _completed_event,
 )
@@ -235,4 +239,8 @@ __all__ = [
     "new_audit_sink",
     "policy_violation_error_type",
     "resolve_policy",
+    # オブザーバビリティ連携（Agent 365 トレース / OTel ログのグローバル結線窓口・
+    # microsoft_agents_a365 / opentelemetry はトップ非 import）
+    "enable_agent365_tracing",
+    "enable_otel_logging",
 ]

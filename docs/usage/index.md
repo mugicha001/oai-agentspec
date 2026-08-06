@@ -35,10 +35,11 @@
 13. [ops/intent.md](./ops/intent.md)
 14. [ops/llmops.md](./ops/llmops.md)
 15. [ops/lightning.md](./ops/lightning.md)
-16. [runtime/realtime.md](./runtime/realtime.md)
-17. [runtime/conversation.md](./runtime/conversation.md)
-18. [runtime/serve_and_cli.md](./runtime/serve_and_cli.md)
-19. [runtime/deterministic.md](./runtime/deterministic.md)
+16. [ops/observability.md](./ops/observability.md)
+17. [runtime/realtime.md](./runtime/realtime.md)
+18. [runtime/conversation.md](./runtime/conversation.md)
+19. [runtime/serve_and_cli.md](./runtime/serve_and_cli.md)
+20. [runtime/deterministic.md](./runtime/deterministic.md)
 
 ## extras 一覧
 
@@ -54,6 +55,7 @@
 | `governance` | `agent-governance-toolkit[openai-agents]` | ツール単位ポリシー強制 + 監査ログ |
 | `intent` | `pydantic` | `IntentClassifier` / `IntentPolicy` |
 | `resilience` | 追加依存なし | `ModelRetryPolicy` / `RunBudgetPolicy` |
+| `observability` | `microsoft-agents-a365-observability-extensions-openai` / `opentelemetry-sdk` / `opentelemetry-exporter-otlp-proto-http` | `enable_agent365_tracing` / `enable_otel_logging`（Agent 365 トレース + OTel ログ） |
 | `guardrails` | 追加依存なし | 入出力ガードレール helper |
 
 一次情報は `pyproject.toml` の `[project.optional-dependencies]`（バージョン制約はこちらを参照）。
@@ -70,6 +72,7 @@
 - 実行の安全網（retry / budget / guardrails / policy） → [safety/](./safety/)
 - 品質評価 → [ops/llmops](./ops/llmops.md)
 - プロンプト自動最適化 → [ops/lightning](./ops/lightning.md)
+- トレース / ログを観測基盤へ流したい → [ops/observability](./ops/observability.md)
 
 ## 横断原則
 

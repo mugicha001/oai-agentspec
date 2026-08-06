@@ -125,6 +125,11 @@ def _valid_kwargs_map() -> dict[str, dict[str, Any]]:
         "oai_agentspec.runtime.llmops.types.ObservedRun": {
             "route": ObservedRoute(steps=[], last_agent="bot")
         },
+        "oai_agentspec.runtime.observability.config.Agent365TracingConfig": {
+            "service_name": "svc",
+            "service_namespace": "ns",
+        },
+        "oai_agentspec.runtime.observability.config.OtelLoggingConfig": {},
         "oai_agentspec.runtime.resilience._failsafe.FailsafePolicy": {},
         "oai_agentspec.runtime.resilience._types.ModelRetryPolicy": {},
     }

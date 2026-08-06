@@ -393,4 +393,4 @@ result = await optimize(target=graph, slot=[...], train=train, val=val, reward=r
 
 ## 次
 
-[../runtime/realtime.md](../runtime/realtime.md) — Realtime エージェント
+[observability.md](./observability.md) — オブザーバビリティ連携

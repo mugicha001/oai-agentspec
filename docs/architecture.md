@@ -52,9 +52,11 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ Resilience (runtime/resilience 公開窓口・resilience extra・agents 非依存・宣言層)
    │
+   ┊ オブザーバビリティ連携 (runtime/observability 公開窓口・observability extra・agents/microsoft_agents_a365/opentelemetry 非依存・上位利用支援層)
+   │
    ┊ 決定的応答モデル (runtime/deterministic 公開窓口・extra 不要・_adapters/deterministic へ再エクスポート委譲)
    │
-利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify・resilience build）
+利用側アプリ      │ import 委譲（会話実行・Session 生成・評価実行・最適化実行・ガバナンス build・意図予測 classify・resilience build・observability 有効化）
    │ import       │
    ▼              │
 __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
@@ -75,7 +77,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
    └────────────────→ _adapters/ (agents / 外部クライアント への import 単一窓口) ◄── 会話サービス / LLMOps 評価 / Agent Lightning 最適化
                               │ runtime import
                               ▼
-                         openai-agents (agents) / deepeval / langfuse
+                         openai-agents (agents) / deepeval / langfuse / microsoft_agents_a365 / opentelemetry
 ```
 
 - 実行寄り層は `runtime/` 配下のサブパッケージ（`runtime/conversation` / `runtime/serve` /
@@ -97,10 +99,10 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops` / `runtime/observability`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
-- `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
+- `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse` / Agent 365 オブザーバビリティ拡張 `microsoft_agents_a365` 系 / OTel SDK `opentelemetry`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
 
 ## コンポーネントの責務
 
@@ -122,7 +124,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
-| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）/ `runtime/deterministic`（決定的応答モデルと応答ビルダの公開窓口・extra 不要＝追加依存なし。詳細は「決定的応答モデル」節）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
+| `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/observability`（オブザーバビリティ連携・公開窓口・`observability` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）/ `runtime/deterministic`（決定的応答モデルと応答ビルダの公開窓口・extra 不要＝追加依存なし。詳細は「決定的応答モデル」節）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
 `_adapters/` が再エクスポートする SDK 型（`Agent` / `RunContextWrapper` / `Model` / `Prompt` / `DynamicPromptFunction` / `GenerateDynamicPromptData` / `Handoff` / `Runner` / `ModelResponse` / `ModelSettings` / `FunctionTool` / `ToolContext` / `ToolApprovalItem` / `RunState`）は内部の型参照用であり、公開契約には含めない（HITL の `ToolApprovalItem` / `RunState` は中断状態を SDK と結合する内部窓口であり外部公開しない。承認必須ツール宣言用の `function_tool` のみ公開再エクスポートする）。利用者はこれらの型が必要な場合 `from agents import ...` を直接使う。
 
@@ -2737,6 +2739,70 @@ PEP 562 遅延再エクスポート（`runtime/hooks` 方式）は採らない�
 1 件も載せない（コア `__all__` は宣言層シンボルのみという原則を保つ）。
 
 設計判断の経緯は `docs/adr/0019-deterministic-response-model.md` を参照。
+
+## オブザーバビリティ連携（Agent 365 トレース / OTel ログ・`runtime/observability`）
+
+実行の観測（トレース span とログ）を Microsoft Agent 365 オブザーバビリティ拡張と OTel Logs へ流す
+ための上位利用支援層。`runtime/` 配下の実行寄り層の一員（`runtime/observability`）であり、単一 extra
+`oai-agentspec[observability]`（`microsoft-agents-a365-observability-extensions-openai` +
+`opentelemetry-sdk` + `opentelemetry-exporter-otlp-proto-http`）で opt-in 導入する。公開窓口は `oai_agentspec.runtime.observability` の
+`__init__.py` に集約し、有効化関数 2 つ（`enable_agent365_tracing` / `enable_otel_logging`）と設定
+dataclass 2 型（`Agent365TracingConfig` / `OtelLoggingConfig`。frozen・SDK 非依存・env 直読なし・
+`runtime/observability/config.py` に定義）をここから参照する。コア `__all__` には載せない。
+
+observability は既存 extra と同じ整合方針に従う。SDK / 外部クライアント隔離（`_adapters` への import
+単一窓口）・extra 未導入耐性（遅延 import 境界と未導入時の `ImportError` 案内）・単方向依存（runtime
+からコアへの上向き参照のみ）の規約は既存節（「SDK 隔離と依存性注入（DI）」「会話 Helper（ローカル
+開発支援）」）が SoT であり、本節では再掲しない。外部 SDK（`microsoft_agents_a365` 系 /
+`opentelemetry`）の import は `_adapters/observability.py` に閉じ、`_adapters` から設定 dataclass への
+参照は `TYPE_CHECKING` ブロック内の型注釈のみ（`_adapters -> runtime` の逆方向ランタイム import を
+作らない）。
+
+### 有効化モデル（明示的なグローバル結線）
+
+有効化は利用者が明示的に 1 回呼ぶ関数のみで行い、import 副作用を持たない（`import oai_agentspec` は
+SDK トレーシング・root logger に非接触）。両関数はプロセス全体に効くグローバル結線であり、
+build-don't-run の例外 3 例目にあたる（rationale と却下案は
+`docs/adr/0022-observability-global-hook-exception.md` を参照）。
+
+- `enable_agent365_tracing(config)`: MS 拡張 `configure()` をラップし、その後に MS 拡張の公式 API
+  `OpenAIAgentsTraceInstrumentor().instrument()` で SDK トレーシングへ計装を適用する（構成前に計装を
+  生成すると MS 拡張側が `RuntimeError` を送出するため、構成 -> 計装の順序が契約）。計装は内部で
+  `set_trace_processors` により SDK のトレースプロセッサ列を置換するため、有効化後は SDK 既定の送信先
+  （OpenAI プラットフォーム）へは送られない。未有効化時の SDK トレース挙動は非接触のまま保たれる。
+  冪等化は MS 拡張側へ委譲し（再構成は警告付きで無視され、再計装も no-op）、本層は独自の状態を持た
+  ない。SDK トレーシングが `set_tracing_disabled` で無効化された状態で呼ぶと `RuntimeWarning` で
+  「トレース未送信」を通知し処理は継続する（環境変数 `OPENAI_AGENTS_DISABLE_TRACING` による無効化は
+  SDK が内部フラグを最初のスパン生成まで更新しないため検知できない）。構成に失敗した場合・未構成の
+  場合も `RuntimeWarning` で通知し、計装せずに戻る（観測の失敗でアプリを停止させない）。
+- `enable_otel_logging(config)`: `LoggerProvider` / `LogExporter` を構築し、OTel `LoggingHandler` を
+  root logger へ冪等に付与する（モジュールフラグでプロセス内 1 回に限定）。既存ハンドラ・
+  フォーマッタには触れず追加のみを行う。付与時の設定を保持し、2 回目以降に異なる設定で呼ばれた場合は
+  適用済みの結線を変えずに `RuntimeWarning` で通知する（黙殺しない）。
+
+### エクスポート先とデータフロー
+
+依存方向は「利用者 -> `runtime/observability` -> `_adapters/observability` -> 外部 SDK」の一方向で、
+コア宣言層（`AgentSpec` / `registry` 等）は本機能を一切参照しない。既存の workflow tracing
+（`_adapters/tracing.py` の `WorkflowTracer`。workflow 層専用の `custom_span` 発行）とは独立の関心事
+であり、ファイルも分離して共存する。
+
+- トレース: span は SDK トレーシング -> MS 拡張 `TracingProcessor` 経由で送出される。エクスポート先
+  切替（既定コンソール / sidecar / 実 Agent365 API / 汎用 OTLP）は MS 拡張 `configure()` の既存仕様へ
+  パススルーで委譲し、lib 独自のエクスポータ選択方式・列挙型を持たない（切替仕様の SoT は MS 拡張
+  側）。
+- ログ: 標準 `logging` -> root logger の `LoggingHandler` -> `LoggerProvider` 経由で送出される。宛先
+  は既定コンソール（`ConsoleLogExporter`）+ `OtelLoggingConfig.otlp_enabled=True` での
+  `OTLPLogExporter` 併用追加（`LogRecordProcessor` 2 本構成・置換しない）のみで、sidecar / 実
+  Agent365 API 宛は存在しない（トレース側との意図的な非対称）。
+- 相関: アクティブ span が存在する時点のログは OTel current span 文脈由来の trace_id / span_id を
+  持ち span と相関する。span が無い時点のログは無効 trace_id 相当となり相関情報を偽装しない。
+
+lib 本体は env 非依存を保つ。MS 拡張・OTel SDK 自身が読む環境変数
+（`ENABLE_A365_OBSERVABILITY_EXPORTER` / `ENABLE_OTLP_EXPORTER` / `OTEL_EXPORTER_OTLP_*` 等）は
+委譲先の仕様として扱う。
+
+利用手順・設定例は `docs/usage/ops/observability.md` を参照。
 
 ## テスト層
 
