@@ -3,7 +3,10 @@
 `enable_agent365_tracing`（Agent 365 トレース連携）と `enable_otel_logging`（標準 logging ->
 OTel Logs 連携）の結線を、依存取得関数（`_require_agent365_tracing` / `_require_opentelemetry` /
 `_require_otlp_log_exporter`）を monkeypatch で spy へ差し替えて検証する。実 SDK は一切呼ばない
-（実 SDK 側の契約は `test_observability_l2.py` が別途 pin する）。
+（実 SDK 側の契約は `test_observability_l2.py` が別途 pin する）。例外は
+`..._does_not_warn_for_spectra_options` のみで、`token_resolver` 属性を**持たない**値の実在性は
+スタブでは担保できないため実 `SpectraExporterOptions` を構築する（observability extra 未導入時は
+`pytest.importorskip` で skip する）。
 
 pin する不変条件（ADR 0022 Confirmation）:
 
@@ -13,6 +16,11 @@ pin する不変条件（ADR 0022 Confirmation）:
 - 構成失敗: 警告のみで例外にせず、かつ計装へ進まない（`configure()` が偽・`is_configured()` が
   偽のいずれでも同じ着地。計装は既定のトレースプロセッサ列を置換するため、半端な構成のまま
   進むと既定の送信先まで失われる）。正常系で計装へ到達することは別テストが pin する。
+- resolver ドロップ検知: `token_resolver` と Agent365 形式 `exporter_options`（resolver 未設定）の
+  併用は `RuntimeWarning` で通知するが処理は継続する。属性を持たない値（sidecar 構成・未指定）は
+  番兵で除外して警告しない。
+- 観測の失敗でアプリを止めない: `exporter_options` の属性取得が例外を投げても伝播させず、
+  判定不能として番兵へ倒して計装まで到達する。
 - 冪等: `enable_otel_logging` を複数回呼んでも root logger への `LoggingHandler` 付与は 1 回だけ。
 - 再設定検知: 初回と異なる設定での 2 回目は `RuntimeWarning` のみで、適用済みの結線は変えない。
 - 非接触: 既存 handler オブジェクト・フォーマッタ・登録順・root logger の level は変更しない
@@ -501,6 +509,198 @@ def test_enable_agent365_tracing_does_not_warn_when_configure_succeeds(
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         obs.enable_agent365_tracing(_tracing_config())
+
+
+# ----------------------------------------------------------------------
+# enable_agent365_tracing: exporter_options による token_resolver ドロップ検知
+# ----------------------------------------------------------------------
+
+
+def _resolver(scope: str, tenant: str) -> str | None:
+    """`token_resolver` として渡す callable のスタブ（値は使わない）。"""
+    return None
+
+
+def test_enable_agent365_tracing_warns_when_exporter_options_drops_token_resolver(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """resolver を渡したのに Agent365 形式 options 併用で捨てられる構成を警告する。
+
+    上流は `exporter_options` が渡された場合トップレベルの `token_resolver` を参照しないため、
+    認証手段を渡したつもりでコンソール出力へフォールバックする。`configure()` /
+    `is_configured()` はこの構成でも真を返すため、警告が唯一の検知手段になる。
+
+    検知する退行: 警告ブロックの削除（M5）・例外化（M6）・カテゴリ変更（M7）・照合語の削除（M10）。
+    加えて警告後も `configure` -> 計装へ到達することを列全体で検査し、警告ブロック末尾へ
+    `return` を挿入して無音で計装が止まる退行（M8）を検知する。
+    """
+    config = _tracing_config(
+        token_resolver=_resolver,
+        exporter_options=SimpleNamespace(token_resolver=None),
+    )
+
+    with pytest.warns(RuntimeWarning, match="token_resolver は Agent 365 側で参照されません"):
+        obs.enable_agent365_tracing(config)
+
+    # 警告のみで中断しない（警告後に return を挿入する変異を検出する）。
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
+
+
+def test_enable_agent365_tracing_warns_about_dropped_resolver_even_when_configure_fails(
+    monkeypatch: pytest.MonkeyPatch, tracing: None
+) -> None:
+    """構成失敗（`configure()` が偽）でも resolver ドロップの警告は発出される。
+
+    判定材料は config のみで構成の成否と独立しているため、警告は `configure()` 呼び出しの
+    **前**に置く。構成失敗は early return するので、警告ブロックを構成失敗判定の後ろへ移すと
+    この経路で警告が失われる（順序退行 M9）。
+
+    構成失敗の警告も同時に出るため、全警告を記録して「resolver ドロップの警告が含まれること」を
+    直接検査する（`pytest.warns(match=...)` 単独では他方の警告で偽に緑化しうる）。
+    """
+    spy = _TracingSpy(configure_result=False)
+    monkeypatch.setattr(obs, "_require_agent365_tracing", spy.as_tuple)
+    config = _tracing_config(
+        token_resolver=_resolver,
+        exporter_options=SimpleNamespace(token_resolver=None),
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        obs.enable_agent365_tracing(config)
+
+    messages = [str(item.message) for item in caught]
+    dropped = [msg for msg in messages if "token_resolver は Agent 365 側で参照されません" in msg]
+    assert dropped, f"resolver ドロップの警告が出ていません: {messages}"
+    assert all(item.category is RuntimeWarning for item in caught)
+    # 構成失敗側の着地（計装しない）は既存テストが pin する。ここでは共存のみ確認する。
+    assert any("構成に失敗" in msg for msg in messages), messages
+
+
+def test_enable_agent365_tracing_does_not_warn_when_exporter_options_carries_token_resolver(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """options 側に resolver が設定済みなら警告しない（実効 resolver があるため）。
+
+    検知する退行: 条件から `options.token_resolver is None` を落として resolver 設定済み構成へ
+    誤警告する変異（M1）。
+    """
+    config = _tracing_config(
+        token_resolver=_resolver,
+        exporter_options=SimpleNamespace(token_resolver=_resolver),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
+
+
+def test_enable_agent365_tracing_does_not_warn_for_spectra_options(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """sidecar 構成（`SpectraExporterOptions`）では resolver 併用でも警告しない。
+
+    Spectra は OTLP sidecar へ送るため resolver を必要とせず、上流は当該属性を持たない。
+    実 SDK のクラスを使うことで「属性が無い値では判定が成立しない」ことを実物で固定する
+    （属性の有無は `test_observability_l2.py` が別途 pin する）。
+
+    検知する退行: `hasattr(options, "token_resolver")` を
+    `getattr(options, "token_resolver", None) is None` へ置き換え、Spectra を誤検知する変異（M2）。
+    トップレベル `token_resolver` も同時に渡さないとこの変異を検知できないため必ず渡す。
+    """
+    core = pytest.importorskip(
+        "microsoft_agents_a365.observability.core",
+        reason="observability extra（microsoft-agents-a365-observability-extensions-openai）未導入",
+    )
+    config = _tracing_config(
+        token_resolver=_resolver,
+        exporter_options=core.SpectraExporterOptions(),
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
+
+
+def test_enable_agent365_tracing_does_not_warn_without_options(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """`exporter_options` 未指定なら警告しない（resolver は上流で合成される）。
+
+    検知する退行: 条件を無条件化する変異（M4）。
+    """
+    config = _tracing_config(token_resolver=_resolver)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
+
+
+def test_enable_agent365_tracing_does_not_warn_for_options_without_top_level_resolver(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """resolver をどこにも渡していない options 単独指定では警告しない。
+
+    上流はバッチ処理パラメータを全エクスポータ分岐で使うため、コンソール出力のままバッチ挙動を
+    調整する目的で `Agent365ExporterOptions(max_queue_size=...)` を渡すのは正当な用途であり、
+    ここで警告すると「動いている構成へのノイズ」になる。
+
+    検知する退行: 条件から `config.token_resolver is not None` を落とし、バッチ調整目的の
+    options 単独指定へ誤警告する変異（M3）。
+    """
+    config = _tracing_config(exporter_options=SimpleNamespace(token_resolver=None))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
+
+
+class _ExplodingOptions:
+    """`token_resolver` の読み取りが `AttributeError` 以外で失敗する options のスタブ。
+
+    `__getattr__` ではなく property で失敗させるのは、実装が想定する現実のケース
+    （利用者が渡す不透明値が遅延解決の計算プロパティを持ち、認証情報の不備等で例外になる）に
+    最も近い形であり、かつ属性は「宣言上は存在する」ため `hasattr` 系の判定が素通しでは
+    済まないことを示せるため。
+    """
+
+    @property
+    def token_resolver(self) -> Any:
+        """読み取りのたびに `AttributeError` 以外の例外を送出する。"""
+        raise ValueError("token_resolver の解決に失敗しました")
+
+
+def test_enable_agent365_tracing_does_not_raise_when_options_attribute_access_fails(
+    tracing_spy: _TracingSpy, tracing: None
+) -> None:
+    """options の属性取得が例外を投げても伝播させず、無警告で計装まで到達する。
+
+    観測の構成判定の失敗で利用者のアプリを停止させない（AC2）。属性値が取れない構成は
+    「判定不能」であり、resolver がドロップされたとは断定できないため警告も出さず、番兵へ
+    倒して処理を継続する（`hasattr` は `AttributeError` のみ吸収するため、この形の値では
+    例外が呼び出し元へ伝播していた）。
+
+    検知する退行: 属性取得を囲む `try` / `except Exception` の削除（素の
+    `getattr(config.exporter_options, "token_resolver", _MISSING)` へ戻す変異）。この変異では
+    `ValueError` が `enable_agent365_tracing` から伝播して本テストが RED になる。
+    """
+    config = _tracing_config(token_resolver=_resolver, exporter_options=_ExplodingOptions())
+
+    with warnings.catch_warnings():
+        # 例外の伝播に加え、判定不能な構成での誤警告（本警告の発出）も同時に RED にする。
+        warnings.simplefilter("error")
+        obs.enable_agent365_tracing(config)
+
+    # 例外吸収後も処理が継続する（`configure` -> 計装まで到達する）。
+    assert tracing_spy.calls == ["configure", "instrumentor_init", "instrument"]
 
 
 # ----------------------------------------------------------------------

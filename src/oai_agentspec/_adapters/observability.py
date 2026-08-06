@@ -38,6 +38,11 @@ _OTLP_EXPORTER_INSTALL_HINT = (
     "次でインストールしてください: pip install 'oai-agentspec[observability]'"
 )
 
+# `exporter_options.token_resolver` の「属性が無い」と「属性はあるが None」を区別する番兵。
+# 前者は sidecar 構成 / options 未指定で警告不要、後者は認証手段が失われる構成で警告対象。
+# `None` を既定値にすると両者が同じ値へ潰れて sidecar 構成を誤検知するため専用の番兵を使う。
+_MISSING = object()
+
 # root logger への `LoggingHandler` 重複付与を防ぐフラグ（プロセス内 1 回だけ付与する）。
 _OTEL_LOG_HANDLER_ATTACHED = False
 
@@ -184,6 +189,14 @@ def enable_agent365_tracing(config: Agent365TracingConfig) -> None:
     既定のエクスポート先への送信は継続する。Agent 365 の計装経路にのみ効く本文抑止
     （`suppress_invoke_agent_input`）や span enricher はこの経路には適用されない。
 
+    `token_resolver` を渡していても、`token_resolver` 属性を持つ `exporter_options`（Agent365
+    形式）を併用した場合は Agent 365 側が options の値のみを使うため、渡した `token_resolver` は
+    参照されない（上流の合成規則）。**`exporter_options` 側にも `token_resolver` が設定されて
+    いない場合**（実効の認証手段がどこにも残らない構成）に限り `RuntimeWarning` で通知するが、
+    構成失敗時とは異なり処理は継続する（計装まで到達する）。options 側に設定済みの場合はそちらが
+    使われるため通知しない。検知範囲には限界があり、環境変数による有効化フラグ未設定に起因する
+    未達は検知しない（本ライブラリは環境変数を読まないため）。詳細は ADR 0024 を参照する。
+
     Args:
         config: トレース連携の宣言的設定（接続先・認証手段は本設定経由でのみ受領する）。
 
@@ -196,6 +209,34 @@ def enable_agent365_tracing(config: Agent365TracingConfig) -> None:
         warnings.warn(
             "SDK トレーシングが無効化されているため Agent 365 へトレースは送信されません。"
             "`agents.set_tracing_disabled(False)` で有効化してください。",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    # 上流は exporter_options が渡された場合その値のみを使い、トップレベル token_resolver を
+    # 参照しない（合成規則は上流 core/config.py の `exporter_options is None` 分岐）。Agent365 形式
+    # options かの判別に isinstance を使わないのは、_adapters へ上流型を持ち込まないため。
+    # SpectraExporterOptions は当該属性を持たないので、属性の不在（sentinel）で sidecar 構成を
+    # 除外できる（exporter_options 未指定 = None も属性を持たないため同じ経路で除外される）。
+    # 属性の読み取りは 1 回だけ行い、あらゆる例外を吸収する: 利用者が渡す不透明値は property や
+    # `__getattr__` を持ちうるため、`hasattr` では `AttributeError` 以外が呼び出し元へ伝播して
+    # 観測の構成ミスがアプリを停止させてしまう（ベストエフォート方針に反する）。
+    # 断定形を避けるのは、2 回目以降の configure() が渡した設定を丸ごと無視して真を返すため
+    # （上流 core/config.py の再構成ガード）。その経路では実際の exporter は初回構成のものになる。
+    if config.token_resolver is not None:
+        try:
+            options_resolver: Any = getattr(config.exporter_options, "token_resolver", _MISSING)
+        except Exception:  # noqa: BLE001 - 観測の判定失敗で利用者のアプリを停止させない
+            options_resolver = _MISSING
+    else:
+        options_resolver = _MISSING
+    if options_resolver is None:
+        warnings.warn(
+            "exporter_options を指定したため token_resolver は Agent 365 側で参照されません"
+            "（exporter_options が渡された場合、Agent 365 はその値のみを使います）。"
+            "この設定が適用される場合、Agent 365 実サービスへは送信されずコンソール出力へ"
+            "フォールバックします（configure() は成功を返すため戻り値では検知できません）。"
+            "実 Agent 365 API へ送る場合は exporter_options の token_resolver を設定してください。",
             RuntimeWarning,
             stacklevel=2,
         )

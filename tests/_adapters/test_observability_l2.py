@@ -94,6 +94,49 @@ def test_require_agent365_tracing_returns_sdk_symbols() -> None:
     assert instrumentor_cls.__name__ == "OpenAIAgentsTraceInstrumentor"
 
 
+def test_agent365_exporter_options_exposes_token_resolver() -> None:
+    """`Agent365ExporterOptions` は公開属性 `token_resolver` を持ち、既定は `None`。
+
+    実装の到達先判定は番兵付き `getattr(options, "token_resolver", _MISSING)` と値の照合だけに
+    依存する（`isinstance` による型判別はしない）。属性の消失・改名は判定を無音で成立しなく
+    するため、存在・既定値・コンストラクタ経由の設定の 3 点を実 SDK で固定する。
+
+    検知する退行: 実装が読む属性名の drift、および pin が実際に属性存在を見ているか（M11）。
+    """
+    core = _a365_core()
+
+    default_options = core.Agent365ExporterOptions()  # type: ignore[attr-defined]
+    assert hasattr(default_options, "token_resolver")
+    assert default_options.token_resolver is None
+
+    async def resolver(scope: str, tenant: str) -> str | None:
+        return None
+
+    configured = core.Agent365ExporterOptions(token_resolver=resolver)  # type: ignore[attr-defined]
+    assert configured.token_resolver is resolver
+
+
+def test_spectra_exporter_options_has_no_token_resolver() -> None:
+    """`SpectraExporterOptions` は `token_resolver` 属性を持たない（sidecar 構成の除外根拠）。
+
+    実装は番兵付き `getattr` でこの差を見て Spectra を警告対象から外す。将来上流が Spectra 側へ
+    当該属性を追加すると sidecar 構成で誤警告が始まるため、その前提をここで pin する。
+
+    「存在しない属性の不在」だけを主張すると属性名 typo でも真になり無音成立するため、同じ
+    リテラルを当該属性を持つ `Agent365ExporterOptions` へ正方向で当てる（M12）。
+    """
+    core = _a365_core()
+
+    options = core.SpectraExporterOptions()  # type: ignore[attr-defined]
+
+    # 同一リテラルを Agent365 形式へ正方向で当てる（属性名を typo すると此処が落ちる）。
+    assert hasattr(core.Agent365ExporterOptions(), "token_resolver")  # type: ignore[attr-defined]
+    assert not hasattr(options, "token_resolver")
+    # 正の assert（Spectra 側の公開属性が実在することの担保）。
+    assert hasattr(options, "endpoint")
+    assert hasattr(options, "protocol")
+
+
 def test_require_opentelemetry_returns_documented_namespace() -> None:
     """`_require_opentelemetry()` が文書化された属性名で実クラスを返す。
 
