@@ -168,35 +168,58 @@ usage docs は「エクスポート先は既定でコンソール（実バック
 - + 属性取得を番兵付き `getattr` + 例外吸収で行うため、利用者が渡す不透明値が属性アクセスで例外を
   投げても有効化は失敗せず、観測の構成判定がアプリの可用性へ影響しない。判定不能な構成は警告せず
   番兵へ倒すため、誤警告も増やさない。
+- - 属性は `configure()` を呼ぶ**前**に 1 回だけ読む。上流が当該属性を読まない構成（sidecar・
+  有効化フラグ未設定）でも読むため、利用者の計算プロパティは上流より広い経路で 1 回評価される。
+  例外は吸収するが評価そのものは避けられないため、ブロッキングな property を渡さないことを
+  `Agent365TracingConfig.exporter_options` の docstring で利用者契約として明示する。吸収した例外は
+  警告せず DEBUG ログへトレースバック付きで記録し、判定不能を「判定対象外」と区別できるようにする。
 
 ## Confirmation
 
-本 ADR は設計フェーズで受理されたものであり、以下の強制手段は**実装フェーズで追加する対象**として
-実装タスクへ引き継ぐ（設計時点では未実装）。
+以下が本決定の強制手段である（いずれも実装済みで、`docs/QUALITY-GUARANTEES.md` へ
+source = `ADR-0024` として登録済み。台帳側の source 列を安定アンカーとして相互参照する）。
 
 - 発火の強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_warns_when_exporter_options_drops_token_resolver`
   （通常発火。警告後も `configure` -> 計装へ到達することを併せて検査する）/
   `::test_enable_agent365_tracing_warns_about_dropped_resolver_even_when_configure_fails`
-  （構成失敗時でも発火すること = 警告を `configure()` の前に置く順序判断の pin）。
+  （構成失敗時でも発火すること = 警告を `configure()` の前に置く順序判断の pin）。前者は警告文面の
+  3 点（原因・結果を断定しない条件節・是正指示）を個別に照合し、単一の `match=` では条件節と是正
+  指示が消えても緑になる穴を塞ぐ。加えて `stacklevel=2`（警告が利用者の呼び出し位置へ帰属すること）を
+  本モジュールの全 `RuntimeWarning` について検査する（帰属の退行は警告を出し続けるためメッセージ
+  照合では検知できない）。
 - 誤検知しないことの強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_does_not_warn_when_exporter_options_carries_token_resolver`
-  / `::test_enable_agent365_tracing_does_not_warn_for_spectra_options`
+  / `::test_enable_agent365_tracing_does_not_warn_for_options_without_resolver_attribute`
   / `::test_enable_agent365_tracing_does_not_warn_without_options`
   / `::test_enable_agent365_tracing_does_not_warn_for_options_without_top_level_resolver`。
+  sidecar 構成の除外は L1（`token_resolver` 属性を持たないスタブで番兵分岐を pin）と L2（実
+  `SpectraExporterOptions` が当該属性を持たないことを pin）の**合成**で保証する。L1 側を実 SDK の
+  クラスで書くと observability extra 未導入環境で skip され、番兵分岐の変異検知が黙って失われる。
   本リポジトリは `filterwarnings` 未設定のため、非発火テストは `warnings.catch_warnings()` +
   `simplefilter("error")` または `record=True` での 0 件 assert を必須とする（指定しないと
   「発火しないこと」を検査できない）。
 - 上流前提の強制手段: `tests/_adapters/test_observability_l2.py::test_agent365_exporter_options_exposes_token_resolver`
   （公開属性 `token_resolver` の存在と既定 `None`）/ `::test_spectra_exporter_options_has_no_token_resolver`
   （当該属性の不在）。後者は「存在しない属性の不在」を主張するだけでは属性名の typo で無音成立する
-  ため、実在する属性に対する正の assert を併記する。
+  ため、実在する属性に対する正の assert を併記する。加えて
+  `::test_upstream_ignores_top_level_token_resolver_when_exporter_options_given` が、子プロセスで
+  `configure()` を 1 回だけ呼び「`exporter_options` 指定時にトップレベル `token_resolver` が使われ
+  ない」ことを実測で pin する。これは本決定の唯一の前提であり、上流が両者を合成する実装へ変われば
+  本警告は「届いている構成への誤警告」へ反転するため、`exporter_options` 未指定時に実 exporter が
+  選ばれることを正の対照として併置する（対照が無いと有効化フラグが効いていないだけの環境でも緑に
+  なる）。span を生成しないため外部通信は発生しない。
 - 例外吸収の強制手段: `tests/_adapters/test_observability_l1.py::test_enable_agent365_tracing_does_not_raise_when_options_attribute_access_fails`
   （`token_resolver` が `AttributeError` 以外を投げる options で、例外を伝播させず・誤警告もせず・
-  計装まで到達すること）。属性取得を囲む `try` / `except Exception` の削除で RED になる。
-- 実装完了後に変異注入（最終判定の緩和・番兵既定値を `None` へ置換・トップレベル resolver ガードの
-  削除・無条件化・警告ブロック削除・例外化・警告カテゴリ変更・警告後の `return` 追加・構成失敗判定の
-  後ろへの移動・照合語の削除・属性取得の例外吸収の削除・L2 pin の属性名改変）を行い、各 pin が RED に
-  なることを実行で確認して pytest 出力を記録する。
+  計装まで到達すること）。属性取得を囲む `try` / `except Exception` の削除で RED になる。同テストと
+  `::test_enable_agent365_tracing_reads_options_token_resolver_once` が読み取り回数を数え、属性を
+  2 回読む退行（`hasattr` 相当の判定を足す変異）を検知する。判定不能時の痕跡は
+  `::test_enable_agent365_tracing_logs_debug_when_options_attribute_access_fails` が pin する
+  （DEBUG レベル・`exc_info` の存在・options の型情報を個別に照合し、無音化への逆戻り・原因例外の
+  欠落・レベル引き上げ・型情報の欠落を検知する）。
+- 上記の各 pin は変異注入で実効性を確認済みである（最終判定の緩和・番兵既定値を `None` へ置換（初期化
+  側と `getattr` 側の両方向）・トップレベル resolver ガードの削除・無条件化・警告ブロック削除・例外化・
+  警告カテゴリ変更・警告後の `return` 追加・構成失敗判定の後ろへの移動・照合語の削除・警告本文の断定形
+  への置換・`stacklevel` の引き下げ（警告ごとに個別注入）・属性取得の例外吸収の削除・属性の二重評価・
+  DEBUG ログの削除と `exc_info` / 型情報の欠落・L2 pin の属性名改変・合成規則 probe の空振り化）。
+  いずれも対象テストが RED になることを実行で確認しており生存はゼロである。
   「テストが実在する」「スイートが全緑」のみでは確認済みとしない。変異の復元は退避した全文の `cp`
   で行い、`git checkout` / `git restore` / `git stash` / `git reset` は使わない。
-- 上記は `docs/QUALITY-GUARANTEES.md` へ source = ADR 0024 として登録する（実装フェーズで実施。
-  台帳側の source 列に `ADR-0024` を安定アンカーとして記載し相互参照する）。
