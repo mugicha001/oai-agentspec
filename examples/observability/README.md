@@ -132,6 +132,11 @@ register_span_enricher(redact)   # enable_agent365_tracing() より前に呼ぶ
   加える。実際に何が載るかは `examples/observability/02_json_lines_and_handoff.py` の出力で確認できる。
 - enricher が例外を送出した場合、SDK は元のスパンをそのまま使う（つまり**除去されずに送出される**）。
   リダクションを確実にしたいなら関数内で例外を出さない実装にする。
+- **enricher は Agent 365 の計装経路にのみ効く**。`configure()` が失敗して `enable_agent365_tracing`
+  が計装せずに戻った場合、SDK 既定のトレースプロセッサ列がそのまま残り既定のエクスポート先へ
+  送信が継続するが、その経路には enricher も `suppress_invoke_agent_input` も適用されない
+  （警告文でもこの旨を通知する）。構成失敗時も送出を止めたいなら
+  `agents.set_tracing_disabled(True)` を併用する。
 
 これでも足りない場合は、エクスポート先の選択そのもの（外部へ送らない）で制御する。
 
