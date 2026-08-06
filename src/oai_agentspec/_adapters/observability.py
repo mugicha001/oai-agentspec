@@ -85,6 +85,8 @@ def _require_opentelemetry() -> SimpleNamespace:
     `ConsoleLogExporter` は後継の `ConsoleLogRecordExporter` へ改名され、旧名は将来削除予定の
     非推奨エイリアス（構築時に `DeprecationWarning` を出す）になっている。新名称があればそちらを
     使い、無い版では旧名へフォールバックする（extra の下限を上げずに警告と将来の破壊を避ける）。
+    旧名が削除された版でも解決できるよう、フォールバック先は新名称の不在を確認してから参照する
+    （既定値を先行評価する形では旧名削除時に `AttributeError` になる）。
 
     Returns:
         `LoggerProvider` / `LoggingHandler` / `ConsoleLogExporter` / `LogRecordProcessor`
@@ -100,9 +102,11 @@ def _require_opentelemetry() -> SimpleNamespace:
         from opentelemetry.sdk.resources import Resource
     except ImportError as exc:
         raise ImportError(_OBSERVABILITY_INSTALL_HINT) from exc
-    console_exporter = getattr(
-        log_export, "ConsoleLogRecordExporter", log_export.ConsoleLogExporter
-    )
+    # 既定値を先行評価させないため 2 段で解決する（`getattr(..., 旧名)` 形は旧名が削除された
+    # 将来版で新名称の有無に関わらず `AttributeError` になり、フォールバックが成立しない）。
+    console_exporter = getattr(log_export, "ConsoleLogRecordExporter", None)
+    if console_exporter is None:  # 新名称が無い旧 SDK 版のみ
+        console_exporter = log_export.ConsoleLogExporter
     return SimpleNamespace(
         LoggerProvider=LoggerProvider,
         LoggingHandler=LoggingHandler,

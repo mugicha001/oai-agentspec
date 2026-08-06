@@ -161,6 +161,32 @@ def test_require_opentelemetry_falls_back_to_legacy_console_exporter(
     assert otel.ConsoleLogExporter is export.ConsoleLogExporter
 
 
+def test_require_opentelemetry_survives_legacy_console_exporter_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """旧名が削除された将来版でも、新名称があれば解決できる（`AttributeError` にしない）。
+
+    上流は旧名 `ConsoleLogExporter` を「将来のリリースで削除する」と明言しており、extra の
+    上限を張らない（`opentelemetry-sdk>=1.36`）ため削除版が入りうる。旧名の不在を `delattr` で
+    模す。`getattr(export, "新名称", export.ConsoleLogExporter)` のように**既定値を先行評価**する
+    実装はこの時点で `AttributeError` になる（`try` の外なので案内付き `ImportError` にも
+    変換されない）ため、削除版を用意せずに退行を検知できる。
+
+    前掲の `..._falls_back_to_legacy_console_exporter` が「新名称なし」方向を pin するのに対し、
+    本テストは「旧名なし」方向を pin する（両方向が揃って初めてフォールバックの契約が成立する）。
+    """
+    export = pytest.importorskip(
+        "opentelemetry.sdk._logs.export", reason="observability extra 未導入"
+    )
+    if not hasattr(export, "ConsoleLogRecordExporter"):  # pragma: no cover - 旧 SDK 版でのみ通る
+        pytest.skip("この opentelemetry-sdk には後継の ConsoleLogRecordExporter が無い")
+    monkeypatch.delattr(export, "ConsoleLogExporter", raising=False)
+
+    otel = obs._require_opentelemetry()
+
+    assert otel.ConsoleLogExporter is export.ConsoleLogRecordExporter
+
+
 def test_require_otlp_log_exporter_returns_sdk_class() -> None:
     """`_require_otlp_log_exporter()` が OTLP ログエクスポータの実クラスを返す。
 
