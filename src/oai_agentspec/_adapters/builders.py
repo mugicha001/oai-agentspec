@@ -52,6 +52,8 @@ _DEDICATED_AGENT_KWARGS = frozenset(
         "hooks",
         "input_guardrails",
         "output_guardrails",
+        "mcp_servers",
+        "mcp_config",
         # 名前参照フィールド。`Agent` の kwarg ではないが、専用フィールドとの衝突として
         # 検知するため列挙する（上流に `Agent.guardrails` が追加されても二重に渡らない）。
         "guardrails",
@@ -161,7 +163,9 @@ def build_agent(spec: AgentSpec) -> Agent:
     """spec から handoffs 空の Agent を 1 つ構築する（デフォルト AgentBuilder 実装）。
 
     `instructions` / `prompt` / `tools` / `model` / `model_settings` / `hooks` /
-    `input_guardrails` / `output_guardrails` を `Agent` にそのまま渡す。handoffs は空
+    `input_guardrails` / `output_guardrails` / `mcp_servers` / `mcp_config` を `Agent` に
+    そのまま渡す（`mcp_servers` は空なら積まずコピーして渡し、`mcp_config` は None なら
+    積まず SDK 既定の空 dict に委ねる）。handoffs は空
     （registry が後付け結線）。spec が `SandboxAgentSpec` の場合は
     `agents.sandbox.SandboxAgent` を構築し、サンドボックス固有 4 フィールド
     （`default_manifest` / `capabilities` / `run_as` / `base_instructions`）を
@@ -221,6 +225,10 @@ def build_agent(spec: AgentSpec) -> Agent:
         kwargs["model_settings"] = spec.model_settings
     if spec.hooks is not None:
         kwargs["hooks"] = spec.hooks
+    if spec.mcp_servers:
+        kwargs["mcp_servers"] = list(spec.mcp_servers)
+    if spec.mcp_config is not None:
+        kwargs["mcp_config"] = spec.mcp_config
     if is_sandbox:
         validate_instructions_callable(
             spec.name, spec.base_instructions, field_label="base_instructions"

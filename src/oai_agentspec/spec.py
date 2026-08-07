@@ -102,7 +102,8 @@ class AgentSpec:
     """宣言的なエージェント定義（`Agent` の薄い Wrapper）。
 
     `instructions` / `prompt` / `tools` / `model` / `model_settings` / `hooks` /
-    `input_guardrails` / `output_guardrails` は `agents.Agent` と同じ意味を持つ。`handoffs` /
+    `input_guardrails` / `output_guardrails` / `mcp_servers` / `mcp_config` は `agents.Agent` と
+    同じ意味を持つ。`handoffs` /
     `sub_agents` はエージェント名の参照で、registry が遅延構築時に解決する（グラフ連携の追加機能）。
     その他の `Agent` kwarg は `extra` で素通しする。
 
@@ -127,6 +128,20 @@ class AgentSpec:
         guardrails: ガードレールの**登録名**リスト（実体は registry が build 時に
             `GuardrailProvider` で解決し、宣言境界に応じて `input_guardrails` /
             `output_guardrails` へ連結する。連結順序は「専用フィールド -> 名前参照」）。
+        mcp_servers: `Agent.mcp_servers`。接続する MCP サーバのリスト。接続 / 切断
+            （`connect()` / `cleanup()`）は利用者責務であり lib は宣言を素通しするだけで
+            lifecycle を持たない（`agents.Agent.mcp_servers` と同じ。
+            `agents.mcp.MCPServerManager` の利用を検討する）。MCP サーバのツール定義・ツール
+            出力は信頼境界の外側から model context へ入るため、必要なら
+            `oai_agentspec.runtime.guardrails` を併用する。
+        mcp_config: `Agent.mcp_config`。MCP 設定（`convert_schemas_to_strict` /
+            `include_server_in_tool_names` / `failure_error_function`）。未指定（None）の場合は
+            build 時に kwargs へ積まず SDK の既定（空 dict）に委ねる。SDK の `MCPConfig` に無い
+            キーは検証されず SDK 側で無視される（綴り誤りは silent に効かない）。
+            `failure_error_function` の戻り値は LLM へ渡るため、例外原文（接続 URL / トークンを
+            含みうる）をそのまま返さない。build 時は dict をコピーせず参照を渡すため、宣言後に
+            渡した dict を mutate すると構築済み `Agent` へ伝播する（registry 経由の `freeze()`
+            は `_copy_spec` が dict を複製するため遮断される）。
         handoffs: ハンドオフ先エージェント名リスト（グラフ連携）。
         handoff_options: dst 名 -> HandoffConfig の per-edge 設定。
         sub_agents: as_tool 配線するサブエージェント名リスト（グラフ連携）。
@@ -147,6 +162,8 @@ class AgentSpec:
     output_guardrails: list[Any] = field(default_factory=list, kw_only=True)
     guardrails: list[str] = field(default_factory=list, kw_only=True)
     instructions_append: list[Callable[..., Any]] = field(default_factory=list, kw_only=True)
+    mcp_servers: list[Any] = field(default_factory=list, kw_only=True)
+    mcp_config: dict[str, Any] | None = field(default=None, kw_only=True)
     handoffs: list[str] = field(default_factory=list)
     handoff_options: dict[str, HandoffConfig] = field(default_factory=dict)
     sub_agents: list[str] = field(default_factory=list)
