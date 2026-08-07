@@ -18,7 +18,11 @@ from agents import Agent
 from agents.sandbox import SandboxAgent
 
 from oai_agentspec._adapters import build_agent
-from oai_agentspec._adapters.builders import _SANDBOX_FIELD_KWARGS
+from oai_agentspec._adapters.builders import (
+    _AGENT_FIELD_NAMES,
+    _DEDICATED_AGENT_KWARGS,
+    _SANDBOX_FIELD_KWARGS,
+)
 from oai_agentspec.spec import AgentSpec, SandboxAgentSpec
 
 pytestmark = pytest.mark.integration
@@ -235,3 +239,107 @@ def test_sandbox_capabilities_list_is_copied_at_build() -> None:
     agent = build_agent(spec)
     caps.append(object())
     assert len(list(agent.capabilities)) == 1
+
+
+# ---------------------------------------------------------------------------
+# build_agent: mcp_servers / mcp_config（Issue #83）
+# ---------------------------------------------------------------------------
+def test_build_passes_mcp_fields_through() -> None:
+    """`mcp_servers` / `mcp_config` の宣言値が構築済み `Agent` へそのまま渡る。"""
+    server = object()  # MCPServer 実体は不要（lib は素通しするだけ）
+    spec = AgentSpec(
+        name="bot",
+        instructions="i",
+        mcp_servers=[server],
+        mcp_config={"include_server_in_tool_names": True},
+    )
+    agent = build_agent(spec)
+    assert agent.mcp_servers == [server]
+    assert agent.mcp_config == {"include_server_in_tool_names": True}
+
+
+def test_build_mcp_servers_list_is_copied_at_build() -> None:
+    """build 後に spec 由来の mcp_servers リストへ append しても構築済み agent に伝播しない。
+
+    tools / sandbox capabilities と同じ遮断挙動。
+    """
+    spec = AgentSpec(name="bot", instructions="i", mcp_servers=[object()])
+    agent = build_agent(spec)
+    assert agent.mcp_servers is not spec.mcp_servers
+    spec.mcp_servers.append(object())
+    assert len(agent.mcp_servers) == 1
+
+
+def test_build_mcp_fields_unset_defer_to_sdk_defaults() -> None:
+    """`mcp_servers` / `mcp_config` 未指定は kwargs へ積まれず SDK 既定に委ねられる。
+
+    `mcp_config` の SDK 既定は `{}`（`None` ではない）ことを pin する。`build_agent` が
+    `None` を渡す実装へ退行すると、`Agent.__post_init__` の `isinstance(mcp_config, dict)`
+    検証に引っかかり `TypeError` になる。
+    """
+    spec = AgentSpec(name="bot", instructions="i")
+    agent = build_agent(spec)
+    assert agent.mcp_servers == []
+    assert agent.mcp_config == {}
+
+
+def test_build_rejects_mcp_servers_extra_collision_message() -> None:
+    """extra に `mcp_servers` と同名のキーを積むと衝突メッセージ原文で弾く。"""
+    spec = AgentSpec(name="bot", instructions="i", extra={"mcp_servers": []})
+    with pytest.raises(ValueError) as excinfo:
+        build_agent(spec)
+    assert str(excinfo.value) == (
+        "agent 'bot': extra に専用フィールドと同名のキーが含まれます: ['mcp_servers']"
+    )
+
+
+def test_build_rejects_mcp_config_extra_collision_message() -> None:
+    """extra に `mcp_config` と同名のキーを積むと衝突メッセージ原文で弾く。"""
+    spec = AgentSpec(name="bot", instructions="i", extra={"mcp_config": {}})
+    with pytest.raises(ValueError) as excinfo:
+        build_agent(spec)
+    assert str(excinfo.value) == (
+        "agent 'bot': extra に専用フィールドと同名のキーが含まれます: ['mcp_config']"
+    )
+
+
+def test_build_rejects_both_mcp_extra_collisions_sorted() -> None:
+    """extra に `mcp_servers` / `mcp_config` の両方を積むとソート済みキー一覧で弾く。"""
+    spec = AgentSpec(name="bot", instructions="i", extra={"mcp_servers": [], "mcp_config": {}})
+    with pytest.raises(ValueError) as excinfo:
+        build_agent(spec)
+    assert str(excinfo.value) == (
+        "agent 'bot': extra に専用フィールドと同名のキーが含まれます: ['mcp_config', 'mcp_servers']"
+    )
+
+
+def test_sandbox_spec_passes_mcp_fields_through() -> None:
+    """`SandboxAgentSpec` でも `mcp_servers` / `mcp_config` が構築済み `SandboxAgent` へ渡る。
+
+    2 分岐（`if spec.mcp_servers:` / `if spec.mcp_config is not None:`）は `is_sandbox` 分岐
+    より前に置かれているため sandbox 経路にも効くはずだが、これを個別に pin しないと
+    「2 分岐を `return Agent(**kwargs)` の直前へ移す」変異が T4-a / T4-b を緑のまま通し、
+    `SandboxAgentSpec` の MCP 宣言だけが無言で落ちる（silent capability loss）。
+    """
+    server = object()
+    spec = SandboxAgentSpec(
+        name="s",
+        instructions="i",
+        mcp_servers=[server],
+        mcp_config={"convert_schemas_to_strict": True},
+    )
+    agent = build_agent(spec)
+    assert isinstance(agent, SandboxAgent)
+    assert agent.mcp_servers == [server]
+    assert agent.mcp_config == {"convert_schemas_to_strict": True}
+
+
+def test_dedicated_agent_kwargs_are_valid_agent_fields() -> None:
+    """`_DEDICATED_AGENT_KWARGS` の各キーは（`guardrails` を除き）`Agent` の実在 kwarg である。
+
+    実在しない kwarg 名を紛れ込ませると（例: `mcp_configs` の typo）、extra 検証の衝突判定が
+    その名前とは一致しなくなり、`extra` へ同名キーを積んでも衝突として弾かれず素通りする。
+    `guardrails` は `Agent` の kwarg ではない名前参照フィールドとして意図的に列挙されている
+    唯一の例外（`builders.py` の定義直前コメントで明示）。
+    """
+    assert _DEDICATED_AGENT_KWARGS - {"guardrails"} <= _AGENT_FIELD_NAMES
