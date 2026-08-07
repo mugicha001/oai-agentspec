@@ -64,6 +64,8 @@ agent = registry.get("triage")  # 依存解決して agents.Agent を構築
 | `sub_agents` | `list[str]` | `[]` | as_tool 配線するサブエージェント名 |
 | `sub_agent_tools` | `dict[str, tuple[str \| None, str \| None]]` | `{}` | サブ名 -> (tool_name, tool_description) |
 | `dynamic_handoffs` | `list[DynamicHandoff]` | `[]` | 動的ハンドオフ宣言 |
+| `mcp_servers` | `list[Any]` | `[]` | 接続する MCP サーバ（kw_only）。接続 / 切断は利用者責務。下記参照 |
+| `mcp_config` | `dict[str, Any] \| None` | `None` | MCP 設定（kw_only）。未指定なら SDK 既定（空 dict）に委ねる |
 | `extra` | `dict[str, Any]` | `{}` | 上記以外の `agents.Agent` kwarg 素通し |
 
 #### run ごとの断片を追記する（`instructions_append`）
@@ -246,6 +248,12 @@ agent = registry.get(Names.PLANNER)
 - `extra` の未知キー（`output_typ` 等のタイポ）は `ValueError` で弾く
 - `registry.freeze()` 後に register / update すると `RegistryFrozenError`（`lockdown(root, registry=registry)` は内部で `freeze()` を呼ぶ）
 - `AgentNames` の subclass は「宣言専用」です。メソッド・property を持たせるとクラス定義時に `ValueError` になります
+- MCP のツールは `tools` に載りません。SDK が **run 時**（ターンごと）にサーバへ list_tools して解決するため、`tools` が空でもモデルは MCP のツールを呼べます
+- MCP サーバの接続 / 切断（`connect()` / `cleanup()`）は**利用者責務**です（lib は宣言を素通しするだけで lifecycle を持ちません）。複数サーバは `agents.mcp.MCPServerManager` を検討してください
+- `mcp_config` に SDK の `MCPConfig`（`convert_schemas_to_strict` / `include_server_in_tool_names` / `failure_error_function`）に無いキーを書いても検証されず SDK 側で無視されます（綴り誤りは silent に効きません）
+- `mcp_config["failure_error_function"]` の戻り値は LLM へ渡ります。例外原文（接続 URL / トークンを含みうる）をそのまま返さないでください
+- `mcp_config` の dict は build 時にコピーされず参照が渡ります。宣言後に mutate すると構築済み `Agent` へ伝播します（`registry.freeze()` は複製するため遮断されます）
+- `mcp_config={"include_server_in_tool_names": True}` にすると公開名は `mcp_{サーバ名}__{ツール名}` を基本形とし、SDK が文字置換 / 長さ超過時の切り詰め等の変形を加える場合があります（詳細は `docs/architecture.md` を参照）。名前でツールを参照する仕組み（ポリシー等）を併用している場合は、実際の公開名を確認して宣言してください
 - `validate_agent_names` は任意の追加手段です。呼ばなくても従来どおり `validate()` / `get()` の実行時検出は働きます
 
 ## 参照

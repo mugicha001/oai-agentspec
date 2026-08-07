@@ -280,6 +280,8 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 | `sub_agents` | `list[str]` | as_tool 配線するサブエージェント名（グラフ連携） |
 | `sub_agent_tools` | `dict[str, tuple[str \| None, str \| None]]` | サブ名 -> (tool_name, tool_description) の as_tool 上書き |
 | `dynamic_handoffs` | `list[DynamicHandoff]` | 動的ハンドオフ宣言（on_invoke で候補から転送先を実行時選択） |
+| `mcp_servers` | `list[Any]` | `Agent.mcp_servers`。接続する MCP サーバ（kw_only・既定は空）。接続 / 切断は利用者責務で lib は lifecycle を持たない |
+| `mcp_config` | `dict[str, Any] \| None` | `Agent.mcp_config`。MCP 設定（kw_only・既定 `None`）。未指定なら kwargs へ積まず SDK 既定（空 dict）に委ねる |
 | `extra` | `dict[str, Any]` | 上記以外の `agents.Agent` kwarg 素通し |
 
 `instructions` / `prompt` は `Agent` のフィールドにそのまま渡される。本ライブラリは指示系に
@@ -288,8 +290,10 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 2 引数が必須であり、これを register 時に検証して run 時 `TypeError` を前倒し検出する。
 
 `extra` に専用フィールド（name / instructions / prompt / tools / handoffs / model /
-model_settings / hooks）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
-場合は構築時に `ValueError` を送出する。
+model_settings / hooks / input_guardrails / output_guardrails / guardrails / mcp_servers /
+mcp_config）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
+場合は構築時に `ValueError` を送出する（`guardrails` は `Agent` の kwarg ではないが、専用
+フィールドとの衝突として検知するため列挙に含める）。
 
 #### run スコープの instructions 追記（`instructions_append`）
 
@@ -1224,9 +1228,10 @@ Realtime シンボルはコア `__all__` に載せず、`oai_agentspec.runtime.c
 カスタム可能にする一貫したパススルー方式を採る。
 
 - **Agent**: 専用フィールド（`instructions` / `prompt` / `tools` / `model` / `model_settings` /
-  `hooks` / `handoffs` / `sub_agents`）+ `extra: dict`（`output_type` / `input_guardrails` /
-  `output_guardrails` / `tool_use_behavior` / `reset_tool_choice` / `handoff_description` /
-  `mcp_servers` 等）。`extra` で `model_settings` 等を渡す場合は `ModelSettings` インスタンスが必須。
+  `hooks` / `handoffs` / `sub_agents` / `input_guardrails` / `output_guardrails` / `guardrails` /
+  `mcp_servers` / `mcp_config`）+ `extra: dict`（`output_type` / `tool_use_behavior` /
+  `reset_tool_choice` / `handoff_description` 等）。`extra` で `model_settings` 等を渡す場合は
+  `ModelSettings` インスタンスが必須。
 - **Handoff**: `HandoffConfig` の型付きフィールド（`description` / `tool_name` / `on_handoff` /
   `input_type` / `input_filter` / `is_enabled`）+ `options: dict` 素通し。静的エッジ
   （`HandoffEdge` / `HandoffConfig`）と動的エッジ（`DynamicHandoffEdge` / `DynamicHandoff`）は
@@ -2006,10 +2011,53 @@ serve / cli / llmops / lightning / guardrails と同型の責務分割・公開�
 `FunctionTool` は govern 済みになる。`AgentSpec` / `tools` / コア `__all__` / `AgentBuilder` Protocol は変更せず、
 利用者の追加記述は「builder を 1 つ差し替える」+ ポリシー指定のみ。
 
+強制点は 2 つある。`spec.tools` の `FunctionTool` は build 時に実行本体（`on_invoke_tool`）をラップして
+評価する。`spec.mcp_servers` 経由の MCP ツールは SDK が **run 時**（ターンごとに `get_all_tools` から
+`MCPUtil.to_function_tool`）に解決するため build 時のラップ対象が存在せず、装着した監査
+`AgentHooks.on_tool_start` で評価する。宣言は同じ `allowed_tools` / `blocked_patterns` で足り、ポリシー
+宣言の規約は 1 本のまま（判定は `_evaluate_tool` の 1 実装を両経路が共有し、照合の意味論が乖離しない）。
+
 既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため per-call の
 allow / deny 評価・決定記録の対象外（監査フックの tool_start / tool_end 記録のみ。サブエージェント自身の
 内部 `FunctionTool` は同 builder 経由で govern 済み）。`register_factory` 経路は builder を通らないため
-govern 対象外。
+govern 対象外。**hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
+され `FunctionTool` でもないため `on_tool_start` が発火せず、評価も監査も発生しない（統治されるのは
+client-side MCP = `spec.mcp_servers` 経由のみ）。同じ理由で、MCP サーバから `list_prompts` /
+`get_prompt` / resources 経由で取得した文面を利用者が `instructions` 等へ流し込む使い方はツール呼び出し
+ではないため評価も監査も受けない。`RealtimeAgentSpec` の `mcp_servers` も別 registry / 別 builder Protocol
+経路のため対象外。`AGENT_AS_TOOL` origin は機構上は同じフックで評価しうるが、既存
+`allowed_tools` 宣言の意味を変えるため評価しない。`get_function_tool_origin` が `None` を返す場合
+（origin が取得できないツール）も MCP 由来かどうかを判定できないため評価しない（fail-open・無警告）。
+評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けずモデル文脈へ入る
+（`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモートのサーバであることが多く、
+許可した MCP ツールの戻り値が間接プロンプトインジェクションの主経路になりうる。信頼境界の外に置く場合は
+SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を併用する。
+
+MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）: MCP の deny は `on_tool_start` からの送出で
+合成チェーンを中断するため、利用者の `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は
+実行本体のラップで弾くため到達する）。MCP の deny は run を `UserError` で終了させ、モデルへエラー文字列を
+返して会話を継続する degradation は行わない（MCP ツール自身の実行時例外が
+`mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）。`tool:` レコードの `agent_id` は
+宣言時の `spec.name`（build 時捕獲）で、`tool_start:` は runtime の `agent.name`（`Agent.clone(name=...)`
+すると食い違う）。照合対象は SDK が解決した公開ツール名であり、`mcp_config` の
+`include_server_in_tool_names` を真にすると、公開名は `mcp_{サーバ名}__{ツール名}` を**基本形**とし SDK が
+次の変形を行う（`allowed_tools` の宣言が基本形のままだと不一致になりうる）: (1) サーバ名部分 / ツール名
+部分それぞれについて、ASCII 英数字 / `_` / `-` 以外の文字を `_` へ置換し前後の `_-` を strip する（strip 後
+に空になると `server` / `tool` へフォールバックする）、(2) 基本形が長さ上限 64 を超える場合、55 文字へ
+切り詰めて `_` + sha1 先頭 8 桁を付ける、(3) `spec.tools` / handoff / as_tool のツール名や同一解決バッチ内
+の他ツールと base 名が衝突する場合、上限以内でもハッシュが付く。`allowed_tools` は名前照合であり、ターン
+ごとに再解決される実体の差し替えは検知しない。
+
+build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む・いずれも SDK の公開 API）と、MCP 経路は
+**強制と監査がともに失われる**（例外も警告も出ない）。`spec.tools` 経路は実行本体のラップが tool オブジェ
+クト自身に焼き込まれるため強制も per-call の `tool:` レコードも残る。両経路で失われるのはフック由来の
+ライフサイクル記録（`agent_start` / `tool_start:` / `tool_end:` / `handoff:` / `agent_end`）のみ。
+差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言すれば builder が合成する。同一ターンに
+複数のツール呼び出しがある場合、SDK は各呼び出しを並行タスクで起動するため、deny が発生した時点で兄弟
+呼び出しが既に実行済み / 実行中ならその副作用は残る（deny は per-call でありターン単位のロールバックでは
+ない）。
+
+判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。
 
 ### GovernedAgentBuilder（装飾 builder）
 

@@ -1,6 +1,6 @@
 # 0016: AgentHooks 合成ヘルパー chain_agent_hooks を agent 単位専用クラスで提供する
 
-- Status: accepted (partially superseded by 0017)
+- Status: accepted (partially superseded by 0017, 0025)
 - Date: 2026-08-03
 
 ## Context

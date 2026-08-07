@@ -52,6 +52,17 @@ bundle YAML（`default` + `agents`）からの構築。3 引数以下のため�
 - `unapplied_overrides: frozenset[str]` — 一度も適用されていない override キー（typo 検知）
 - `audit_sink: object | None` — 現在の監査 sink
 
+## 強制点は 2 つ（宣言は共通）
+
+同じ `allowed_tools` / `blocked_patterns` が両方に効きます（ポリシー宣言の規約は 1 本のまま）。
+
+| 対象 | 評価位置 | 理由 |
+|---|---|---|
+| `spec.tools` の `FunctionTool` | build 時に実行本体（`on_invoke_tool`）を差し替え | tool オブジェクトが build 時に存在する |
+| `spec.mcp_servers` 経由の MCP ツール | 装着した監査 `AgentHooks.on_tool_start` | SDK が **run 時**（ターンごと）にサーバへ list_tools して `FunctionTool` を生成するため、build 時にラップ対象が無い |
+
+MCP を使う場合も利用者の記述は変わりません（builder を注入し、`allowed_tools` に MCP ツールの公開名を書くだけ）。実行例は `examples/governance/05_mcp_tool_governance.py` を参照してください。
+
 ## 判断軸
 
 - 監査要件・ポリシー強制が要るなら **`GovernedAgentBuilder` DI** を registry に注入する。宣言面（`AgentSpec`）は触らない
@@ -63,6 +74,17 @@ bundle YAML（`default` + `agents`）からの構築。3 引数以下のため�
 - AGT の import は関数内遅延。窓口 import 自体は extra 未導入でも壊れないが、`build()` 実行時にアクセスで例外
 - `sub_agents` の as_tool・`register_factory` 経路は govern 対象外
 - clone された registry は builder を共有する（監査チェーンが混ざる）。系を分けたい場合は builder を別々に注入
+- **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。同様に `list_prompts` / `get_prompt` / resources 経由で取得した文面を `instructions` 等へ流し込む使い方はツール呼び出しでないため統治対象外
+- origin が取得できない（MCP 由来かどうか判定できない）ツールも同様に評価も監査もされない（fail-open・無警告）
+- 評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けない。第三者の MCP サーバを使う場合は戻り値が間接プロンプトインジェクションの経路になるため、信頼境界の外に置く MCP サーバには SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を併用する
+- **MCP の deny は利用者の `spec.hooks.on_tool_start` へ到達しない**（`spec.tools` の deny では到達する）。利用者フックで監査・計測している場合は観測が欠ける
+- MCP の deny は run を `UserError` で終了させる。MCP ツール自身の実行時例外が `mcp_config["failure_error_function"]` でモデルへ返り会話が継続するのとは挙動が違う
+- deny で run が中断すると、stdio 接続の MCP サーバーの切断時に SDK が `Error cleaning up server: unhandled errors in a TaskGroup` を ERROR でログ出力する（非致命的。切断自体は完了し終了コードも変わらない）。deny が起きない実行では出ないため、ログ監視のしきい値設定で誤検知になりうる
+- `mcp_config={"include_server_in_tool_names": True}` にすると公開名は基本形（`mcp_{サーバ名}__{ツール名}`）から SDK が変形を加える場合がある。`allowed_tools` は実際の公開名を確認して宣言する必要がある（未対応なら全 deny になり安全側で顕在化する。詳細は `docs/architecture.md` を参照）
+- `allowed_tools` は名前照合で、MCP ツールの実体はターンごとに再解決される。同名のまま schema / 意味だけ差し替える変更は検知しない
+- build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む）と、MCP 経路は強制と監査がともに失われる（`spec.tools` 経路は強制と per-call の記録が残る）。差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言する
+- deny は per-call であり、同一ターンに複数のツール呼び出しがある場合、deny 発生時点で並行実行済みの兄弟呼び出しの副作用は残る（ターン単位のロールバックではない）
+- 監査の `details` には MCP ツールの引数も全文記録される（URL / 接続情報が入りうるため `audit_sink` の永続先を考慮する）
 
 ## 参照
 
