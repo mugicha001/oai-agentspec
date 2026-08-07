@@ -25,11 +25,16 @@ if TYPE_CHECKING:
 
 
 class GovernedAgentBuilder:
-    """`AgentBuilder` を満たす装飾 builder。全 tools を govern ラップし監査フックを装着する。
+    """`AgentBuilder` を満たす装飾 builder。tools を govern ラップし監査 / 強制フックを装着する。
 
     `AgentRegistry(agent_builder=GovernedAgentBuilder(policy=...))` で注入すると、registry の遅延
     構築が唯一の構築経路（`_builder().build`）を通るため、循環ハンドオフ解決後の到達可能 spec も
     govern 済みになる。`AgentSpec` / `tools` / コア `__all__` / `AgentBuilder` Protocol は変えない。
+
+    強制点は 2 つある。`spec.tools` の `FunctionTool` は build 時に実行本体
+    （`on_invoke_tool`）をラップして評価する。`spec.mcp_servers` 経由の MCP ツールは SDK が
+    **run 時**に解決するため build 時のラップ対象が存在せず、装着した `AgentHooks.on_tool_start`
+    で評価する（宣言は同じ `allowed_tools` / `blocked_patterns` で足り、規約は 1 本のまま）。
 
     既知の境界（govern 対象外）:
         - `sub_agents` の as_tool は registry が build 後に注入するため per-call の allow/deny
@@ -38,6 +43,19 @@ class GovernedAgentBuilder:
         - `register_factory` 経路は builder（`build`）を通らないため govern 対象外。
         - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより
           先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny）。
+        - hosted MCP（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
+          されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）
+          のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
+
+    MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）:
+        - MCP の deny は `on_tool_start` からの送出で合成チェーンを中断するため、利用者の
+          `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は実行本体のラップで
+          弾くため到達する）。利用者フックで監査・計測している場合は観測が欠ける。
+        - `tool:` レコードの `agent_id` は宣言時の `spec.name`、`tool_start:` は runtime の
+          `agent.name` で取得元が違う（`Agent.clone(name=...)` すると食い違う）。
+
+    実装に近い粒度の境界（評価をスキップする全経路・照合名の詳細）は `_adapters/governance.py` の
+    `govern_spec` docstring を参照する。
 
     状態のスコープ（builder 単位）:
         - 既定監査 sink・解決済みポリシー・override 適用記録は **builder インスタンス単位** の

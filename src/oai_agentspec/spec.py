@@ -133,7 +133,10 @@ class AgentSpec:
             lifecycle を持たない（`agents.Agent.mcp_servers` と同じ。
             `agents.mcp.MCPServerManager` の利用を検討する）。MCP サーバのツール定義・ツール
             出力は信頼境界の外側から model context へ入るため、必要なら
-            `oai_agentspec.runtime.guardrails` を併用する。
+            `oai_agentspec.runtime.guardrails` を併用する。ここで宣言したサーバのツールは
+            `tools` に載らず SDK が run 時（ターンごと）に解決するため build 時のポリシー検証
+            対象外で、`GovernedAgentBuilder` を注入した場合の評価は実行時のフック
+            （`AgentHooks.on_tool_start`）で行われる。
         mcp_config: `Agent.mcp_config`。MCP 設定（`convert_schemas_to_strict` /
             `include_server_in_tool_names` / `failure_error_function`）。未指定（None）の場合は
             build 時に kwargs へ積まず SDK の既定（空 dict）に委ねる。SDK の `MCPConfig` に無い
@@ -141,7 +144,9 @@ class AgentSpec:
             `failure_error_function` の戻り値は LLM へ渡るため、例外原文（接続 URL / トークンを
             含みうる）をそのまま返さない。build 時は dict をコピーせず参照を渡すため、宣言後に
             渡した dict を mutate すると構築済み `Agent` へ伝播する（registry 経由の `freeze()`
-            は `_copy_spec` が dict を複製するため遮断される）。
+            は `_copy_spec` が dict を複製するため遮断される）。`include_server_in_tool_names` を
+            真にするとツールの公開名が `mcp_{サーバ名}__{ツール名}` になるため、名前でツールを
+            参照する仕組み（ガバナンスの `allowed_tools` 等）を併用している場合は追随が必要。
         handoffs: ハンドオフ先エージェント名リスト（グラフ連携）。
         handoff_options: dst 名 -> HandoffConfig の per-edge 設定。
         sub_agents: as_tool 配線するサブエージェント名リスト（グラフ連携）。
