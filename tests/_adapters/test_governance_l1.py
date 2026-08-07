@@ -7,9 +7,11 @@ default_factory / 必須）を直接検証する。加えて `_make_audit_hooks`
 （origin 判定 / 記録順 / fail-closed / agent_id / 利用者フック非到達 / policy 既定 None での
 非評価）を fake sink・fake policy・fake 拒否例外の注入で検証する。
 
-ポリシー評価は fake policy（呼び出し記録付き）を注入し AGT 非依存で検証する。YAML 読込のみ
-実 `GovernancePolicy`（dataclass フィールド集合が挙動を決める）が必要なため、テスト内
-`pytest.importorskip` で governance extra 未導入環境では skip する。
+ポリシー評価は原則 fake policy（呼び出し記録付き）を注入し AGT 非依存で検証する。実
+`GovernancePolicy`（dataclass フィールド集合と照合実装が挙動を決める）が必要なのは、YAML 読込と
+`blocked_patterns` の照合結果を `spec.tools` 経路と同一入力で突き合わせる検証（`_evaluate_tool`
+の複製検知）で、いずれもテスト内 `pytest.importorskip` により governance extra 未導入環境では
+skip する。
 """
 
 from __future__ import annotations

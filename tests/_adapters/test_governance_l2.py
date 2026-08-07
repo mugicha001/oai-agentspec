@@ -222,16 +222,16 @@ async def test_mcp_origin_tool_deny_lands_as_user_error_cause_via_runner() -> No
 
     assert isinstance(excinfo.value.__cause__, PolicyViolationError)
     assert invoked == []  # 実ツール本体は実行されない
-    triples = [(e.agent_id, e.action, e.decision) for e in sink.get_entries()]
-    assert ("bot", "tool_start:mcp_read", "allow") in triples
-    assert ("bot", "tool:mcp_read", "deny") in triples
+    # 記録列全体を `==` で固定する（`in` 判定では `tool:` の重複記録を検知できない）。
+    # 拒否で run が中断されるため tool_end / agent_end も現れないことが同時に固定される。
+    assert [(e.agent_id, e.action, e.decision) for e in sink.get_entries()] == [
+        ("bot", "agent_start", "allow"),
+        ("bot", "tool_start:mcp_read", "allow"),
+        ("bot", "tool:mcp_read", "deny"),
+    ]
     deny = next(e for e in sink.get_entries() if e.action == "tool:mcp_read")
     assert deny.details["arguments"] == '{"q": "x"}'
     assert "mcp_read" in deny.details["reason"]
-    # 拒否で実行が中断されるため tool_end / agent_end は記録されない。
-    actions = [e.action for e in sink.get_entries()]
-    assert "tool_end:mcp_read" not in actions
-    assert "agent_end" not in actions
     assert sink.verify_chain() is True
 
 
