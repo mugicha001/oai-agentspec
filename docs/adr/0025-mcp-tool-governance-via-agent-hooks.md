@@ -124,8 +124,13 @@ ADR-0016 の「`_make_audit_hooks` が作る `AgentHooks` は監査記録のみ�
   監査も発生しない。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
 - **-** `allowed_tools` は名前照合であり、MCP ツールの実体はターンごとに再解決される。同名の
   まま schema / 意味だけ差し替える変更は検知しない。
-- **-** `mcp_config["include_server_in_tool_names"]` を真にするとツールの公開名が
-  `mcp_{サーバ名}__{ツール名}` になるため、`allowed_tools` の宣言も追随が必要になる。
+- **-** `mcp_config["include_server_in_tool_names"]` を真にすると、SDK が生成する公開名は
+  `mcp_{サーバ名}__{ツール名}` を基本形とし、文字置換や長さ超過時の切り詰めなどの変形を加える
+  場合があるため、`allowed_tools` は実際の公開名を確認して宣言する必要がある。
+- **-** 評価対象はツール名と引数のみで、MCP サーバが返す結果は評価も content 照合も受けずモデル
+  文脈へ入る（`on_tool_end` は記録のみ）。MCP はサーバが第三者であるため、許可したツールの戻り値
+  が間接プロンプトインジェクションの主経路になる。信頼境界の外に置く場合は SDK の出力ガードレール
+  を併用する。
 
 ## Confirmation
 

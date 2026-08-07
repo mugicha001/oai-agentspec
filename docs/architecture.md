@@ -2022,9 +2022,16 @@ allow / deny 評価・決定記録の対象外（監査フックの tool_start /
 内部 `FunctionTool` は同 builder 経由で govern 済み）。`register_factory` 経路は builder を通らないため
 govern 対象外。**hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
 され `FunctionTool` でもないため `on_tool_start` が発火せず、評価も監査も発生しない（統治されるのは
-client-side MCP = `spec.mcp_servers` 経由のみ）。`RealtimeAgentSpec` の `mcp_servers` も別 registry /
-別 builder Protocol 経路のため対象外。`AGENT_AS_TOOL` origin は機構上は同じフックで評価しうるが、既存
-`allowed_tools` 宣言の意味を変えるため評価しない。
+client-side MCP = `spec.mcp_servers` 経由のみ）。同じ理由で、MCP サーバから `list_prompts` /
+`get_prompt` / resources 経由で取得した文面を利用者が `instructions` 等へ流し込む使い方はツール呼び出し
+ではないため評価も監査も受けない。`RealtimeAgentSpec` の `mcp_servers` も別 registry / 別 builder Protocol
+経路のため対象外。`AGENT_AS_TOOL` origin は機構上は同じフックで評価しうるが、既存
+`allowed_tools` 宣言の意味を変えるため評価しない。`get_function_tool_origin` が `None` を返す場合
+（origin が取得できないツール）も MCP 由来かどうかを判定できないため評価しない（fail-open・無警告）。
+評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けずモデル文脈へ入る
+（`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモートのサーバであることが多く、
+許可した MCP ツールの戻り値が間接プロンプトインジェクションの主経路になりうる。信頼境界の外に置く場合は
+SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を併用する。
 
 MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）: MCP の deny は `on_tool_start` からの送出で
 合成チェーンを中断するため、利用者の `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は
@@ -2033,8 +2040,23 @@ MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差�
 `mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）。`tool:` レコードの `agent_id` は
 宣言時の `spec.name`（build 時捕獲）で、`tool_start:` は runtime の `agent.name`（`Agent.clone(name=...)`
 すると食い違う）。照合対象は SDK が解決した公開ツール名であり、`mcp_config` の
-`include_server_in_tool_names` を真にすると `mcp_{サーバ名}__{ツール名}` 形式になるため `allowed_tools` の
-宣言も追随が必要（`allowed_tools` は名前照合であり、ターンごとに再解決される実体の差し替えは検知しない）。
+`include_server_in_tool_names` を真にすると、公開名は `mcp_{サーバ名}__{ツール名}` を**基本形**とし SDK が
+次の変形を行う（`allowed_tools` の宣言が基本形のままだと不一致になりうる）: (1) サーバ名部分 / ツール名
+部分それぞれについて、ASCII 英数字 / `_` / `-` 以外の文字を `_` へ置換し前後の `_-` を strip する（strip 後
+に空になると `server` / `tool` へフォールバックする）、(2) 基本形が長さ上限 64 を超える場合、55 文字へ
+切り詰めて `_` + sha1 先頭 8 桁を付ける、(3) `spec.tools` / handoff / as_tool のツール名や同一解決バッチ内
+の他ツールと base 名が衝突する場合、上限以内でもハッシュが付く。`allowed_tools` は名前照合であり、ターン
+ごとに再解決される実体の差し替えは検知しない。
+
+build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む・いずれも SDK の公開 API）と、MCP 経路は
+**強制と監査がともに失われる**（例外も警告も出ない）。`spec.tools` 経路は実行本体のラップが tool オブジェ
+クト自身に焼き込まれるため強制も per-call の `tool:` レコードも残る。両経路で失われるのはフック由来の
+ライフサイクル記録（`agent_start` / `tool_start:` / `tool_end:` / `handoff:` / `agent_end`）のみ。
+差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言すれば builder が合成する。同一ターンに
+複数のツール呼び出しがある場合、SDK は各呼び出しを並行タスクで起動するため、deny が発生した時点で兄弟
+呼び出しが既に実行済み / 実行中ならその副作用は残る（deny は per-call でありターン単位のロールバックでは
+ない）。
+
 判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。
 
 ### GovernedAgentBuilder（装飾 builder）

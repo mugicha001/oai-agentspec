@@ -253,7 +253,7 @@ agent = registry.get(Names.PLANNER)
 - `mcp_config` に SDK の `MCPConfig`（`convert_schemas_to_strict` / `include_server_in_tool_names` / `failure_error_function`）に無いキーを書いても検証されず SDK 側で無視されます（綴り誤りは silent に効きません）
 - `mcp_config["failure_error_function"]` の戻り値は LLM へ渡ります。例外原文（接続 URL / トークンを含みうる）をそのまま返さないでください
 - `mcp_config` の dict は build 時にコピーされず参照が渡ります。宣言後に mutate すると構築済み `Agent` へ伝播します（`registry.freeze()` は複製するため遮断されます）
-- `mcp_config={"include_server_in_tool_names": True}` にするとツールの公開名が `mcp_{サーバ名}__{ツール名}` になります。名前でツールを参照する仕組み（ポリシー等）を併用している場合は追随が必要です
+- `mcp_config={"include_server_in_tool_names": True}` にすると公開名は `mcp_{サーバ名}__{ツール名}` を基本形とし、SDK が文字置換 / 長さ超過時の切り詰め等の変形を加える場合があります（詳細は `docs/architecture.md` を参照）。名前でツールを参照する仕組み（ポリシー等）を併用している場合は、実際の公開名を確認して宣言してください
 - `validate_agent_names` は任意の追加手段です。呼ばなくても従来どおり `validate()` / `get()` の実行時検出は働きます
 
 ## 参照

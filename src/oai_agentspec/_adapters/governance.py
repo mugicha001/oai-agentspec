@@ -777,21 +777,52 @@ def govern_spec(
     `agent.name`（runtime agent）とは取得元が違うため `Agent.clone(name=...)` すると食い違う、
     (6) `RealtimeAgentSpec` の `mcp_servers` は別 registry / 別 builder Protocol 経路のため govern
     対象外、(7) 照合対象は SDK が解決した公開ツール名であり
-    `mcp_config["include_server_in_tool_names"]` を真にすると `mcp_{サーバ名}__{ツール名}` 形式に
-    なるため `allowed_tools` の宣言も追随が必要（prefix 後が SDK の長さ上限を超えると末尾が
-    切られハッシュが付くため、長い名前では実際の公開名を確認して宣言する）、
+    `mcp_config["include_server_in_tool_names"]` を真にすると `mcp_{サーバ名}__{ツール名}` を
+    基本形とする名前になるため `allowed_tools` の宣言も追随が必要。サーバ名部分 / ツール名部分は
+    それぞれ ASCII 英数字 / `_` / `-` 以外の文字が `_` へ置換され、前後の `_-` が strip される
+    （strip 後に空になると `server` / `tool` へフォールバックする。置換が 0 文字でも `--` / `__` /
+    空文字は空になるため該当する）。基本形が長さ上限を超える場合は切り詰めてハッシュを付け、
+    `spec.tools` / handoff / as_tool のツール名（SDK が予約名として渡す集合）や同一解決バッチ
+    （同一 agent の全 MCP サーバ）内の他ツールと衝突する場合は上限以内でもハッシュが付く。
+    基本形をそのまま宣言すると全不一致＝当該ツールが常時 deny になりうるため、実際の公開名を
+    確認して宣言する、
     (8) hosted MCP（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行され
     `FunctionTool` でもないため `on_tool_start` が発火せず、**評価も監査も一切発生しない**
-    （本経路が統治するのは client-side MCP = `spec.mcp_servers` 経由のツールのみ）、
+    （本経路が統治するのは client-side MCP = `spec.mcp_servers` 経由のツールのみ）。統治対象は
+    MCP の**ツール呼び出し**に限られ、`list_prompts` / `get_prompt` / resources 経由でサーバから
+    取得した文面を利用者が `instructions` 等へ流し込む使い方は評価も監査も受けない、
     (9) allowlist は名前照合であり、MCP ツールの実体はターンごとに再解決されるため同名のまま
     schema / 意味だけ差し替える変更は検知しない（サーバ単位で名前空間を分ける
     `include_server_in_tool_names` の併用が有効）、(10) deny は `UserError` として run を終了させ、
     モデルへエラー文字列を返して会話を継続する degradation は行わない（MCP ツール自身の実行時
-    例外が `mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）、
+    例外が `mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）。deny は
+    per-call であり**ターン単位のロールバックではない**: 同一ターンに複数のツール呼び出しがある
+    場合、SDK は各呼び出しを並行タスクで起動するため、deny 発生時点で兄弟呼び出しが既に実行済み /
+    実行中ならその副作用は残る（「deny で run が終わった = 何も起きていない」とは読めない）、
     (11) build 後に `agent.tools` へ直接注入したツールは build 時ラップを受けず、FUNCTION origin の
     ままなら本フックでも評価されない（positive 判定の帰結）。利用者が MCP origin の
     `FunctionTool` を自前で `spec.tools` に置いた場合は build ラップと本フックの二重評価になり
-    allow 時に `tool:` レコードが 2 件残る。
+    allow 時に `tool:` レコードが 2 件残る、
+    (12) build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` 含む・いずれも SDK の公開 API）と
+    **MCP 経路の強制と監査がともに失われる**（例外も警告も出ない）。`spec.tools` 経路は実行本体の
+    ラップが tool オブジェクト自身に焼き込まれるため強制も per-call の `tool:` レコードも残り、
+    この点で 2 経路は非対称である。差し替えで両経路とも失われるのはフック由来のライフサイクル
+    記録（`agent_start` / `tool_start:` / `tool_end:` / `handoff:` / `agent_end`）で、これは本
+    フックの導入時から存在する性質だが、強制と per-call レコードまで失われるのは MCP 経路のみ。
+    差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言して builder に合成させる
+    （本モジュールが `chain_agent_hooks` で合成するため利用者フックは失われない）、
+    (13) `get_function_tool_origin` が `None` を返すツールは MCP 由来であっても評価されない
+    （fail-open・例外も警告も出ない）。SDK が非公開の `FunctionTool._emit_tool_origin` を False に
+    したラッパ（現行 SDK では `build_litellm_json_tool_call` の合成ツール）や、第三者ラッパが同
+    フィールドを落とした場合が該当する。逆に引数が `str` として取れない場合は名前照合へ縮退せず
+    deny する（fail-closed）ため、正常な MCP 呼び出しでも `ToolContext.tool_arguments` の契約が
+    変われば一律 deny になる、
+    (14) 評価対象は**ツール名と引数のみ**で、MCP サーバが返す**結果は評価も content 照合も受けず**
+    モデル文脈へ入る（`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモート
+    のサーバであり、`allowed_tools` で許可したツールの戻り値が間接プロンプトインジェクションの主
+    経路になる。`spec.tools` でも同じだが、サーバが自前でない MCP では影響が大きい。サーバを信頼
+    境界の外に置く場合は SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を
+    併用する。
 
     Args:
         spec: govern 対象の `AgentSpec`（plain・コア型）。

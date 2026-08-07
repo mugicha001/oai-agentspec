@@ -45,7 +45,12 @@ class GovernedAgentBuilder:
           先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny）。
         - hosted MCP（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
           されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）
-          のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
+          のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。MCP について
+          統治するのはツール**呼び出し**のみで、`get_prompt` / resources 経由でサーバから取得した
+          文面は対象外。
+        - 評価対象はツール名と引数のみで、**ツールの戻り値は評価されない**（許可した呼び出しの
+          結果は素通しでモデル文脈へ入る）。第三者の MCP サーバを使う場合、戻り値が間接プロンプト
+          インジェクションの経路になるため SDK の出力ガードレールを併用する。
 
     MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）:
         - MCP の deny は `on_tool_start` からの送出で合成チェーンを中断するため、利用者の
@@ -53,6 +58,11 @@ class GovernedAgentBuilder:
           弾くため到達する）。利用者フックで監査・計測している場合は観測が欠ける。
         - `tool:` レコードの `agent_id` は宣言時の `spec.name`、`tool_start:` は runtime の
           `agent.name` で取得元が違う（`Agent.clone(name=...)` すると食い違う）。
+        - build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` 含む）と **MCP 経路の強制と
+          監査がともに失われる**（`spec.tools` 経路はラップが tool 自身へ焼き込まれるため強制と
+          per-call の `tool:` レコードは残り、失われるのはフック由来のライフサイクル記録のみ）。
+          利用者フックを足したい場合は差し替えでなく `spec.hooks` へ宣言する（本 builder が
+          合成するため既存フックは失われない）。
 
     実装に近い粒度の境界（評価をスキップする全経路・照合名の詳細）は `_adapters/governance.py` の
     `govern_spec` docstring を参照する。
