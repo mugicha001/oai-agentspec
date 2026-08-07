@@ -280,6 +280,8 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 | `sub_agents` | `list[str]` | as_tool 配線するサブエージェント名（グラフ連携） |
 | `sub_agent_tools` | `dict[str, tuple[str \| None, str \| None]]` | サブ名 -> (tool_name, tool_description) の as_tool 上書き |
 | `dynamic_handoffs` | `list[DynamicHandoff]` | 動的ハンドオフ宣言（on_invoke で候補から転送先を実行時選択） |
+| `mcp_servers` | `list[Any]` | `Agent.mcp_servers`。接続する MCP サーバ（kw_only・既定は空）。接続 / 切断は利用者責務で lib は lifecycle を持たない |
+| `mcp_config` | `dict[str, Any] \| None` | `Agent.mcp_config`。MCP 設定（kw_only・既定 `None`）。未指定なら kwargs へ積まず SDK 既定（空 dict）に委ねる |
 | `extra` | `dict[str, Any]` | 上記以外の `agents.Agent` kwarg 素通し |
 
 `instructions` / `prompt` は `Agent` のフィールドにそのまま渡される。本ライブラリは指示系に
@@ -288,8 +290,10 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 2 引数が必須であり、これを register 時に検証して run 時 `TypeError` を前倒し検出する。
 
 `extra` に専用フィールド（name / instructions / prompt / tools / handoffs / model /
-model_settings / hooks）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
-場合は構築時に `ValueError` を送出する。
+model_settings / hooks / input_guardrails / output_guardrails / guardrails / mcp_servers /
+mcp_config）と同名のキー、または `agents.Agent` が受け付けない未知キーが含まれる
+場合は構築時に `ValueError` を送出する（`guardrails` は `Agent` の kwarg ではないが、専用
+フィールドとの衝突として検知するため列挙に含める）。
 
 #### run スコープの instructions 追記（`instructions_append`）
 
@@ -1224,9 +1228,10 @@ Realtime シンボルはコア `__all__` に載せず、`oai_agentspec.runtime.c
 カスタム可能にする一貫したパススルー方式を採る。
 
 - **Agent**: 専用フィールド（`instructions` / `prompt` / `tools` / `model` / `model_settings` /
-  `hooks` / `handoffs` / `sub_agents`）+ `extra: dict`（`output_type` / `input_guardrails` /
-  `output_guardrails` / `tool_use_behavior` / `reset_tool_choice` / `handoff_description` /
-  `mcp_servers` 等）。`extra` で `model_settings` 等を渡す場合は `ModelSettings` インスタンスが必須。
+  `hooks` / `handoffs` / `sub_agents` / `input_guardrails` / `output_guardrails` / `guardrails` /
+  `mcp_servers` / `mcp_config`）+ `extra: dict`（`output_type` / `tool_use_behavior` /
+  `reset_tool_choice` / `handoff_description` 等）。`extra` で `model_settings` 等を渡す場合は
+  `ModelSettings` インスタンスが必須。
 - **Handoff**: `HandoffConfig` の型付きフィールド（`description` / `tool_name` / `on_handoff` /
   `input_type` / `input_filter` / `is_enabled`）+ `options: dict` 素通し。静的エッジ
   （`HandoffEdge` / `HandoffConfig`）と動的エッジ（`DynamicHandoffEdge` / `DynamicHandoff`）は
