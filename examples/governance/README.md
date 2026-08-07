@@ -105,7 +105,10 @@ from oai_agentspec.runtime.governance import PolicyViolationError
 違反時は実関数を実行せず AGT `PolicyViolationError` を送出する。SDK `Runner` 経由では SDK
 例外にラップされ得るため、捕捉時は `__cause__` も確認する（`01_policy_enforcement.py` 参照）。
 拒否で run は中断されるため、拒否されたツールの `tool_end` 以降の監査記録は残らない（deny
-レコードが終端）。
+レコードが終端）。中断に伴い、stdio 接続の MCP サーバーの切断時に SDK が
+`Error cleaning up server: unhandled errors in a TaskGroup` を ERROR でログ出力する
+（`05_mcp_tool_governance.py` の実行時に stderr へ出る。非致命的で切断自体は完了し終了コードも
+変わらない。deny が起きない実行では出ない）。
 
 YAML の未知キー（`allowed_tool:` のような typo）は読み込み時に `ValueError` で拒否される
 （allowlist が黙って無効化され全ツール許可に化ける事故の防止）。`max_tool_calls` 等の本統合で
@@ -146,7 +149,11 @@ MCP 経路の非対称（利用者が観測しうる差）:
 - `allowed_tools` は名前照合で、MCP ツールの実体はターンごとに再解決される。同名のまま
   schema / 意味だけ差し替える変更は検知しない（`mcp_config["include_server_in_tool_names"]` で
   サーバ単位に名前空間を分けると識別しやすい。真にした場合は `allowed_tools` の宣言も
-  `mcp_{サーバ名}__{ツール名}` へ追随する）。
+  `mcp_{サーバ名}__{ツール名}` を基本形とする公開名へ追随する。SDK は ASCII 英数字 / `_` / `-`
+  以外を `_` へ置換し、長さ上限超えでは切り詰めてハッシュを付け、`spec.tools` / handoff /
+  as_tool のツール名や同一解決バッチ（同一 agent の全 MCP サーバ）内の他ツールとの衝突では
+  上限以内でもハッシュを付けるため、基本形をそのまま宣言すると全不一致＝当該ツールが常時
+  deny になりうる）。
 
 ## 既知の境界（govern 対象外）
 
@@ -156,6 +163,13 @@ MCP 経路の非対称（利用者が観測しうる差）:
 - **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行され
   `on_tool_start` が発火しないため、評価も監査も発生しない。統治されるのは client-side MCP
   （`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
+  MCP について統治するのはツール**呼び出し**のみで、`get_prompt` / resources 経由でサーバから
+  取得した文面は対象外。
+- 評価対象はツール名と引数のみで、**ツールの戻り値は評価されない**（許可した呼び出しの結果は
+  素通しでモデル文脈へ入る）。第三者の MCP サーバを使う場合は戻り値が間接プロンプトインジェク
+  ションの経路になるため、SDK の出力ガードレールを併用する。
+- deny は per-call でありターン単位のロールバックではない。同一ターンに複数のツール呼び出しが
+  ある場合、deny 発生時点で兄弟呼び出しが既に実行済み / 実行中ならその副作用は残る。
 - `register_factory` 経路は builder を通らないため govern 対象外。
 - hosted tool 等の非 `FunctionTool` は素通し（ポリシー強制境界は関数ツールの呼び出し）。
 - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより先に

@@ -45,8 +45,13 @@ spec.tools -> Agent.tools       Agent.get_all_tools()
 ```
 
 ツールの公開名は既定でサーバ上の名前そのまま（例: `get_stock`）。
-`mcp_config={"include_server_in_tool_names": True}` にすると `mcp_{サーバ名}__{ツール名}` 形式の
-prefix が付くため、名前でツールを参照する仕組み（ポリシー等）を併用している場合は追随が必要。
+`mcp_config={"include_server_in_tool_names": True}` にすると `mcp_{サーバ名}__{ツール名}` を基本形
+とする prefix が付くため、名前でツールを参照する仕組み（ポリシー等）を併用している場合は追随が
+必要。基本形がそのまま公開名になるのは「ASCII 英数字 / `_` / `-` のみ・長さ上限以内・`spec.tools` /
+handoff / as_tool のツール名や同一解決バッチ（同一 agent の全 MCP サーバ）内の他ツールと非衝突」の
+場合で、外れると SDK が文字を置換したりハッシュ付きへ切り詰めるため、実際の公開名を確認して
+宣言する。サーバ名 / ツール名が置換と strip の結果空になる場合（`--` 等）は `server` / `tool` へ
+フォールバックする。
 
 ## サーバの接続 / 切断は利用者責務
 

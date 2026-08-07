@@ -64,7 +64,10 @@ def build_registry(server: Any, model: Any) -> AgentRegistry:
             mcp_servers=[server],
             # 未指定なら SDK 既定（空 dict）に委ねられる。ここでは既定値を明示している。
             # include_server_in_tool_names=True にするとツールの公開名が
-            # `mcp_{サーバ名}__{ツール名}` になる（ポリシー等で名前を参照する場合は追随が必要）。
+            # `mcp_{サーバ名}__{ツール名}` を基本形とする名前になる（ポリシー等で名前を参照する
+            # 場合は追随が必要。SDK は ASCII 英数字 / `_` / `-` 以外を `_` へ置換し、長さ上限超え
+            # では切り詰めてハッシュを付け、名前衝突では上限以内でもハッシュを付けるため、実際の
+            # 公開名を確認して宣言する）。
             mcp_config={"include_server_in_tool_names": False},
         )
     )
