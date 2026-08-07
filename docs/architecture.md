@@ -2011,10 +2011,31 @@ serve / cli / llmops / lightning / guardrails と同型の責務分割・公開�
 `FunctionTool` は govern 済みになる。`AgentSpec` / `tools` / コア `__all__` / `AgentBuilder` Protocol は変更せず、
 利用者の追加記述は「builder を 1 つ差し替える」+ ポリシー指定のみ。
 
+強制点は 2 つある。`spec.tools` の `FunctionTool` は build 時に実行本体（`on_invoke_tool`）をラップして
+評価する。`spec.mcp_servers` 経由の MCP ツールは SDK が **run 時**（ターンごとに `get_all_tools` から
+`MCPUtil.to_function_tool`）に解決するため build 時のラップ対象が存在せず、装着した監査
+`AgentHooks.on_tool_start` で評価する。宣言は同じ `allowed_tools` / `blocked_patterns` で足り、ポリシー
+宣言の規約は 1 本のまま（判定は `_evaluate_tool` の 1 実装を両経路が共有し、照合の意味論が乖離しない）。
+
 既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため per-call の
 allow / deny 評価・決定記録の対象外（監査フックの tool_start / tool_end 記録のみ。サブエージェント自身の
 内部 `FunctionTool` は同 builder 経由で govern 済み）。`register_factory` 経路は builder を通らないため
-govern 対象外。
+govern 対象外。**hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
+され `FunctionTool` でもないため `on_tool_start` が発火せず、評価も監査も発生しない（統治されるのは
+client-side MCP = `spec.mcp_servers` 経由のみ）。`RealtimeAgentSpec` の `mcp_servers` も別 registry /
+別 builder Protocol 経路のため対象外。`AGENT_AS_TOOL` origin は機構上は同じフックで評価しうるが、既存
+`allowed_tools` 宣言の意味を変えるため評価しない。
+
+MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）: MCP の deny は `on_tool_start` からの送出で
+合成チェーンを中断するため、利用者の `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は
+実行本体のラップで弾くため到達する）。MCP の deny は run を `UserError` で終了させ、モデルへエラー文字列を
+返して会話を継続する degradation は行わない（MCP ツール自身の実行時例外が
+`mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）。`tool:` レコードの `agent_id` は
+宣言時の `spec.name`（build 時捕獲）で、`tool_start:` は runtime の `agent.name`（`Agent.clone(name=...)`
+すると食い違う）。照合対象は SDK が解決した公開ツール名であり、`mcp_config` の
+`include_server_in_tool_names` を真にすると `mcp_{サーバ名}__{ツール名}` 形式になるため `allowed_tools` の
+宣言も追随が必要（`allowed_tools` は名前照合であり、ターンごとに再解決される実体の差し替えは検知しない）。
+判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。
 
 ### GovernedAgentBuilder（装飾 builder）
 
