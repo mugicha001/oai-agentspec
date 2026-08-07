@@ -3,13 +3,22 @@
 `AgentRegistry(agent_builder=GovernedAgentBuilder(...))` 経由で build した実 Agent に対し、
 許可ツールの実行 / 拒否ツールの実関数非実行（`PolicyViolationError`）/ 監査ログの allow・deny
 記録と `verify_chain()` / 既存 `spec.hooks` の合成委譲 / 非 FunctionTool 素通しと元 spec・tool の
-非破壊性 / 既定 sink の build 間共有（agent_id 跨ぎのチェーン連続）を検証する。
+非破壊性 / 既定 sink の build 間共有（agent_id 跨ぎのチェーン連続）を検証する。build 後に注入
+される MCP origin tool（`spec.tools` を通らない経路）の deny が監査フック側の評価で
+`UserError.__cause__` に `PolicyViolationError` を載せて着地することも併せて固定する。
 
 SDK / AGT のバージョン耐性トリップワイヤを兼ねる: SDK `AgentHooksBase` の public ライフサイクル
 メソッド集合（増えたら `_AuditAgentHooks` の監査記録の追随漏れを検知）と、AGT
 `GovernancePolicy.check_tool / check_content`・`AuditLog.record / get_entries / verify_chain`・
 `PolicyViolationError` の存在 / シグネチャを固定する。FakeModel で出力を制御し実 LLM を
 呼ばない（決定的）。
+
+MCP 経路は統治が fail-open（origin が MCP でなければ素通し）なため、依存する SDK 契約が破れても
+例外もログも出ず MCP ツールが無警告で未統治になる。そのため実 `MCPUtil.to_function_tool` の
+生成物を使って origin 付与 / 公開名 / 実例外の文字列化を pin し、`agents.tool.
+get_function_tool_origin` の存在・`ToolOriginType` のメンバ集合・`on_tool_start` に渡る
+`tool_arguments: str` も併せてトリップワイヤ化する（実 SDK 生成物が監査フックで実際に評価される
+ことも deny / allow 両方向で固定する）。
 """
 
 from __future__ import annotations
@@ -24,10 +33,19 @@ import pytest
 pytest.importorskip(
     "openai_agents_trust", reason="governance extra（agent-governance-toolkit）未導入"
 )
+# `mcp` は openai-agents の無条件依存だが、実 MCP ツール生成経路の pin が
+# `mcp.types.Tool` に依存するため明示的にガードする。
+pytest.importorskip("mcp", reason="mcp（openai-agents の依存）未導入")
 
-from agents import FunctionTool, Runner  # noqa: E402
+import agents.tool as sdk_tool  # noqa: E402
+from agents import FunctionTool, Runner, ToolOrigin, ToolOriginType, UserError  # noqa: E402
 from agents.lifecycle import AgentHooksBase, RunHooksBase  # noqa: E402
+from agents.mcp import MCPServer  # noqa: E402
+from agents.mcp.util import MCPUtil  # noqa: E402
+from agents.tool import get_function_tool_origin  # noqa: E402
 from agents.tool_context import ToolContext  # noqa: E402
+from mcp.types import CallToolResult, GetPromptResult, ListPromptsResult  # noqa: E402
+from mcp.types import Tool as MCPTool  # noqa: E402
 from openai_agents_trust import AuditLog, GovernancePolicy  # noqa: E402
 
 from oai_agentspec import AgentRegistry, AgentSpec, function_tool  # noqa: E402
@@ -60,6 +78,26 @@ def _make_tool(record: list[str], name: str = "echo") -> FunctionTool:
         return f"echo:{text}"
 
     return _tool
+
+
+def _mcp_origin_tool(record: list[str], name: str = "mcp_read") -> FunctionTool:
+    """MCP origin メタを載せた `FunctionTool` を作る（build 後注入用・origin を偽装）。
+
+    実 MCP サーバへ接続せず `MCPUtil.to_function_tool` を通さずに `_tool_origin` を直接載せる
+    （origin 判定に必要なメタのみを再現する）。`record` には実ツール本体の呼び出し引数が積まれる。
+    """
+
+    async def _on_invoke_tool(ctx: Any, input_json: str) -> str:
+        record.append(input_json)
+        return "ok"
+
+    return FunctionTool(
+        name=name,
+        description="fake mcp tool",
+        params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        on_invoke_tool=_on_invoke_tool,
+        _tool_origin=ToolOrigin(type=ToolOriginType.MCP, mcp_server_name="srv"),
+    )
 
 
 def _tool_ctx(name: str, arguments: str) -> ToolContext:
@@ -158,6 +196,41 @@ async def test_denied_tool_not_executed_and_raises_via_runner() -> None:
     # 拒否で実行が中断されるため tool_end / agent_end は記録されない。
     actions = [e.action for e in sink.get_entries()]
     assert "tool_end:echo" not in actions
+    assert "agent_end" not in actions
+    assert sink.verify_chain() is True
+
+
+async def test_mcp_origin_tool_deny_lands_as_user_error_cause_via_runner() -> None:
+    """A12: build 後注入した MCP origin tool の deny が `UserError.__cause__` に載って着地する。
+
+    MCP ツールは実行時に SDK 側で agent へ注入されるため、`spec.tools` には現れず build 時の
+    govern ラップ（`_govern_tool`）が掛からない。ここでは build 後の `agent.tools.append(...)`
+    で経路を再現し、監査フック（`on_tool_start`）側の評価だけで deny が効くことを固定する。
+    """
+    invoked: list[str] = []
+    sink = AuditLog()
+    policy = GovernancePolicy(name="p", allowed_tools=["allowed_only"])
+    reg = AgentRegistry(agent_builder=GovernedAgentBuilder(policy=policy, audit_sink=sink))
+    model = FakeModel().queue_tool_call("mcp_read", '{"q": "x"}').queue_text("unreached")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model))
+    agent = reg.get("bot")
+    # build 後注入（`spec.tools` に置くと build 時ラップも同時に掛かり経路が混ざる）。
+    agent.tools.append(_mcp_origin_tool(invoked))
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(agent, input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert invoked == []  # 実ツール本体は実行されない
+    triples = [(e.agent_id, e.action, e.decision) for e in sink.get_entries()]
+    assert ("bot", "tool_start:mcp_read", "allow") in triples
+    assert ("bot", "tool:mcp_read", "deny") in triples
+    deny = next(e for e in sink.get_entries() if e.action == "tool:mcp_read")
+    assert deny.details["arguments"] == '{"q": "x"}'
+    assert "mcp_read" in deny.details["reason"]
+    # 拒否で実行が中断されるため tool_end / agent_end は記録されない。
+    actions = [e.action for e in sink.get_entries()]
+    assert "tool_end:mcp_read" not in actions
     assert "agent_end" not in actions
     assert sink.verify_chain() is True
 
@@ -292,6 +365,25 @@ async def test_audit_hooks_without_inner_returns_audit_hooks_itself() -> None:
     # 監査対象外の on_llm_start は基底の no-op が呼ばれるだけで記録されない。
     await hooks.on_llm_start(None, _Named("bot"), None, [])
     assert len(sink.get_entries()) == 1
+
+
+async def test_audit_hooks_with_policy_without_inner_returns_audit_hooks_itself() -> None:
+    """A11: policy を渡しても `inner=None` なら合成ラッパを被せず監査フック自身を返す。
+
+    MCP ツール評価の追加が `chain_agent_hooks` の要素数・合成条件に影響しないこと
+    （`inner=None` 時に余計なラッパが 1 個挟まらないこと）を固定する。
+    """
+    sink = AuditLog()
+    hooks = _make_audit_hooks(
+        sink,
+        None,
+        policy=GovernancePolicy(name="p", allowed_tools=["echo"]),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+
+    assert type(hooks).__name__ == "_AuditAgentHooks"
+    assert isinstance(hooks, AgentHooksBase)
 
 
 async def test_audit_record_precedes_inner_delegation() -> None:
@@ -552,3 +644,269 @@ def test_dataclasses_replace_keeps_custom_on_invoke_tool() -> None:
 
     replaced = dataclasses.replace(tool, on_invoke_tool=_custom)
     assert replaced.on_invoke_tool is _custom
+
+
+# ----------------------------------------------------------------------
+# MCP 経路の SDK 契約トリップワイヤ（origin 付与 / origin 型集合 / 引数型 / 例外の文字列化）
+#
+# 本経路の統治は fail-open（origin が MCP でなければ素通し）のため、以下の契約が破れても
+# 例外もログも出ず MCP ツールが無警告で未統治になる。CI で SDK upgrade を検知する唯一の
+# 手段としてトリップワイヤで固定する。
+# ----------------------------------------------------------------------
+
+
+class _StubMCPServer(MCPServer):
+    """`MCPUtil.to_function_tool` を通すための最小 MCP サーバー（実接続なし）。
+
+    `_get_failure_error_function` / `_get_needs_approval_for_tool` は SDK 既定の挙動を使うため
+    `MCPServer`（abc）を継承して private ヘルパを継承で得る（duck-typed で自前実装すると
+    「SDK 既定の `failure_error_function` が効く」という B5 の pin 対象そのものを偽装してしまう）。
+    """
+
+    def __init__(self, name: str = "srv", *, fail_with: Exception | None = None) -> None:
+        """サーバー名と `call_tool` の失敗挙動を設定する。
+
+        Args:
+            name: `ToolOrigin.mcp_server_name` に載るサーバー名。
+            fail_with: `call_tool` が送出する例外（None なら空結果を返す）。
+        """
+        super().__init__()
+        self._name = name
+        self._fail_with = fail_with
+        self.calls: list[tuple[str, Any]] = []
+
+    @property
+    def name(self) -> str:
+        """サーバー名を返す。"""
+        return self._name
+
+    async def connect(self) -> None:
+        """接続は行わない（no-op）。"""
+
+    async def cleanup(self) -> None:
+        """後始末は行わない（no-op）。"""
+
+    async def list_tools(self, run_context: Any = None, agent: Any = None) -> list[MCPTool]:
+        """ツール一覧は空を返す（本テストは `to_function_tool` を直接呼ぶ）。"""
+        return []
+
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any] | None, meta: dict[str, Any] | None = None
+    ) -> CallToolResult:
+        """呼び出しを記録し、`fail_with` があれば送出する。"""
+        self.calls.append((tool_name, arguments))
+        if self._fail_with is not None:
+            raise self._fail_with
+        return CallToolResult(content=[])
+
+    async def list_prompts(self) -> ListPromptsResult:
+        """プロンプト一覧は未対応。"""
+        raise NotImplementedError
+
+    async def get_prompt(
+        self, name: str, arguments: dict[str, Any] | None = None
+    ) -> GetPromptResult:
+        """プロンプト取得は未対応。"""
+        raise NotImplementedError
+
+
+def _real_mcp_function_tool(
+    server: _StubMCPServer, *, tool_name: str = "read", name_override: str | None = None
+) -> FunctionTool:
+    """実 SDK の `MCPUtil.to_function_tool` で MCP 由来 `FunctionTool` を生成する。"""
+    return MCPUtil.to_function_tool(
+        MCPTool(name=tool_name, inputSchema={"type": "object"}),
+        server,
+        False,
+        tool_name_override=name_override,
+    )
+
+
+def test_sdk_get_function_tool_origin_import_tripwire() -> None:
+    """B1: `agents.tool.get_function_tool_origin` が存在し callable であることを固定する。
+
+    本シンボルは `agents` トップレベルに export されていないため（`_adapters/governance.py` は
+    サブモジュールから import している）、改名・移動が起きうる。消滅すれば import 時に落ちて
+    気付けるが、**改名で別名が増えたのに旧名も残る**場合は静かに古い契約を見続けることに
+    なるため、存在そのものを pin する。
+    """
+    origin_getter = getattr(sdk_tool, "get_function_tool_origin", None)
+    assert callable(origin_getter), (
+        "SDK の agents.tool.get_function_tool_origin が消滅 / 改名した。"
+        "_adapters/governance.py の import と _AuditAgentHooks.on_tool_start の origin 判定を"
+        "追従させること（MCP 由来ツールの positive 判定が成立しなくなる）。"
+    )
+    # `_adapters/governance.py` が束縛しているのと同一オブジェクトであること（別実装の混入検知）。
+    assert origin_getter is get_function_tool_origin
+
+
+def test_sdk_tool_origin_type_member_set_tripwire() -> None:
+    """B2: `ToolOriginType` のメンバ値集合を固定する（新 origin 型追加時に判断を強制する）。
+
+    `on_tool_start` は MCP のみを評価する positive 判定のため、新しい origin 型が増えても
+    例外は出ず黙って非評価になる。評価対象へ含めるかの判断ポイントとして fail させる。
+    """
+    expected = {"function", "mcp", "agent_as_tool"}
+    actual = {member.value for member in ToolOriginType}
+    assert actual == expected, (
+        "SDK ToolOriginType のメンバ集合が変化した。"
+        "_adapters/governance.py の _AuditAgentHooks.on_tool_start の positive 判定"
+        "（MCP のみ評価）へ新 origin を含めるか判断すること。"
+        f" 差分: {sorted(actual.symmetric_difference(expected))}"
+    )
+
+
+def test_sdk_mcp_to_function_tool_attaches_mcp_origin_tripwire() -> None:
+    """B3 / C1: 実 `MCPUtil.to_function_tool` の生成物が MCP origin と公開名を持つことを固定する。
+
+    A 群のテストは `_tool_origin` を手で載せた偽装 tool を使うため、**実 SDK の MCP ツール生成
+    経路を 1 本も通らない**。SDK が origin 付与をやめる / `_emit_tool_origin` の既定を反転すると、
+    偽装ベースのテストは緑のまま本番の positive 判定が全 MCP ツールを素通しにする（fail-open
+    なので例外もログも出ない・最悪の失敗モード）。ここでは `_AuditAgentHooks.on_tool_start` と
+    同じ `get_function_tool_origin(tool)` 経由で assert し、既定反転も同時に検知する。
+
+    併せて「SDK が解決した公開名が `FunctionTool.name` に載る」ことも pin する
+    （`_evaluate_tool` へ渡す名前 = allowlist 照合対象の前提。`include_server_in_tool_names` の
+    prefix 解決結果は `tool_name_override` として渡り、`FunctionTool.name` に反映される）。
+    """
+    server = _StubMCPServer(name="srv")
+    tool = _real_mcp_function_tool(server)
+
+    origin = get_function_tool_origin(tool)
+    assert origin is not None, (
+        "実 SDK の MCP ツールから origin が取得できない"
+        "（_emit_tool_origin の既定が反転した可能性）。"
+        "_adapters/governance.py の MCP positive 判定が全ツールを素通しにするため追従が必要。"
+    )
+    assert origin.type is ToolOriginType.MCP, (
+        "実 SDK の MCP ツールに ToolOriginType.MCP が付与されなくなった。"
+        "_adapters/governance.py の _AuditAgentHooks.on_tool_start による MCP 統治が"
+        "無警告で全て素通しになるため、origin 判定の追従が必須。"
+        f" 実際の origin: {origin!r}"
+    )
+    assert origin.mcp_server_name == "srv"
+    # SDK が解決した公開名が FunctionTool.name に載る（allowlist 照合対象の前提）。
+    assert tool.name == "read"
+    prefixed = _real_mcp_function_tool(server, name_override="mcp_srv__read")
+    assert prefixed.name == "mcp_srv__read", (
+        "SDK が解決した公開名が FunctionTool.name に載らなくなった。"
+        "allowlist 照合（_evaluate_tool へ渡す名前）の前提が崩れるため追従が必要。"
+    )
+
+
+async def test_real_sdk_mcp_function_tool_is_evaluated_by_audit_hooks() -> None:
+    """C1: 実 SDK 生成の MCP `FunctionTool` が監査フックで評価される（deny / allow 両方向）。
+
+    偽装 origin ではなく `MCPUtil.to_function_tool` の生成物を `on_tool_start` へ渡し、
+    ポリシー評価が実際に走ることをエンドツーエンドで固定する。deny 側だけでは
+    「常に deny」変異と区別できないため、同一ツールを allow するポリシーで素通ることも
+    併せて確認する。
+    """
+    server = _StubMCPServer(name="srv")
+    tool = _real_mcp_function_tool(server)
+    ctx = _tool_ctx("read", '{"path": "/etc/passwd"}')
+
+    class _Named:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    deny_sink = AuditLog()
+    deny_hooks = _make_audit_hooks(
+        deny_sink,
+        None,
+        policy=GovernancePolicy(name="p", allowed_tools=["other"]),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+    with pytest.raises(PolicyViolationError, match="read"):
+        await deny_hooks.on_tool_start(ctx, _Named("bot"), tool)
+    assert [(e.action, e.decision) for e in deny_sink.get_entries()] == [
+        ("tool_start:read", "allow"),
+        ("tool:read", "deny"),
+    ]
+    assert server.calls == []  # 実 MCP 呼び出しは発生しない
+
+    allow_sink = AuditLog()
+    allow_hooks = _make_audit_hooks(
+        allow_sink,
+        None,
+        policy=GovernancePolicy(name="p", allowed_tools=["read"]),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+    await allow_hooks.on_tool_start(ctx, _Named("bot"), tool)
+    assert [(e.action, e.decision) for e in allow_sink.get_entries()] == [
+        ("tool_start:read", "allow"),
+        ("tool:read", "allow"),
+    ]
+    allow_entry = allow_sink.get_entries()[1]
+    assert allow_entry.details == {"arguments": '{"path": "/etc/passwd"}'}
+
+
+async def test_sdk_tool_context_carries_str_arguments_tripwire() -> None:
+    """B4: `on_tool_start` に渡る context が `tool_arguments: str` を持つことを固定する。
+
+    型が変わると `_AuditAgentHooks.on_tool_start` の fail-closed 分岐が常時発火して
+    全 MCP 呼び出しが deny になる（アプリ停止）。逆に空文字へ化けると引数照合
+    （blocked_patterns）が黙って効かなくなる。実 Runner + FakeModel で駆動し、
+    合成チェーン後段の既存フックで context を捕獲して pin する。
+    """
+    captured: list[Any] = []
+
+    class _CapturingHooks:
+        """`on_tool_start` の context を捕獲する既存 `spec.hooks` 相当。"""
+
+        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+            captured.append(context)
+
+    invoked: list[str] = []
+    sink = AuditLog()
+    policy = GovernancePolicy(name="p", allowed_tools=["mcp_read"])
+    reg = AgentRegistry(agent_builder=GovernedAgentBuilder(policy=policy, audit_sink=sink))
+    model = FakeModel().queue_tool_call("mcp_read", '{"q": "x"}').queue_text("done")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, hooks=_CapturingHooks()))
+    agent = reg.get("bot")
+    # MCP ツールは run 時に SDK が注入するため build 後注入で経路を再現する。
+    agent.tools.append(_mcp_origin_tool(invoked))
+
+    await Runner.run(agent, input="go")
+
+    assert len(captured) == 1
+    arguments = getattr(captured[0], "tool_arguments", None)
+    assert isinstance(arguments, str), (
+        "SDK が on_tool_start の context に str の tool_arguments を渡さなくなった。"
+        "_adapters/governance.py の fail-closed 分岐が常時発火し全 MCP 呼び出しが deny になる。"
+        f" 実際の型: {type(arguments).__name__}"
+    )
+    assert arguments == '{"q": "x"}', (
+        "SDK が渡す tool_arguments がモデル出力の引数 JSON と一致しない。"
+        "blocked_patterns の引数照合が黙って無効化されるため追従が必要。"
+    )
+    # 引数が評価・監査へそのまま渡っている（allow 記録の details で観測する）。
+    allow = next(e for e in sink.get_entries() if e.action == "tool:mcp_read")
+    assert allow.details == {"arguments": '{"q": "x"}'}
+    assert invoked == ['{"q": "x"}']  # allow なので実ツール本体まで到達する
+
+
+async def test_sdk_mcp_function_tool_wraps_errors_into_result_tripwire() -> None:
+    """B5: MCP 由来 `FunctionTool` の `on_invoke_tool` が内部例外を文字列化して返すことを固定する。
+
+    SDK 既定の `failure_error_function` が効くため、MCP ツールの実行時例外は送出されず
+    モデル向けエラー文字列として返る（`agents/tool.py` の
+    `_FailureHandlingFunctionToolInvoker.__call__`）。この性質があるため「`on_invoke_tool` の
+    内側にポリシー評価を置く」案は成立せず（deny 例外が文字列へ吸われて統治が無効化される）、
+    `on_tool_start` を選んだ設計判断の前提になっている。性質が消えたら設計の再検討が必要。
+    """
+    server = _StubMCPServer(name="srv", fail_with=RuntimeError("stub mcp failure"))
+    tool = _real_mcp_function_tool(server)
+
+    result = await tool.on_invoke_tool(_tool_ctx("read", "{}"), "{}")
+
+    assert isinstance(result, str), (
+        "MCP 由来 FunctionTool の on_invoke_tool が内部例外を文字列化して返さなくなった。"
+        "on_tool_start でポリシー評価する設計判断（deny 例外が文字列へ吸われないため）の"
+        "前提が変わるため、_adapters/governance.py の評価位置を再検討すること。"
+        f" 実際の型: {type(result).__name__}"
+    )
+    assert "stub mcp failure" in result
+    assert server.calls == [("read", {})]  # 実 MCP 呼び出しは 1 回だけ走った

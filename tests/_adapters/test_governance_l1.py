@@ -3,7 +3,9 @@
 `_load_policy`（YAML 読込 / 未知キー fail-fast / 非強制フィールド警告 / policy オブジェクト
 素通し・検証）、`_evaluate_tool`（allowlist 短絡 / blocked_patterns 生文字列照合 / JSON
 エスケープ正規化照合 / パース不能フォールバック）、`_field_default`（default /
-default_factory / 必須）を直接検証する。
+default_factory / 必須）を直接検証する。加えて `_make_audit_hooks` の MCP ツール評価
+（origin 判定 / 記録順 / fail-closed / agent_id / 利用者フック非到達 / policy 既定 None での
+非評価）を fake sink・fake policy・fake 拒否例外の注入で検証する。
 
 ポリシー評価は fake policy（呼び出し記録付き）を注入し AGT 非依存で検証する。YAML 読込のみ
 実 `GovernancePolicy`（dataclass フィールド集合が挙動を決める）が必要なため、テスト内
@@ -18,11 +20,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from agents import FunctionTool, ToolOrigin, ToolOriginType
+from agents.tool_context import ToolContext
 
 from oai_agentspec._adapters.governance import (
     _evaluate_tool,
     _field_default,
     _load_policy,
+    _make_audit_hooks,
     _require_agt,
 )
 
@@ -540,3 +545,340 @@ def test_iter_decoded_strings_walks_nested_structures() -> None:
 
     out = _iter_decoded_strings({"a": ["x", {"b": "y"}, 1], "c": None})
     assert set(out) == {"a", "b", "c", "x", "y"}
+
+
+# ----------------------------------------------------------------------
+# _make_audit_hooks: MCP ツールのポリシー評価（fake 注入・AGT 非依存）
+# ----------------------------------------------------------------------
+
+
+class _DenyExc(Exception):
+    """`denied_exc` として注入する fake 拒否例外（AGT `PolicyViolationError` 相当）。"""
+
+
+class _Sink:
+    """`record(...)` 呼び出しを 4 つ組で記録する fake 監査 sink（記録順と件数の検証用）。"""
+
+    def __init__(self) -> None:
+        """記録リストを初期化する。"""
+        self.records: list[tuple[Any, str, str, dict[str, Any] | None]] = []
+
+    def record(
+        self,
+        agent_id: str,
+        action: str,
+        decision: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """監査レコードを記録順に積む（AGT `AuditLog.record` と同シグネチャ）。"""
+        self.records.append((agent_id, action, decision, details))
+
+
+class _Named:
+    """`name` だけを持つ最小の agent / tool スタブ。"""
+
+    def __init__(self, name: str) -> None:
+        """名前を保持する。"""
+        self.name = name
+
+
+class _RecordingInnerHooks:
+    """利用者フック（`spec.hooks`）を模す記録フック（deny 時の非到達検証用・duck typing）。"""
+
+    def __init__(self) -> None:
+        """イベント記録を初期化する。"""
+        self.events: list[str] = []
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        """ツール開始を記録する。"""
+        self.events.append(f"tool_start:{tool.name}")
+
+    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+        """ツール終了を記録する。"""
+        self.events.append(f"tool_end:{tool.name}")
+
+
+class _ArgsCtx:
+    """`tool_arguments` に任意の値を持つ最小コンテキスト（非 str / None の検証用）。"""
+
+    def __init__(self, tool_arguments: Any) -> None:
+        """ツール引数を保持する。"""
+        self.tool_arguments = tool_arguments
+
+
+def _origin_tool(
+    name: str = "mcp_read",
+    *,
+    origin_type: ToolOriginType | str | None = ToolOriginType.MCP,
+    emit_origin: bool = True,
+    invoked: list[str] | None = None,
+) -> FunctionTool:
+    """指定 origin の `FunctionTool` を作る（`MCPUtil.to_function_tool` を通さず origin を偽装）。
+
+    Args:
+        name: ツール名。
+        origin_type: 載せる `ToolOriginType`（None なら `_tool_origin` を付けない）。生 str を
+            渡した場合は `ToolOrigin(type=<生 str>)` になる（型検証を持たない frozen dataclass
+            のため成立する・identity 比較の退行検知に使う）。
+        emit_origin: `_emit_tool_origin`（False なら origin 解決結果が None になる）。
+        invoked: 実ツール本体（`on_invoke_tool`）が呼ばれたら引数 JSON を積むリスト。
+
+    Returns:
+        origin メタを持つ `FunctionTool`。
+    """
+
+    async def _on_invoke_tool(ctx: Any, input_json: str) -> str:
+        if invoked is not None:
+            invoked.append(input_json)
+        return "ok"
+
+    origin: Any = None
+    if origin_type is ToolOriginType.MCP:
+        origin = ToolOrigin(type=origin_type, mcp_server_name="srv")
+    elif origin_type is ToolOriginType.AGENT_AS_TOOL:
+        origin = ToolOrigin(type=origin_type, agent_name="sub")
+    elif origin_type is not None:
+        origin = ToolOrigin(type=origin_type)
+    return FunctionTool(
+        name=name,
+        description="fake tool",
+        params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        on_invoke_tool=_on_invoke_tool,
+        _tool_origin=origin,
+        _emit_tool_origin=emit_origin,
+    )
+
+
+def _tool_ctx(name: str, arguments: str) -> ToolContext:
+    """`on_tool_start` へ渡す最小 `ToolContext`（実 SDK 型・`tool_arguments` を持つ）を作る。"""
+    return ToolContext(context=None, tool_name=name, tool_call_id="c1", tool_arguments=arguments)
+
+
+async def test_mcp_tool_deny_raises_and_does_not_invoke_tool_body() -> None:
+    """A1: MCP origin ツールの deny は `denied_exc` を送出し、実ツール本体を呼ばない。"""
+    sink = _Sink()
+    invoked: list[str] = []
+    tool = _origin_tool(invoked=invoked)
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc, match="mcp_read"):
+        await hooks.on_tool_start(_tool_ctx("mcp_read", '{"q": "x"}'), _Named("support"), tool)
+
+    assert invoked == []  # 実ツール本体は実行されない
+    assert policy.tool_calls == ["mcp_read"]  # 評価は行われた
+
+
+@pytest.mark.parametrize(
+    ("origin_type", "emit_origin", "evaluated"),
+    [
+        (ToolOriginType.MCP, True, True),
+        ("mcp", True, True),
+        (ToolOriginType.FUNCTION, True, False),
+        (ToolOriginType.AGENT_AS_TOOL, True, False),
+        (None, False, False),
+    ],
+    ids=["mcp", "mcp_raw_str", "function", "agent_as_tool", "origin_none"],
+)
+async def test_only_mcp_origin_tools_are_evaluated(
+    origin_type: ToolOriginType | str | None, emit_origin: bool, evaluated: bool
+) -> None:
+    """A2: 評価対象は MCP origin のみ（FUNCTION / AGENT_AS_TOOL / origin None は非評価）。
+
+    非 MCP ケースはツール名を allowlist に載せない（= 評価されたら必ず deny になる）状態で、
+    例外が出ないことと `tool:{name}` レコードが 0 件であることの 2 点で非評価を固定する
+    （positive 判定への pin。negative 判定だと `spec.tools` の as_tool が二重評価される）。
+
+    `mcp_raw_str` ケースは生 str origin（`ToolOrigin(type="mcp")`）の回帰 pin。
+    `ToolOriginType` は `str` 派生 Enum で `ToolOrigin` は型検証を持たない frozen dataclass の
+    ため、第三者ラッパ・シリアライズ経路から生 str が渡り得る。実装の origin 判定を `!=` から
+    `is not`（identity 比較）へ戻すと、同値なのに不一致となり統治が無警告でスキップされる
+    （fail-open）。enum ケースと同一の期待値（評価される）で固定する。
+    """
+    sink = _Sink()
+    tool = _origin_tool(origin_type=origin_type, emit_origin=emit_origin)
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+    ctx = _tool_ctx("mcp_read", '{"q": "x"}')
+    agent = _Named("support")
+
+    if evaluated:
+        with pytest.raises(_DenyExc):
+            await hooks.on_tool_start(ctx, agent, tool)
+    else:
+        await hooks.on_tool_start(ctx, agent, tool)  # 例外は出ない
+
+    tool_records = [r for r in sink.records if r[1] == "tool:mcp_read"]
+    assert len(tool_records) == (1 if evaluated else 0)
+    assert policy.tool_calls == (["mcp_read"] if evaluated else [])
+
+
+async def test_mcp_tool_deny_records_start_then_deny_in_order() -> None:
+    """A3: deny 時は `tool_start:`(allow) -> `tool:`(deny) の順で raise 前に両方残る。"""
+    sink = _Sink()
+    tool = _origin_tool()
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="bot")
+
+    with pytest.raises(_DenyExc):
+        await hooks.on_tool_start(_tool_ctx("mcp_read", '{"q": "x"}'), _Named("bot"), tool)
+
+    # 記録列全体を == で比較する（順序反転・重複記録・記録欠落のいずれも検知する）。
+    assert sink.records == [
+        ("bot", "tool_start:mcp_read", "allow", None),
+        (
+            "bot",
+            "tool:mcp_read",
+            "deny",
+            {"reason": "tool not allowed", "arguments": '{"q": "x"}'},
+        ),
+    ]
+
+
+async def test_mcp_tool_allow_records_single_allow_entry_with_arguments() -> None:
+    """A4: allow 時は `tool:`(allow) が引数付きでちょうど 1 件残る（監査形式の対称性）。"""
+    sink = _Sink()
+    tool = _origin_tool()
+    policy = _FakePolicy()
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="bot")
+
+    await hooks.on_tool_start(_tool_ctx("mcp_read", '{"q": "x"}'), _Named("bot"), tool)
+
+    assert sink.records == [
+        ("bot", "tool_start:mcp_read", "allow", None),
+        ("bot", "tool:mcp_read", "allow", {"arguments": '{"q": "x"}'}),
+    ]
+    assert len([r for r in sink.records if r[1] == "tool:mcp_read"]) == 1  # 二重評価なし
+
+
+async def test_mcp_tool_blocked_patterns_deny_json_escaped_arguments() -> None:
+    """A5: MCP 経路でも JSON エスケープ（\\u0072m = rm）の回避が塞がる（`_evaluate_tool` 共用）。
+
+    既存 `test_blocked_patterns_deny_json_escaped_arguments`（L2・govern ラップ経路）と
+    同一入力・同一結果になることを固定し、MCP 側で評価ロジックが複製・乖離するのを防ぐ。
+    """
+    cls = _agt_policy_cls()
+    policy = cls(name="p", blocked_patterns=["rm -rf"])
+    escaped = '{"text": "\\u0072m -rf /"}'  # 生文字列に "rm -rf" は現れない
+    expected_reason = _evaluate_tool(policy, "sh", escaped)
+    assert expected_reason is not None and "blocked pattern" in expected_reason
+
+    sink = _Sink()
+    invoked: list[str] = []
+    tool = _origin_tool("sh", invoked=invoked)
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="bot")
+
+    with pytest.raises(_DenyExc, match="sh"):
+        await hooks.on_tool_start(_tool_ctx("sh", escaped), _Named("bot"), tool)
+
+    assert invoked == []
+    assert sink.records[-1] == (
+        "bot",
+        "tool:sh",
+        "deny",
+        {"reason": expected_reason, "arguments": escaped},
+    )
+
+
+@pytest.mark.parametrize(
+    "context",
+    [object(), _ArgsCtx(None), _ArgsCtx(123), _ArgsCtx({"q": "x"})],
+    ids=["missing_attr", "none", "int", "dict"],
+)
+async def test_mcp_tool_unavailable_arguments_fail_closed(context: Any) -> None:
+    """A6: `tool_arguments` が欠落 / 非 str なら fail-closed で deny する（名前照合へ縮退しない）。
+
+    ツール名は allowlist に載せた状態（`_FakePolicy` は常に許可）で試験するため、deny の
+    原因は引数の取得不能に限定される。
+    """
+    sink = _Sink()
+    tool = _origin_tool()
+    policy = _FakePolicy()
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc, match="mcp_read"):
+        await hooks.on_tool_start(context, _Named("support"), tool)
+
+    assert sink.records == [
+        ("support", "tool_start:mcp_read", "allow", None),
+        (
+            "support",
+            "tool:mcp_read",
+            "deny",
+            {
+                "reason": "tool arguments unavailable for policy evaluation",
+                "arguments": None,
+            },
+        ),
+    ]
+    # 引数が取れない時点で deny するため、ポリシー評価そのものには入らない。
+    assert policy.tool_calls == []
+
+
+async def test_non_function_tool_passes_through_without_evaluation() -> None:
+    """A7: 非 `FunctionTool`（hosted tool 相当）は例外にならず素通しされる。"""
+    sink = _Sink()
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="bot")
+
+    await hooks.on_tool_start(
+        _tool_ctx("web_search", '{"q": "x"}'), _Named("bot"), _Named("web_search")
+    )
+
+    assert sink.records == [("bot", "tool_start:web_search", "allow", None)]
+    assert policy.tool_calls == []
+
+
+async def test_policy_none_skips_evaluation_for_mcp_tool() -> None:
+    """A8: `policy=None`（既存の 2 引数呼び出し相当）では MCP origin でも評価しない。"""
+    sink = _Sink()
+    tool = _origin_tool()
+
+    hooks = _make_audit_hooks(sink, None)  # policy / denied_exc / agent_name は既定 None
+    await hooks.on_tool_start(_tool_ctx("mcp_read", '{"q": "x"}'), _Named("bot"), tool)
+
+    assert sink.records == [("bot", "tool_start:mcp_read", "allow", None)]
+
+
+async def test_tool_record_uses_spec_agent_name_not_runtime_agent_name() -> None:
+    """A9: `tool:` 行の agent_id は `agent_name`（`spec.name`）・`tool_start:` 行は agent.name。"""
+    sink = _Sink()
+    tool = _origin_tool()
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc):
+        await hooks.on_tool_start(_tool_ctx("mcp_read", "{}"), _Named("other"), tool)
+
+    assert [(r[0], r[1], r[2]) for r in sink.records] == [
+        ("other", "tool_start:mcp_read", "allow"),
+        ("support", "tool:mcp_read", "deny"),
+    ]
+
+
+async def test_mcp_tool_deny_does_not_reach_inner_hooks() -> None:
+    """A10: MCP deny 時は利用者フック（`inner`）の `on_tool_start` へ到達しない。"""
+    sink = _Sink()
+    inner = _RecordingInnerHooks()
+    tool = _origin_tool()
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, inner, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc):
+        await hooks.on_tool_start(_tool_ctx("mcp_read", "{}"), _Named("support"), tool)
+
+    assert inner.events == []  # 評価が委譲より後ろへ動いたら非空になる
+
+
+async def test_allowed_mcp_tool_reaches_inner_hooks() -> None:
+    """A10 対照: allow なら利用者フックへ委譲される（deny の非到達が raise 由来である担保）。"""
+    sink = _Sink()
+    inner = _RecordingInnerHooks()
+    tool = _origin_tool()
+    hooks = _make_audit_hooks(
+        sink, inner, policy=_FakePolicy(), denied_exc=_DenyExc, agent_name="support"
+    )
+
+    await hooks.on_tool_start(_tool_ctx("mcp_read", "{}"), _Named("support"), tool)
+
+    assert inner.events == ["tool_start:mcp_read"]
