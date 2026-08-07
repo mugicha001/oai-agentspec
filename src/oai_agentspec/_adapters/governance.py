@@ -27,7 +27,7 @@ from dataclasses import MISSING as _MISSING
 from dataclasses import fields as _dataclass_fields
 from dataclasses import replace as _dataclass_replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from agents import AgentHooks, FunctionTool, ToolOriginType
 
@@ -516,6 +516,42 @@ def _evaluate_tool(policy: Any, tool_name: str, input_json: str) -> str | None:
     return None
 
 
+def _deny_tool_call(
+    *,
+    sink: Any,
+    agent_name: str | None,
+    tool_name: str,
+    reason: str,
+    arguments: str | None,
+    denied_exc: Any,
+) -> NoReturn:
+    """拒否を監査 sink へ記録してから拒否例外を送出する（記録が送出より前であることを保証）。
+
+    build 時ラップ（`_govern_tool`）と run 時フック（`_make_audit_hooks` の `on_tool_start`）の
+    両経路が共有する。監査レコードの形（`action` / `decision` / `details` のキー）と例外メッセージ
+    書式を 1 箇所へ集約し、経路ごとに drift しないようにする（形が揃っていることは利用側の
+    `action.startswith("tool:")` 抽出の前提であり、ずれても例外は出ない）。
+
+    Args:
+        sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
+        agent_name: 監査記録に使うエージェント名（`spec.name`）。
+        tool_name: 拒否したツールの公開名。
+        reason: 拒否理由（ポリシー由来の文言、または評価不能を示す固定文言）。
+        arguments: 評価対象の生ワイヤ引数。取得できなかった場合は None を渡す。
+        denied_exc: 送出する例外クラス（AGT `PolicyViolationError`）。
+
+    Raises:
+        denied_exc: 常に送出する（戻らない）。
+    """
+    sink.record(
+        agent_id=agent_name,
+        action=f"tool:{tool_name}",
+        decision="deny",
+        details={"reason": reason, "arguments": arguments},
+    )
+    raise denied_exc(f"governance denied tool {tool_name!r}: {reason}")
+
+
 def _govern_tool(
     tool: FunctionTool,
     *,
@@ -552,13 +588,14 @@ def _govern_tool(
     async def _on_invoke_tool(ctx: Any, input_json: str) -> Any:
         reason = _evaluate_tool(policy, tool_name, input_json)
         if reason is not None:
-            sink.record(
-                agent_id=agent_name,
-                action=f"tool:{tool_name}",
-                decision="deny",
-                details={"reason": reason, "arguments": input_json},
+            _deny_tool_call(
+                sink=sink,
+                agent_name=agent_name,
+                tool_name=tool_name,
+                reason=reason,
+                arguments=input_json,
+                denied_exc=denied_exc,
             )
-            raise denied_exc(f"governance denied tool {tool_name!r}: {reason}")
         sink.record(
             agent_id=agent_name,
             action=f"tool:{tool_name}",
@@ -656,23 +693,24 @@ def _make_audit_hooks(
             args = getattr(context, "tool_arguments", None)
             if not isinstance(args, str):
                 # 引数が取れないときは名前照合へ縮退せず deny する（fail-closed）。
-                reason = "tool arguments unavailable for policy evaluation"
-                sink.record(
-                    agent_id=agent_name,
-                    action=f"tool:{name}",
-                    decision="deny",
-                    details={"reason": reason, "arguments": None},
+                _deny_tool_call(
+                    sink=sink,
+                    agent_name=agent_name,
+                    tool_name=name,
+                    reason="tool arguments unavailable for policy evaluation",
+                    arguments=None,
+                    denied_exc=denied_exc,
                 )
-                raise denied_exc(f"governance denied tool {name!r}: {reason}")
             reason = _evaluate_tool(policy, name, args)
             if reason is not None:
-                sink.record(
-                    agent_id=agent_name,
-                    action=f"tool:{name}",
-                    decision="deny",
-                    details={"reason": reason, "arguments": args},
+                _deny_tool_call(
+                    sink=sink,
+                    agent_name=agent_name,
+                    tool_name=name,
+                    reason=reason,
+                    arguments=args,
+                    denied_exc=denied_exc,
                 )
-                raise denied_exc(f"governance denied tool {name!r}: {reason}")
             sink.record(
                 agent_id=agent_name,
                 action=f"tool:{name}",
