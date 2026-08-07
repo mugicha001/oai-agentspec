@@ -43,7 +43,11 @@ enable_otel_logging(OtelLoggingConfig(service_name="my-app"))
 
 トレース側の切り替えは Agent 365 拡張の仕様に委譲しており、本ライブラリは独自の選択方式を
 持たない。`Agent365TracingConfig` の `token_resolver` / `exporter_options` / `cluster_category`
-がそのまま渡る。
+がそのまま渡る。ただし Agent 365 拡張は `exporter_options` を渡された場合その値のみを使うため、
+`token_resolver` と `cluster_category` は参照されない。実サービスへ送る場合は
+`exporter_options` 側に `token_resolver` を設定する。トップレベルの `token_resolver` も併せて
+渡している場合に限り options 側の設定漏れが `RuntimeWarning` で通知されるため、options だけを
+渡した構成ではコンソールへ span が出ていないかで確認する。
 
 ログ側は Agent 365 拡張がログ機構を持たないため素の OpenTelemetry Logs で組む。宛先はコンソール
 と OTLP の 2 つで、`otlp_enabled=True` はコンソールを**置換せず併用追加**する（接続先は

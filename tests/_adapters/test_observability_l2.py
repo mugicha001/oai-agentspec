@@ -5,13 +5,15 @@ instrumentor の順序契約・OTel Logs の構築 API）を、実パッケー�
 これらの形を模しているため、SDK 側が変わったときに L1 が「模造品にだけ通る」状態へ静かに退行
 するのを防ぐ。
 
-**有効化（`configure()` / `instrument()` の実呼び出し）は行わない**。Agent 365 の
+**本プロセスでは有効化（`configure()` / `instrument()` の実呼び出し）を行わない**。Agent 365 の
 `TelemetryManager` はプロセス singleton で一度 configure すると元に戻せず、`instrument()` は
 `set_trace_processors([...])` で SDK の processor 列を置換するため、実行するとテストセッション
 全体（`tests/workflow/test_tracing_l2.py` 等）を汚染する。本ファイルはシグネチャ・属性・
 未設定時の例外に加え、グローバル状態へ触れない純粋な整形（コンソール出力の 1 行 JSON 化に使う
-`_json_lines_formatter` と実レコードの `to_json()`）のみを実呼び出しで検査する。observability
-extra 未導入環境では skip する。
+`_json_lines_formatter` と実レコードの `to_json()`）のみを実呼び出しで検査する。例外は
+`..._ignores_top_level_token_resolver_when_exporter_options_given` のみで、上流の引数合成規則は
+`configure()` を実際に呼ばないと確かめられないため**子プロセスへ隔離して**実行する（span は
+生成しないので外部通信は発生しない）。observability extra 未導入環境では skip する。
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from __future__ import annotations
 import inspect
 import io
 import json
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -92,6 +96,149 @@ def test_require_agent365_tracing_returns_sdk_symbols() -> None:
     assert callable(configure)
     assert callable(is_configured)
     assert instrumentor_cls.__name__ == "OpenAIAgentsTraceInstrumentor"
+
+
+def test_agent365_exporter_options_exposes_token_resolver() -> None:
+    """`Agent365ExporterOptions` は公開属性 `token_resolver` を持ち、既定は `None`。
+
+    実装の到達先判定は番兵付き `getattr(options, "token_resolver", _MISSING)` と値の照合だけに
+    依存する（`isinstance` による型判別はしない）。属性の消失・改名は判定を無音で成立しなく
+    するため、存在・既定値・コンストラクタ経由の設定の 3 点を実 SDK で固定する。
+
+    `cluster_category` の既定も併せて固定する。`exporter_options` を渡すとトップレベルの
+    `cluster_category` も参照されず options 側の既定が使われる、という前提を docs / docstring /
+    examples の 4 か所で公開しているが、この既定値が変わると当該記述だけが静かに偽になる
+    （`token_resolver` と違い警告と結びつかないため実行時には現れない）。
+
+    検知する退行: 実装が読む属性名の drift、および pin が実際に属性存在を見ているか（M11）。
+    """
+    core = _a365_core()
+
+    default_options = core.Agent365ExporterOptions()  # type: ignore[attr-defined]
+    assert hasattr(default_options, "token_resolver")
+    assert default_options.token_resolver is None
+    assert default_options.cluster_category == "prod"
+
+    async def resolver(scope: str, tenant: str) -> str | None:
+        return None
+
+    configured = core.Agent365ExporterOptions(token_resolver=resolver)  # type: ignore[attr-defined]
+    assert configured.token_resolver is resolver
+
+
+def test_spectra_exporter_options_has_no_token_resolver() -> None:
+    """`SpectraExporterOptions` は `token_resolver` 属性を持たない（sidecar 構成の除外根拠）。
+
+    実装は番兵付き `getattr` でこの差を見て Spectra を警告対象から外す。将来上流が Spectra 側へ
+    当該属性を追加すると sidecar 構成で誤警告が始まるため、その前提をここで pin する。
+
+    「存在しない属性の不在」だけを主張すると属性名 typo でも真になり無音成立するため、同じ
+    リテラルを当該属性を持つ `Agent365ExporterOptions` へ正方向で当てる（M12）。
+    """
+    core = _a365_core()
+
+    options = core.SpectraExporterOptions()  # type: ignore[attr-defined]
+
+    # 同一リテラルを Agent365 形式へ正方向で当てる（属性名を typo すると此処が落ちる）。
+    assert hasattr(core.Agent365ExporterOptions(), "token_resolver")  # type: ignore[attr-defined]
+    assert not hasattr(options, "token_resolver")
+    # 正の assert（Spectra 側の公開属性が実在することの担保）。
+    assert hasattr(options, "endpoint")
+    assert hasattr(options, "protocol")
+
+
+# 上流の引数合成規則を確かめる子プロセス probe。`TelemetryManager` はプロセス singleton で一度
+# configure すると元に戻せないため親プロセスでは実行しない。有効化フラグは子プロセス内で立てる
+# （本体は環境変数を読まないため、テスト側も親プロセスの環境を汚さない）。span は生成しない。
+_COMPOSITION_PROBE = """
+import os
+import sys
+
+os.environ["ENABLE_A365_OBSERVABILITY_EXPORTER"] = "true"
+os.environ.pop("ENABLE_OTLP_EXPORTER", None)
+
+from microsoft_agents_a365.observability.core import configure
+from microsoft_agents_a365.observability.core.config import TelemetryManager
+from microsoft_agents_a365.observability.core.exporters import Agent365ExporterOptions
+
+
+def resolver(scope, tenant):
+    return "token"
+
+
+kwargs = {"service_name": "svc", "service_namespace": "ns", "token_resolver": resolver}
+if sys.argv[1] == "with_options":
+    kwargs["exporter_options"] = Agent365ExporterOptions()
+
+configure_ok = configure(**kwargs)
+exporter = TelemetryManager()._span_processors["batch"].span_exporter
+print(f"VERDICT:{configure_ok}:{type(exporter).__name__}")
+"""
+
+
+def _composition_probe(case: str) -> str:
+    """子プロセスで `configure()` を 1 回呼び、`"<戻り値>:<採用 exporter のクラス名>"` を返す。
+
+    上流のログや `ConsoleSpanExporter` の出力が混ざりうるため、標準出力から `VERDICT:` 行だけを
+    取り出す（現行の上流のフォールバック WARNING は stderr へ出る）。
+
+    Args:
+        case: `"with_options"`（`Agent365ExporterOptions()` を併用）または `"without_options"`。
+
+    Returns:
+        `"True:ConsoleSpanExporter"` のような 1 行（`VERDICT:` 接頭辞を除いたもの）。
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _COMPOSITION_PROBE, case],
+        capture_output=True,
+        text=True,
+        check=False,
+        # 上流が構築時のトークン取得・shutdown 時の flush を行う実装へ変わった場合に、
+        # 「CI が止まる」ではなく「テストが落ちる」へ着地させる（drift 検知が目的の probe）。
+        timeout=60,
+    )
+    assert result.returncode == 0, f"probe が失敗しました: {result.stderr}"
+    verdicts = [
+        line[len("VERDICT:") :]
+        for line in result.stdout.splitlines()
+        if line.startswith("VERDICT:")
+    ]
+    assert len(verdicts) == 1, result.stdout
+    return verdicts[0]
+
+
+def test_upstream_ignores_top_level_token_resolver_when_exporter_options_given() -> None:
+    """上流は `exporter_options` を渡されるとトップレベル `token_resolver` を参照しない。
+
+    これは `enable_agent365_tracing` の到達先未達警告が成立する唯一の前提（ADR 0024）である。
+    上流依存はバージョン上限を持たないため、上流が両者を合成する実装へ変わった時点で本警告は
+    「実サービスへ届いている構成に対する誤警告」へ反転する。その退行は lib 側のテストを緑のまま
+    通過してしまうため、前提そのものをここで pin する。
+
+    `configure()` の戻り値が両ケースで真であることも同時に固定する（戻り値は到達の証拠に
+    ならない = 警告が唯一の検知手段である、という設計全体の前提）。
+
+    上流内部（`TelemetryManager._span_processors`）を参照するのは、採用された exporter を知る
+    公開 API が上流にも OpenTelemetry にも無いためで、上流 drift の検知を目的とした意図的な
+    内部依存である。参照先が失われた場合は probe が非ゼロ終了して本テストが落ちる（無音で
+    緑化しない）。
+    """
+    _a365_core()  # observability extra 未導入なら skip する
+
+    with_options = _composition_probe("with_options")
+    without_options = _composition_probe("without_options")
+
+    # 正の対照: options を渡さなければトップレベル resolver は使われ実 exporter が選ばれる。
+    # この assert が無いと、有効化フラグが効いていないだけの環境でも本テストが緑になる
+    # （有効化フラグ名が上流で改名された場合も対照側が Console へ倒れて RED になる）。
+    assert without_options.startswith("True:"), without_options
+    assert "Console" not in without_options, without_options
+    # 本題: options を渡すとトップレベル resolver は捨てられ、コンソールへフォールバックする。
+    # 具象クラス名の完全一致は避ける（OpenTelemetry はこの種のクラスを改名する実績があり、
+    # 無関係な改名で「上流が合成規則を変えた」と読める誤 RED になるため）。対照側と同じ粒度で
+    # 判定する。
+    assert with_options.startswith("True:"), with_options
+    assert "Console" in with_options, with_options
 
 
 def test_require_opentelemetry_returns_documented_namespace() -> None:

@@ -26,10 +26,19 @@ class Agent365TracingConfig:
         service_namespace: MS 拡張 `configure()` の必須引数。
         logger_name: 内部ログ出力に使う logger 名。None で MS 拡張既定に委ねる。
         token_resolver: 実 Agent365 API 向けの `(scope, tenant) -> token | None` callable。
-            None でトークン解決を行わない。
-        cluster_category: MS 拡張のクラスタ区分（既定 "prod"）。
-        exporter_options: sidecar 向け `SpectraExporterOptions` 等の不透明値。lib は解釈せず
-            素通しする（SDK 隔離）。
+            None でトークン解決を行わない。`exporter_options` を渡した場合、MS 拡張は options の
+            値のみを使うため本フィールドは参照されない（`exporter_options` 側に設定する）。
+        cluster_category: MS 拡張のクラスタ区分（既定 "prod"）。`token_resolver` と同じ合成規則で、
+            `exporter_options` を渡した場合は本フィールドが参照されない。Agent365 形式の options
+            では options 側の `cluster_category`（既定 "prod"）が使われるため非既定のクラスタへ送る
+            ときはそちらへ設定し、sidecar 向け options ではクラスタ区分自体が使われない。
+        exporter_options: sidecar 向け `SpectraExporterOptions` 等の不透明値。lib は素通しを原則と
+            する（SDK 隔離）。例外として `token_resolver` 属性の有無と値のみを警告判定に読む
+            （型判別もエクスポータ選択も行わない。ADR 0024）。この読み取りは有効化時に同期で
+            1 回だけ行うため、ブロッキングな計算 property を本値に持たせない。読み取りが例外に
+            なった場合、その例外はトレースバック付きで DEBUG ログ（logger 名
+            `oai_agentspec._adapters.observability`）へ記録されるため、例外メッセージへトークン等の
+            機微情報を含めない。
         suppress_invoke_agent_input: True で InvokeAgent スパンの `gen_ai.input.messages` 属性
             （完全一致キー）のみを送出対象から除く。**本文送出の全面的な抑止手段ではない**:
             system instructions は接頭辞付きキー（`gen_ai.input.messages.0.*`）で送出され、
