@@ -127,11 +127,35 @@ YAML の未知キー（`allowed_tool:` のような typo）は読み込み時に
 検証する。`audit_sink=` に `record(agent_id, action, decision, details=None)` を持つ任意
 オブジェクトを DI して出力先を差し替えられる（env 参照は持たない・引数 DI のみ）。
 
+## 強制点は 2 つ（`spec.tools` と MCP）
+
+`spec.tools` の `FunctionTool` は build 時に実行本体（`on_invoke_tool`）をラップして評価する。
+`spec.mcp_servers` 経由の MCP ツールは SDK が **run 時**（ターンごと）に解決するため build 時の
+ラップ対象が存在せず、装着した `AgentHooks.on_tool_start` で評価する。宣言は同じ
+`allowed_tools` / `blocked_patterns` で足り、ポリシーの規約は 1 本のまま
+（`05_mcp_tool_governance.py` 参照）。
+
+MCP 経路の非対称（利用者が観測しうる差）:
+
+- MCP の deny は `on_tool_start` からの送出で合成チェーンを中断するため、**利用者の
+  `spec.hooks.on_tool_start` へ到達しない**（`spec.tools` の deny は実行本体のラップで弾くため
+  到達する）。利用者フックで監査・計測している場合は観測が欠ける。
+- MCP の deny は run を `UserError` で終了させる。MCP ツール自身の実行時例外が
+  `mcp_config["failure_error_function"]` でモデルへ文字列返却され会話が継続するのとは挙動が違う。
+- `tool:` レコードの `agent_id` は宣言時の `spec.name`、`tool_start:` は runtime の `agent.name`。
+- `allowed_tools` は名前照合で、MCP ツールの実体はターンごとに再解決される。同名のまま
+  schema / 意味だけ差し替える変更は検知しない（`mcp_config["include_server_in_tool_names"]` で
+  サーバ単位に名前空間を分けると識別しやすい。真にした場合は `allowed_tools` の宣言も
+  `mcp_{サーバ名}__{ツール名}` へ追随する）。
+
 ## 既知の境界（govern 対象外）
 
 - `sub_agents` の as_tool は registry が build 後に注入するため、per-call の allow / deny 評価・
   決定記録の対象外（hooks の `tool_start` / `tool_end` 記録のみ。サブエージェント自身の内部
   `FunctionTool` は同 builder 経由で govern 済み）。
+- **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行され
+  `on_tool_start` が発火しないため、評価も監査も発生しない。統治されるのは client-side MCP
+  （`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
 - `register_factory` 経路は builder を通らないため govern 対象外。
 - hosted tool 等の非 `FunctionTool` は素通し（ポリシー強制境界は関数ツールの呼び出し）。
 - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより先に
@@ -147,6 +171,7 @@ YAML の未知キー（`allowed_tool:` のような typo）は読み込み時に
 | `02_audit_log.py` | 複数エージェントでの既定 sink 共有（1 本のチェーン）・`audit_sink` プロパティ・`verify_chain()`・利用者 hooks との合成。ポリシーはオブジェクト形 |
 | `03_per_agent_policy.py` | per-agent ポリシー（overrides）。同一ツールのエージェント別 allow / deny の出し分け・既定へのフォールバック・`unapplied_overrides` での typo 検知。ポリシーはコード（オブジェクト）形 |
 | `04_policy_bundle.py` | bundle YAML（`from_yaml`）。既定 + per-agent の制限を 1 ファイルに宣言し、コード側は参照 1 行 |
+| `05_mcp_tool_governance.py` | MCP サーバ経由のツールにも同じ `allowed_tools` を効かせる。run 時解決ツールの allow / deny と `tool:{name}` 監査（同梱の最小 MCP サーバ `examples/mcp/_server.py` を stdio で自動起動） |
 | `policies/support.yaml` | 単一ポリシー定義の例（`01_policy_enforcement.py` が読む） |
 | `policies/governance.yaml` | bundle 定義の例（`04_policy_bundle.py` が読む） |
 
