@@ -18,13 +18,20 @@ MCP 経路は統治が fail-open（origin が MCP でなければ素通し）な
 生成物を使って origin 付与 / 公開名 / 実例外の文字列化を pin し、`agents.tool.
 get_function_tool_origin` の存在・`ToolOriginType` のメンバ集合・`on_tool_start` に渡る
 `tool_arguments: str` も併せてトリップワイヤ化する（実 SDK 生成物が監査フックで実際に評価される
-ことも deny / allow 両方向で固定する）。
+ことも deny / allow 両方向で固定する）。さらに宣言 `spec.mcp_servers` から SDK の run 時解決を経て
+run loop が `on_tool_start` へ dispatch するまでの結合部を実 Runner で通し、deny / allow と
+`include_server_in_tool_names` による SDK 生成の照合名（base 名 `mcp_{サーバ名}__{ツール名}` が
+そのまま公開名になる単純分岐と、SDK が置換・切り詰め + ハッシュ付与を行う変形分岐の両方）を
+pin する（SDK が MCP を専用 dispatch へ移す退行を、build 後注入ベースのテストでは検知できない
+ため）。build 後に `Agent.hooks` を差し替えたとき MCP 経路の強制と監査がともに失われ、`spec.tools`
+経路は強制と per-call の `tool:` レコードが残るという非対称も併せて固定する。
 """
 
 from __future__ import annotations
 
 import dataclasses
 import inspect
+import re
 import warnings
 from typing import Any
 
@@ -50,6 +57,7 @@ from openai_agents_trust import AuditLog, GovernancePolicy  # noqa: E402
 
 from oai_agentspec import AgentRegistry, AgentSpec, function_tool  # noqa: E402
 from oai_agentspec._adapters import govern_spec, new_audit_sink  # noqa: E402
+from oai_agentspec._adapters import governance as governance_module  # noqa: E402
 from oai_agentspec._adapters.governance import _make_audit_hooks  # noqa: E402
 from oai_agentspec.runtime.governance import GovernedAgentBuilder  # noqa: E402
 
@@ -663,16 +671,25 @@ class _StubMCPServer(MCPServer):
     「SDK 既定の `failure_error_function` が効く」という B5 の pin 対象そのものを偽装してしまう）。
     """
 
-    def __init__(self, name: str = "srv", *, fail_with: Exception | None = None) -> None:
-        """サーバー名と `call_tool` の失敗挙動を設定する。
+    def __init__(
+        self,
+        name: str = "srv",
+        *,
+        fail_with: Exception | None = None,
+        tools: list[MCPTool] | None = None,
+    ) -> None:
+        """サーバー名と `call_tool` の失敗挙動 / 公開ツール一覧を設定する。
 
         Args:
             name: `ToolOrigin.mcp_server_name` に載るサーバー名。
             fail_with: `call_tool` が送出する例外（None なら空結果を返す）。
+            tools: `list_tools` が返す MCP ツール一覧（None なら空。SDK が run 時に
+                `spec.mcp_servers` から解決する経路を通す e2e で指定する）。
         """
         super().__init__()
         self._name = name
         self._fail_with = fail_with
+        self._tools: list[MCPTool] = list(tools) if tools else []
         self.calls: list[tuple[str, Any]] = []
 
     @property
@@ -687,8 +704,12 @@ class _StubMCPServer(MCPServer):
         """後始末は行わない（no-op）。"""
 
     async def list_tools(self, run_context: Any = None, agent: Any = None) -> list[MCPTool]:
-        """ツール一覧は空を返す（本テストは `to_function_tool` を直接呼ぶ）。"""
-        return []
+        """コンストラクタで受けたツール一覧を返す（既定は空）。
+
+        既定の空は `to_function_tool` を直接呼ぶトリップワイヤ向け。`tools` を渡した場合は
+        SDK の run 時解決（`Agent.get_all_tools`）がこの一覧から `FunctionTool` を組む。
+        """
+        return list(self._tools)
 
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any] | None, meta: dict[str, Any] | None = None
@@ -710,12 +731,17 @@ class _StubMCPServer(MCPServer):
         raise NotImplementedError
 
 
+def _mcp_tool(name: str) -> MCPTool:
+    """MCP サーバーが公開するツール宣言（引数なしの最小 `inputSchema`）を作る。"""
+    return MCPTool(name=name, inputSchema={"type": "object"})
+
+
 def _real_mcp_function_tool(
     server: _StubMCPServer, *, tool_name: str = "read", name_override: str | None = None
 ) -> FunctionTool:
     """実 SDK の `MCPUtil.to_function_tool` で MCP 由来 `FunctionTool` を生成する。"""
     return MCPUtil.to_function_tool(
-        MCPTool(name=tool_name, inputSchema={"type": "object"}),
+        _mcp_tool(tool_name),
         server,
         False,
         tool_name_override=name_override,
@@ -729,6 +755,10 @@ def test_sdk_get_function_tool_origin_import_tripwire() -> None:
     サブモジュールから import している）、改名・移動が起きうる。消滅すれば import 時に落ちて
     気付けるが、**改名で別名が増えたのに旧名も残る**場合は静かに古い契約を見続けることに
     なるため、存在そのものを pin する。
+
+    併せて `_adapters/governance.py` が束縛している実体が SDK の関数そのもの（同一オブジェクト）で
+    あることも pin する。自前フォールバック実装や等価ラッパへの差し替えが混入すると、SDK 側の
+    origin 判定ロジックの変更から静かに乖離し MCP の positive 判定が崩れるため identity で検知する。
     """
     origin_getter = getattr(sdk_tool, "get_function_tool_origin", None)
     assert callable(origin_getter), (
@@ -736,8 +766,16 @@ def test_sdk_get_function_tool_origin_import_tripwire() -> None:
         "_adapters/governance.py の import と _AuditAgentHooks.on_tool_start の origin 判定を"
         "追従させること（MCP 由来ツールの positive 判定が成立しなくなる）。"
     )
-    # `_adapters/governance.py` が束縛しているのと同一オブジェクトであること（別実装の混入検知）。
-    assert origin_getter is get_function_tool_origin
+    # `_adapters/governance.py` が束縛している実体が SDK の関数そのものであること
+    # （自前フォールバック実装・別シンボルへの差し替えが混入したら検知する）。本テストファイル冒頭
+    # の `from agents.tool import get_function_tool_origin`（モジュールグローバルの
+    # `get_function_tool_origin`）と比較しても両辺が `agents.tool` の同一属性を指すため恒真になる。
+    # よって governance モジュール側の束縛（`governance_module` 経由）を参照する。
+    assert governance_module.get_function_tool_origin is sdk_tool.get_function_tool_origin, (
+        "_adapters/governance.py が束縛する get_function_tool_origin が SDK の関数そのもので"
+        "なくなった（自前フォールバック実装 / 別シンボルへの差し替えの混入）。"
+        "MCP 由来ツールの origin 判定が SDK の実装から乖離するため追従させること。"
+    )
 
 
 def test_sdk_tool_origin_type_member_set_tripwire() -> None:
@@ -910,3 +948,318 @@ async def test_sdk_mcp_function_tool_wraps_errors_into_result_tripwire() -> None
     )
     assert "stub mcp failure" in result
     assert server.calls == [("read", {})]  # 実 MCP 呼び出しは 1 回だけ走った
+
+
+# ----------------------------------------------------------------------
+# D 群: 宣言 `spec.mcp_servers` -> SDK の run 時解決 -> run loop の `on_tool_start` dispatch
+#
+# 他の MCP テストは build 後の `agent.tools.append` 注入か `on_tool_start` の直接呼び出しで、
+# 宣言から run 時解決までの結合部を 1 本も通らない。SDK が MCP ツールを専用 dispatch へ移す
+# （`on_tool_start` を発火させない）退行が起きても、fail-open のため全テスト緑のまま統治だけが
+# 消えるため、実 Runner で結合部ごと固定する。
+# ----------------------------------------------------------------------
+
+
+def _mcp_server_with_read(name: str = "srv") -> _StubMCPServer:
+    """`read` ツール 1 本を公開するスタブ MCP サーバーを作る（run 時解決の入力）。"""
+    return _StubMCPServer(name=name, tools=[_mcp_tool("read")])
+
+
+def _governed_registry(policy: GovernancePolicy, sink: AuditLog) -> AgentRegistry:
+    """`GovernedAgentBuilder` を差した registry を作る。"""
+    return AgentRegistry(agent_builder=GovernedAgentBuilder(policy=policy, audit_sink=sink))
+
+
+async def test_declared_mcp_server_tool_deny_end_to_end() -> None:
+    """D1: 宣言 `mcp_servers` の run 時解決ツールを deny し、MCP 呼び出しごと止める。
+
+    `spec.mcp_servers` -> SDK の run 時解決 -> run loop の `on_tool_start` dispatch という結合部
+    を実 Runner で通す（build 後注入もフック直呼びもしない）。deny は `UserError` として run を
+    終了させ（`__cause__` に `PolicyViolationError`）、MCP サーバーの `call_tool` へは 1 度も
+    到達しないこと・監査列が厳密に `agent_start` / `tool_start` / `tool` deny の 3 件であることを
+    固定する（`tool_end` / `agent_end` が続かない = run が継続していない証跡）。
+    """
+    server = _mcp_server_with_read()
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), sink)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("unreached")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+    agent = reg.get("bot")
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(agent, input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError), (
+        "宣言 mcp_servers 経路の deny が PolicyViolationError を原因として着地しない。"
+        f" 実際の __cause__: {excinfo.value.__cause__!r}"
+    )
+    assert server.calls == [], "deny なのに MCP サーバーの call_tool へ到達した（統治の抜け）。"
+    assert [(e.action, e.decision) for e in sink.get_entries()] == [
+        ("agent_start", "allow"),
+        ("tool_start:read", "allow"),
+        ("tool:read", "deny"),
+    ], (
+        "宣言 mcp_servers 経路で on_tool_start が発火しなくなった可能性がある"
+        "（SDK が MCP ツールを専用 dispatch へ移すと fail-open で統治が消える）。"
+    )
+
+
+async def test_declared_mcp_server_tool_allow_end_to_end() -> None:
+    """D2: 宣言 `mcp_servers` の run 時解決ツールを allow し、MCP サーバーまで到達させる。
+
+    D1（deny）だけでは「常に deny」変異と区別できないため、同一経路で allow が素通り、
+    `call_tool` へツール名と引数の両方が渡ることを固定する。監査列は allow 経路の 5 件
+    （`agent_start` / `tool_start` / `tool` / `tool_end` / `agent_end`）を厳密比較する。
+    """
+    server = _mcp_server_with_read()
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["read"]), sink)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+    agent = reg.get("bot")
+
+    await Runner.run(agent, input="go")
+
+    assert server.calls == [("read", {"q": "x"})], (
+        "allow なのに MCP サーバーへツール名 / 引数がそのまま渡っていない。"
+        f" 実際の呼び出し: {server.calls!r}"
+    )
+    assert [(e.action, e.decision) for e in sink.get_entries()] == [
+        ("agent_start", "allow"),
+        ("tool_start:read", "allow"),
+        ("tool:read", "allow"),
+        ("tool_end:read", "allow"),
+        ("agent_end", "allow"),
+    ]
+
+
+async def test_declared_mcp_server_tool_name_prefixed_by_sdk_end_to_end() -> None:
+    """D3: `include_server_in_tool_names` の照合名を SDK に生成させて両方向を固定する。
+
+    既存トリップワイヤは `tool_name_override` をテスト側から渡しており SDK の prefix 生成
+    （`agents/mcp/util.py` の private ヘルパ）を 1 度も通らない。ここでは
+    `mcp_config={"include_server_in_tool_names": True}` を宣言して SDK に名前を生成させ、
+    prefix 付き名（`mcp_srv__read`）で allow・prefix 前の名前（`read`）で deny という 2 方向を
+    pin する（片方だけでは prefix が付いていること自体を固定できない）。SDK 側で形式が変われば
+    利用者の `allowed_tools` が全不一致 = 全 deny（機能停止）になるため検知が必須。
+
+    本テストが固定するのは `mcp_{サーバ名}__{ツール名}`（base 名）がそのまま公開名になる**単純
+    分岐**、すなわち base 名が ASCII 英数字 / `_` / `-` のみで構成され、SDK の長さ上限以内で、
+    同一解決バッチ内の他ツール名や `spec.tools` の名前と衝突しない場合の形式である。それ以外の
+    場合は SDK が置換・切り詰め・ハッシュ付与を行う（変形分岐は D4 で別途 pin する）。
+    """
+    allow_server = _mcp_server_with_read()
+    allow_sink = AuditLog()
+    allow_reg = _governed_registry(
+        GovernancePolicy(name="p", allowed_tools=["mcp_srv__read"]), allow_sink
+    )
+    allow_model = FakeModel().queue_tool_call("mcp_srv__read", '{"q": "x"}').queue_text("done")
+    allow_reg.register(
+        AgentSpec(
+            name="bot",
+            instructions="i",
+            model=allow_model,
+            mcp_servers=[allow_server],
+            mcp_config={"include_server_in_tool_names": True},
+        )
+    )
+
+    await Runner.run(allow_reg.get("bot"), input="go")
+
+    assert [tool.name for tool in allow_model.calls[0].tools] == ["mcp_srv__read"], (
+        "単純分岐（ASCII 英数字のみ・長さ上限以内・非衝突）でも SDK が生成する MCP ツールの"
+        "公開名が mcp_{サーバ名}__{ツール名} でなくなった。"
+        "allowed_tools の宣言形式に関する記述（spec.py / _adapters/governance.py / docs）が"
+        "全て不一致になり全 deny へ化けるため追従が必須。"
+        f" 実際の名前: {[tool.name for tool in allow_model.calls[0].tools]!r}"
+    )
+    assert [(e.action, e.decision) for e in allow_sink.get_entries()] == [
+        ("agent_start", "allow"),
+        ("tool_start:mcp_srv__read", "allow"),
+        ("tool:mcp_srv__read", "allow"),
+        ("tool_end:mcp_srv__read", "allow"),
+        ("agent_end", "allow"),
+    ]
+    # MCP サーバーへ渡るのは prefix 前のツール名（prefix は SDK 側の公開名だけに載る）。
+    assert allow_server.calls == [("read", {"q": "x"})]
+
+    deny_server = _mcp_server_with_read()
+    deny_sink = AuditLog()
+    deny_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["read"]), deny_sink)
+    deny_model = FakeModel().queue_tool_call("mcp_srv__read", '{"q": "x"}').queue_text("unreached")
+    deny_reg.register(
+        AgentSpec(
+            name="bot",
+            instructions="i",
+            model=deny_model,
+            mcp_servers=[deny_server],
+            mcp_config={"include_server_in_tool_names": True},
+        )
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(deny_reg.get("bot"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert deny_server.calls == []
+    assert [(e.action, e.decision) for e in deny_sink.get_entries()] == [
+        ("agent_start", "allow"),
+        ("tool_start:mcp_srv__read", "allow"),
+        ("tool:mcp_srv__read", "deny"),
+    ], (
+        "prefix 前の名前（read）が allowlist にあるだけで許可された"
+        "（照合対象が SDK 解決後の公開名でなくなった可能性）。"
+    )
+
+
+async def test_declared_mcp_server_tool_name_transformed_by_sdk_end_to_end() -> None:
+    """D4: SDK が公開名を変形する分岐（非英数字置換 / 長さ超過ハッシュ）を宣言経路で固定する。
+
+    D3 が固定するのは base 名（`mcp_{サーバ名}__{ツール名}`）がそのまま公開名になる単純分岐だけ。
+    SDK は `include_server_in_tool_names` の名前解決で (1) ASCII 英数字 / `_` / `-` 以外を `_` へ
+    置換し前後の `_-` を strip し、(2) base 名が長さ上限を超える場合は切り詰めて sha1 先頭 8 桁を
+    付ける（同一解決バッチ内での base 名重複・`spec.tools` の名前との衝突では短い名前でもハッシュ
+    が付く）。この分岐に入ると `allowed_tools=["mcp_<サーバ名>__<ツール名>"]` は全不一致になり当該
+    MCP ツールが常時 deny になる（fail-closed なので安全側だが機能停止）。既存テストは緑のままな
+    ので、変形が起きること自体をトリップワイヤ化する。
+
+    private ヘルパ（`_build_prefixed_tool_base_name` 等）は直接呼ばず、宣言 `mcp_servers` から SDK
+    の run 時解決へ至る公開経路で pin する。ハッシュ値そのものは seed 構成の変更で無意味に赤くなる
+    ため固定せず、「base 名と異なる」「長さ上限以下」「`_` + 16 進 8 桁で終わる」の 3 点で固定する。
+    """
+    # SDK の `_MCP_FUNCTION_TOOL_NAME_MAX_LENGTH`（private 定数のため参照せず値を持つ）。
+    max_length = 64
+
+    # (1) 非英数字置換: サーバ名の `.` が `_` へ置換され、その公開名が照合対象になる。
+    dotted_server = _mcp_server_with_read("my.srv")
+    dotted_sink = AuditLog()
+    dotted_reg = _governed_registry(
+        GovernancePolicy(name="p", allowed_tools=["mcp_my_srv__read"]), dotted_sink
+    )
+    dotted_model = FakeModel().queue_tool_call("mcp_my_srv__read", '{"q": "x"}').queue_text("done")
+    dotted_reg.register(
+        AgentSpec(
+            name="bot",
+            instructions="i",
+            model=dotted_model,
+            mcp_servers=[dotted_server],
+            mcp_config={"include_server_in_tool_names": True},
+        )
+    )
+
+    await Runner.run(dotted_reg.get("bot"), input="go")
+
+    assert [tool.name for tool in dotted_model.calls[0].tools] == ["mcp_my_srv__read"], (
+        "SDK の公開名生成が変わった（ASCII 英数字 / _ / - 以外を _ へ置換しなくなった）。"
+        "allowed_tools の宣言形式に関する docstring / docs の記述"
+        "（src/oai_agentspec/spec.py / _adapters/governance.py /"
+        " docs/usage/safety/governance.md 等）を追随させること。"
+        f" 実際の名前: {[tool.name for tool in dotted_model.calls[0].tools]!r}"
+    )
+    # 置換後の公開名で allow 照合が成立し、MCP サーバーへは prefix 前の名前が渡る。
+    assert dotted_server.calls == [("read", {"q": "x"})]
+    assert [(e.action, e.decision) for e in dotted_sink.get_entries()] == [
+        ("agent_start", "allow"),
+        ("tool_start:mcp_my_srv__read", "allow"),
+        ("tool:mcp_my_srv__read", "allow"),
+        ("tool_end:mcp_my_srv__read", "allow"),
+        ("agent_end", "allow"),
+    ]
+
+    # (2) 長さ超過: base 名が上限超のとき公開名は切り詰め + ハッシュ付きへ変形される。
+    long_server_name = "my-very-long-mcp-server-name-for-testing"
+    long_tool_name = "read_file_with_an_extremely_long_tool_name_for_testing"
+    base_name = f"mcp_{long_server_name}__{long_tool_name}"
+    assert len(base_name) > max_length  # 前提: 上限超過分岐へ入る base 名であること
+    long_server = _StubMCPServer(name=long_server_name, tools=[_mcp_tool(long_tool_name)])
+    long_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), AuditLog())
+    long_model = FakeModel().queue_text("done")
+    long_reg.register(
+        AgentSpec(
+            name="bot",
+            instructions="i",
+            model=long_model,
+            mcp_servers=[long_server],
+            mcp_config={"include_server_in_tool_names": True},
+        )
+    )
+
+    await Runner.run(long_reg.get("bot"), input="go")
+
+    resolved = [tool.name for tool in long_model.calls[0].tools]
+    assert len(resolved) == 1
+    public_name = resolved[0]
+    follow_up = (
+        "SDK の公開名生成が変わった。allowed_tools の宣言形式に関する docstring / docs の記述"
+        "（src/oai_agentspec/spec.py / _adapters/governance.py /"
+        " docs/usage/safety/governance.md 等）を追随させること。"
+    )
+    assert public_name != base_name, (
+        f"{follow_up} 長さ上限超の base 名が変形されず公開名になっている: {public_name!r}"
+    )
+    assert len(public_name) <= max_length, (
+        f"{follow_up} 公開名が長さ上限（{max_length}）へ切り詰められていない:"
+        f" {public_name!r}（{len(public_name)} 文字）"
+    )
+    assert re.search(r"_[0-9a-f]{8}\Z", public_name) is not None, (
+        f"{follow_up} 公開名の末尾がハッシュ（_ + 16 進 8 桁）でない: {public_name!r}"
+    )
+
+
+async def test_agent_hooks_replacement_drops_mcp_enforcement_not_spec_tools() -> None:
+    """D5: build 後に `Agent.hooks` を差し替えると MCP 経路の強制だけが失われる（境界 (12)）。
+
+    `Agent.hooks` の差し替え（`clone(hooks=...)` 含む）は SDK の公開 API なので利用者が到達しうる。
+    MCP 由来ツールの強制はフック（`on_tool_start`）にしか無いため差し替えで消え、`spec.tools` は
+    実行本体のラップが tool オブジェクト自身へ焼き込まれるため残る。この非対称は意図したもので、
+    利用者が差し替えたときの挙動を固定するためにここで pin する（差し替えを推奨するものではない。
+    フックを足したい場合は `spec.hooks` へ宣言して builder に合成させる）。両方向を 1 本で固定する
+    （片方だけでは非対称そのものを固定できない）。
+    """
+    # (a) MCP 経路: 差し替えで強制が消え、deny すべき呼び出しが MCP サーバーへ到達する。
+    mcp_server = _mcp_server_with_read()
+    mcp_sink = AuditLog()
+    mcp_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), mcp_sink)
+    mcp_model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    mcp_reg.register(
+        AgentSpec(name="bot", instructions="i", model=mcp_model, mcp_servers=[mcp_server])
+    )
+    mcp_agent = mcp_reg.get("bot")
+    mcp_agent.hooks = None  # 利用者による差し替え（監査フックの合成チェーンごと捨てる）
+
+    await Runner.run(mcp_agent, input="go")
+
+    assert mcp_server.calls == [("read", {"q": "x"})], (
+        "hooks 差し替え後も MCP 経路の強制が残っている（境界 (12) の前提が変わった）。"
+        "_adapters/governance.py の govern_spec 境界 (12) と"
+        " runtime/governance/builder.py の記述を追随させること。"
+        f" 実際の呼び出し: {mcp_server.calls!r}"
+    )
+    assert mcp_sink.get_entries() == []  # フック由来の記録も一切残らない
+
+    # (b) `spec.tools` 経路: 同一の差し替えでも build 時ラップによる deny と `tool:` 記録は残る。
+    invoked: list[str] = []
+    tool_sink = AuditLog()
+    tool_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), tool_sink)
+    tool_model = FakeModel().queue_tool_call("echo", '{"text": "nope"}').queue_text("unreached")
+    tool_reg.register(
+        AgentSpec(
+            name="bot", instructions="i", model=tool_model, tools=[_make_tool(invoked, "echo")]
+        )
+    )
+    tool_agent = tool_reg.get("bot")
+    tool_agent.hooks = None
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(tool_agent, input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError), (
+        "hooks 差し替えで spec.tools 経路の強制まで失われた"
+        "（build 時ラップが tool 自身へ焼き込まれる前提が壊れた）。"
+        f" 実際の __cause__: {excinfo.value.__cause__!r}"
+    )
+    assert invoked == []  # 実関数へは到達しない
+    # per-call の `tool:` レコードはラップ内で記録されるため残る（消えるのはフック由来の記録のみ）。
+    assert [(e.agent_id, e.action, e.decision) for e in tool_sink.get_entries()] == [
+        ("bot", "tool:echo", "deny"),
+    ]
