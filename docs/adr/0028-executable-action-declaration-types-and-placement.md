@@ -115,11 +115,11 @@ import すると `slots.py -> _models.py -> slots.py` の循環が生じる。�
 
    > `lockdown()`（の段 2 `_preload`）を通した `PromptStore` に対して、**manifest に未掲載の
    > セグメント**（= `_cache` に載っていないセグメント）を `prompt` が要求した場合に限り、
-   > `catalog.validate()` は集約 `ValueError` ではなく `PromptTemplateIntegrityError` を
+   > `planner.validate()` は集約 `ValueError` ではなく `PromptTemplateIntegrityError` を
    > 送出する。manifest 掲載済みのセグメントは lockdown 後も `_cache` から解決され、検証は通常どおり
    > 完了する。
 
-   運用上は `catalog.validate()` を `lockdown()` の**前**に呼ぶことを推奨とする。曖昧一致は
+   運用上は `planner.validate()` を `lockdown()` の**前**に呼ぶことを推奨とする。曖昧一致は
    `PromptResolutionError` として捕捉され、「解決できないセグメント」の集約 `ValueError` に含まれる。
 6. **既定マージ解決は `actions.py` のモジュールレベル純関数 3 件へ一元化する**
    （`resolve_prompt` / `resolve_prompt_vars` / `resolve_on_invalid_slot`）。catalog と spec の

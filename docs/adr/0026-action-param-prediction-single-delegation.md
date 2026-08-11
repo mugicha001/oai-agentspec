@@ -34,14 +34,14 @@
 4. **押下後の実行まで面倒を見る実行ヘルパー（`run_action(plan, ...)`）を足す（却下）**:
    逸脱が 5 例目に増える。実行は `Runner.run(registry.get(plan.action_agent), input=plan.input_json)`
    の 1 行で書けるため、逸脱を増やして得られるものが小さい。
-5. **`ActionCatalog.plan()` の内部でパラメータ予測を 1 ターンあたり 1 回だけ駆動する（採用）**:
+5. **`ActionPlanner.plan()` の内部でパラメータ予測を 1 ターンあたり 1 回だけ駆動する（採用）**:
    不足パラメータを持つ候補が 1 件でもあるときに限り、全候補・全不足パラメータを 1 本の
    プロンプトへ合成して `Runner.run` を 1 回だけ駆動する。不足が無ければ 0 回、`predict=False`
    なら 0 回。
 
 ## Decision
 
-build-don't-run の逸脱に `ActionCatalog.plan()` 内のパラメータ予測を 4 例目として加え、逸脱範囲を
+build-don't-run の逸脱に `ActionPlanner.plan()` 内のパラメータ予測を 4 例目として加え、逸脱範囲を
 次のとおり限定する。
 
 - 駆動するのは 1 ターンあたり `Runner.run` **ちょうど 1 回**であり、候補件数・不足パラメータ件数に

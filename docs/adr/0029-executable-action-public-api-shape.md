@@ -1,4 +1,4 @@
-# 0029: 実行可能アクションの公開 API 形（明示コンストラクタ + `bind` + `plan` + `Slot` 1 型）
+# 0029: 実行可能アクションの公開 API 形（明示コンストラクタ + `bind` が返す `ActionPlanner` + `Slot` 1 型）
 
 - Status: accepted
 - Date: 2026-08-11
@@ -34,12 +34,18 @@
    送出され、無症状にはならないことを確認した。
 
 マーカー（`from_context()` / `predicted()`）も導入しない。`param(..., from_context=(...),
-by_agent=True, ...)` のキーワード引数形で足りる。
+by_llm=True, ...)` のキーワード引数形で足りる。
 
 ### 結線の渡し方
 
 `registry` / `prompts` / `guardrail_registry` / 候補の出どころ / 不足の埋め方という 3 つの関心事が
 混ざる。平坦な引数列にすると「どれがどの目的の部品か」が呼び出し側から読み取れない。
+
+結線の保持先も 2 案を比較した。当初案は「`bind()` が `ActionCatalog` 自身を変異させ、以降の
+`validate()` / `plan()` が catalog のメソッドとして結線を読む」形だった。この形は
+「`bind()` を呼ばずに `plan()` / `validate()` を呼ぶと `RuntimeError`」という実行時検査を
+必要とし、呼び出し順を誤ると実行時まで結線漏れが検出されない。また「`bind()` を 2 回呼んだら
+どうなるか」という意味論（上書きか・エラーか）を別途定義する必要が残っていた。
 
 予測エージェントについては、当初「利用者がエージェントの実体を渡す」形も検討した。しかし
 本ライブラリの原則は「利用者は `AgentSpec` を宣言し、実体は registry が遅延構築する」であり、
@@ -72,6 +78,14 @@ by_agent=True, ...)` のキーワード引数形で足りる。
 契約していた。利用者が接頭辞を切り出すコードを書く必要があり、実際にレビュー工程で
 `s.origin.startswith("user:")` が `origin is None` の状態で `AttributeError` になる誤りが 1 度発生した。
 
+### 用語の不統一
+
+「LLM で値を埋める」という 1 つの概念が、宣言 `param(..., by_agent=True)`・結線 `llm_filler`・
+値の出どころ `Origin.AGENT`・スロット状態 `SlotState.NEEDS_AGENT` と複数の名前で呼ばれていた。
+さらに `agent` という語は本ライブラリでは `action_agent`（実行エージェント）・
+`action_next_turn_agent`（次ターンの窓口）という別概念を既に指しており、`by_agent` が
+「実行エージェントが埋める」と誤読される余地があった。
+
 ### 却下した中間案
 
 - decorator を採る案（宣言 decorator あり・パラメータのみ明示の中間形を含む）。
@@ -83,6 +97,19 @@ by_agent=True, ...)` のキーワード引数形で足りる。
 - 候補列を直接受け取る引数（`plan(query, candidates=...)`）を足す案。候補の出どころが 2 つになり、
   allowlist 除外・WARNING の経路が分岐する。自作ランキング結果を渡したい利用者は
   `CandidateGenerator` Protocol を数行で実装すればよい。
+- catalog 変異型 `bind`（`catalog.bind(...)` が catalog を変異させ、`validate()` / `plan()` を
+  catalog のメソッドに置く案）。却下理由: (a) 本設計は「実行時検査より、間違いを構造的に不可能に
+  する」を一貫原則としており（連結文字列の enum 化・`from_user` の導出・予測エージェントの内製化が
+  同じ方向）、API の入口だけが「順序を誤ると実行時 `RuntimeError`」という実行時検査に依存するのは
+  原則の不徹底である。結線済みオブジェクトを返す形なら、未結線の `plan()` は「呼べない」
+  （`ActionCatalog` にメソッドが存在しない）。(b) 前例として引いていた `AgentRegistry` は DI を
+  **コンストラクタ**で受けており（`registry.py:50-55`）、後から変異させるメソッドではない。
+  前例はむしろ「結線を受けた不変オブジェクトが仕事をする」形を支持する。(c) 結線済みオブジェクトを
+  返す形なら、テストで同じ宣言簿を別結線（別 registry・別 generator）で使い回せる。
+  「`bind()` を 2 回」の意味論も「独立した結線オブジェクトが 2 つできる」という自明な形に解ける。
+  frozen と `validate()` 実行済みフラグ（`plan()` 初回の自動 validate を 1 度にする仕組み）の
+  両立は pydantic の private attribute（公開フィールドに現れない可変キャッシュ）で成立することを
+  実測で確認した。
 - 押下後の実行まで面倒を見る実行ヘルパー（`run_action(plan, ...)`）。build-don't-run の逸脱が
   5 例目に増える（ADR 0026 で 4 例目に増やす判断と同じターンでもう 1 件増やすのは原則の空洞化）。
   実行は 1 行で書ける。
@@ -95,14 +122,29 @@ by_agent=True, ...)` のキーワード引数形で足りる。
 
 1. **宣言は明示コンストラクタ（`ActionSpec` + `param`）を維持し、decorator を採らない。**
    上記のコスト 2 件を受け入れる。
-2. **結線は `ActionCatalog.bind` へ一元化し、関心事ごとの frozen 宣言型へ分ける。**
+2. **結線は `ActionCatalog.bind` へ一元化し、`bind` は catalog を変異させず frozen な結線済み
+   オブジェクト `ActionPlanner` を返す。関心事は frozen 宣言型へ分ける。**
    シグネチャは `bind(*, registry, prompts=None, guardrail_registry=None, candidates=None,
    llm_filler=None)` の 5 引数で、`CandidateSource`（`generator` / `context_builder` /
    `history_limit`）と `LLMFiller`（`model` / `on_invalid_response` / `guardrails`）が関心事を
-   束ねる。前例は `AgentRegistry.__init__(agent_builder=...)` と、既存の
-   `SessionPolicy` / `CompactionConfig` / `IntentPolicy` / `NextTurnPolicy` である。`bind` は
-   DI 対象を保持するだけで実行しない。両宣言型の検証（`context_builder` と `history_limit` の
-   排他・`on_invalid_response` の `Literal`）は各型の validator が持ち、`bind` まで持ち越さない。
+   束ねる。前例は `AgentRegistry.__init__(agent_builder=...)`（DI をコンストラクタで受け、
+   受けた後は変異させない）と、既存の `SessionPolicy` / `CompactionConfig` / `IntentPolicy` /
+   `NextTurnPolicy` である。`bind` は DI 対象と bind 時点の宣言簿スナップショットを
+   `ActionPlanner` へ載せるだけで実行しない。両宣言型の検証（`context_builder` と
+   `history_limit` の排他・`on_invalid_response` の `Literal`）は各型の validator が持ち、
+   `bind` まで持ち越さない。
+   - **(0) `ActionCatalog` は純粋な宣言簿に戻る。** 公開メソッドは `register` / `names` /
+     `get` / `bind` の 4 つで、`validate` / `plan` は `ActionPlanner` 側の公開メソッドである。
+     未結線のまま `plan()` を呼ぶ形は構造的に存在しない（`ActionCatalog` にメソッドが無い）。
+     `bind()` を複数回呼ぶと独立した `ActionPlanner` が複数できるだけであり、bind 後の
+     `register()` は既存の `ActionPlanner` に影響しない。
+   - **(0a) 戻り値の型名は `ActionPlanner` とする。** 既存の型名は役割で名付けられており
+     （`CandidateSource` = 候補の出どころ・`LLMFiller` = 不足の埋め方・`AgentBuilder` /
+     `ContextBuilder`）、`BoundCatalog` のような「作られ方」による名前は流儀から外れる。
+     `planner.plan(query)` が生成物 `ActionPlan` と対応して読め、`ActionSpec` / `ActionCatalog` /
+     `ActionPlan` と同じ `Action` 接頭辞で族が揃う。`ActionPlanner` の frozen と `validate()`
+     実行済みフラグ（`plan()` 初回の自動 validate を 1 度に抑えるキャッシュ）の両立は、公開
+     フィールドに現れない private な可変キャッシュで実現する（実測で成立を確認済み）。
    - **(a) 予測エージェントの実体は lib が構築する。** 利用者が渡すのは `LLMFiller(model=...)` の
      `model` のみで、`runtime/intent` が `AgentSpec(name=<lib 固定名>, instructions=<合成済み>,
      model=<利用者の model>)` を宣言し、`_adapters` が実体化する。エージェント名は lib の宣言定数
@@ -119,8 +161,8 @@ by_agent=True, ...)` のキーワード引数形で足りる。
    - **(d) ガードレール発火時は SDK 例外を伝播し、`on_invalid_response="skip"` の後退を適用しない。**
      `on_invalid_response` が扱うのは「応答が壊れている」であり回復が妥当な事象だが、ガードレール
      発火は「危険な内容を検出した」安全事象であり、既定値での実行続行は宣言意図に反する。後退が
-     必要な利用者は `failsafe_call` で `catalog.plan()` を包める。
-3. **毎ターンの 3 関数を `await catalog.plan(query, *, predict=True, detail=False)` へ畳み、
+     必要な利用者は `failsafe_call` で `planner.plan()` を包める。
+3. **毎ターンの 3 関数を `await planner.plan(query, *, predict=True, detail=False)` へ畳み、
    公開シンボルから外す**（実装は各モジュールに残す）。低レベル用途は 2 引数で賄う。`predict=False`
    は予測段を実行せず（候補生成器が非 LLM なら全経路で LLM 0 回）、`detail=True` は
    `PlanResult(plans, suggestion, usage)` を返して `report` / `metadata` / 使用量を捨てない。
@@ -134,13 +176,15 @@ by_agent=True, ...)` のキーワード引数形で足りる。
    `origin` が `USER_INPUT` / `USER_CONFIRMED` のいずれかという enum 判定を利用者に書かせず、
    `origin is None` でも `False` を返すため、当初案で実際に起きた誤りが構造的に発生しない。
    次ターンでの再利用は `param(..., from_context=(...))` の宣言で表現する。
-6. **必須結線が欠けた場合の規則を 4 つ定める。** `bind()` 未呼び出しは `plan()` / `validate()` とも
-   `RuntimeError`、`candidates=None` での `plan()` は `RuntimeError`、`prompts=None` かつ
+6. **必須結線が欠けた場合の規則を 3 つ定める。** `candidates=None` で得た `ActionPlanner` の
+   `plan()` は `RuntimeError`（`validate()` だけの利用は妨げない）、`prompts=None` かつ
    セグメント宣言ありでの `validate()` は `RuntimeError`。**`llm_filler=None` のみ例外ではなく
    スキップ**とし、決定的段の結果と `ParamUsage(runs=0, ...)` を返す。`LLMFiller` を渡さないこと
    自体が「穴埋め経路を持たない構成」という利用者の明示的な意思表示であり、例外にするとその
    意思表示が使えなくなる。段階リリース（予測段の実装前でも `plan(query)` を既定引数のまま呼べる）と
-   `predict` の既定値 `True` の両立でもある。
+   `predict` の既定値 `True` の両立でもある。当初 4 つ目としてあった「`bind()` 未呼び出しの
+   `plan()` / `validate()` は `RuntimeError`」は、Decision 2 (0) により構造的に不可能となり
+   規則として不要になった。
 7. **`ActionSpec.action_agent` を改名しない。** 改名すると隣接する 2 型で同名フィールドが別物を
    指す（`spec.agent` は名前・`plan.agent` は実体）構図になる。撤回後は「`action_agent` は常に
    名前（`str`）、`agent` は registry で解決した実体」という規則が全型で一貫する。
@@ -152,6 +196,26 @@ by_agent=True, ...)` のキーワード引数形で足りる。
      UI のフォーム生成という外向きの用途があるため公開のまま残す）。`ready` / `pending` /
      `from_user` は状態集合・enum 判定の**定義**を含むため残す。
 
+8. **「LLM で値を埋める」概念の名前を `llm` へ統一する。** 宣言は `param(..., by_llm=True)`、
+   値の出どころは `Origin.LLM`、スロット状態は `SlotState.NEEDS_LLM` とする（`by_agent` /
+   `Origin.AGENT` / `NEEDS_AGENT` は採らない）。1 概念 1 名の統一に加え、`agent` という語を
+   `action_agent`（実行エージェント）系の概念へ専有させ、「実行エージェントが埋める」という
+   誤読を断つ。`NEEDS_AGENT` を揃えの対象に含めるのは、同状態が「`by_llm=True` のパラメータが
+   未充足」という同一概念の状態表現であるため（`needs_agent` 導出プロパティは既に公開面から
+   削減済みで、影響はミラーの enum 値のみ）。
+   - **(a) `Origin.LLM` の `detail` は `None` とする。** 旧 `Origin.AGENT` の `detail` は
+     予測エージェント名だったが、予測エージェントの内製化（Decision 2 (b)）により名前は
+     ライブラリ内部の固定定数となり利用者にとって情報量が無い。載せると内部定数名が
+     `model_dump(mode="json")` の公開契約へ漏れ、内部名の変更が契約変更になる。`detail` は
+     `str | None` のまま残るため、将来情報を載せる判断（例: モデル識別子）は非破壊の拡張で
+     行える（逆方向の削除は破壊的であり、YAGNI 側へ倒す）。これに伴い `Slot` validator の
+     条件 6 は「`detail` 非 `None` は `origin` が `RUN_CONTEXT` のときのみ」へ縮小する
+     （6 条件の構成自体は不変）。
+9. **`param(..., extra={})` を削除する。** 要件書の AC 120 件のいずれも `extra` を消費して
+   おらず、消費者のいない拡張口である。`LLMFiller(spec=...)` の逃げ道・`max_turns` の公開を
+   見送った Decision 2 (b) と同じ YAGNI 基準を適用する。必要になった時点での既定値付き
+   フィールド追加は非破壊で行える。
+
 現在仕様の SoT は `docs/architecture.md`（「意図予測（`runtime/intent`）」節の
 「実行可能意図の宣言と決定的スロット確定」小節）とし、本 ADR は判断・却下案のみを記録する。
 
@@ -160,6 +224,11 @@ by_agent=True, ...)` のキーワード引数形で足りる。
 - + 宣言層の書き方が明示コンストラクタ 1 つに揃い、実行関数は素の Python 関数のままでよい。
 - + 結線が 1 箇所（`bind`）に集約され、DI 注入点が読み取りやすい。`llm_filler` を渡さなければ
   穴埋め経路が存在しないことがコードから読め、従量課金の発生条件が API 形に現れる。
+- + 未結線の `plan()` / `validate()` が構造的に呼べなくなり、「bind 忘れの実行時
+  `RuntimeError`」という検査と、その検査を固定するテストが不要になる。同じ宣言簿を
+  別結線でテストに使い回せる。
+- + 「LLM で埋める」概念の名前が宣言・結線・出どころ・状態の 4 箇所で `llm` に揃い、
+  `agent` は実行エージェント系の概念だけを指す。
 - + 予測エージェントの分離（業務エージェントと別・`session` 非伝播）が構造的に保証される。
 - + 毎ターンの呼び出しが 1 行になり、順序の書き写しと「呼び忘れると永久に `ready=False`」という
   無症状の footgun が消える。
@@ -173,10 +242,13 @@ by_agent=True, ...)` のキーワード引数形で足りる。
 
 強制手段（`tests/_adapters/test_intent_adapter_l2.py` のみ既存ファイルへの追記。他は**新規作成**）:
 
-- `tests/runtime/intent/test_catalog_l1.py`: `bind` 前の `plan()` が `RuntimeError` /
-  `candidates` 未結線で `RuntimeError` / `prompts` 未結線 + セグメント宣言ありで `validate()` が
-  `RuntimeError` / `llm_filler` 未結線で予測段をスキップし `ParamUsage(runs=0, ...)` を返すこと /
-  `plan()` 初回に `validate()` が 1 度だけ走ること / `bind` が実行しないこと。
+- `tests/runtime/intent/test_catalog_l1.py`: `bind()` が frozen な `ActionPlanner` を返し
+  catalog を変異させないこと / `ActionCatalog` が `validate` / `plan` を持たないこと /
+  `bind()` 2 回で独立した `ActionPlanner` が 2 つでき、bind 後の `register()` が既存の
+  `ActionPlanner` に影響しないこと / `candidates` 未結線の `plan()` が `RuntimeError` /
+  `prompts` 未結線 + セグメント宣言ありで `validate()` が `RuntimeError` / `llm_filler` 未結線で
+  予測段をスキップし `ParamUsage(runs=0, ...)` を返すこと / `plan()` 初回に `validate()` が
+  1 度だけ走ること（frozen のまま実行済みキャッシュが機能すること） / `bind` が実行しないこと。
 - `tests/runtime/intent/test_binding_l1.py`: `CandidateSource` の排他 validator・`LLMFiller` の
   `Literal`・両型の frozen。
 - `tests/runtime/intent/test_slots_l1.py`: `Slot` の `model_validator` が 6 条件を強制すること
