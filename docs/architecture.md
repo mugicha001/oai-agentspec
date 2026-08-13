@@ -2130,6 +2130,13 @@ class GovernedAgentBuilder:
 - **拒否例外の再エクスポート**: `PolicyViolationError`（AGT 由来・isinstance 互換）は公開窓口から遅延再
   エクスポートされる（PEP 562）。窓口 import 自体は extra 未導入でも壊れず、属性アクセス時に install hint
   付き `ImportError` となる（`hasattr` / `import *` にも同例外が伝播する fail-fast 仕様）。
+  送出される `PolicyViolationError` は `details` に `tool_name` と `reason` を持つ（build 時ラップ
+  経路・run 時通常 deny・run 時 fail-closed の 3 経路共通。送出点が `_deny_tool_call` の 1 箇所に
+  集約されているため経路で差が出ない）。ツール引数は `details` に載せない（例外は画面・ログ・
+  エラーレスポンスまで運ばれうるため。引数の取得先は監査 sink）。キー集合は将来増えうるため
+  `exc.details.get(key)` で読み、完全一致に依存しない。`reason` は人間可読の説明であり機械判別の
+  ための安定キーではない（分岐に使わない）。本経路の例外は `check_result` が `None` のままである
+  （実体が入るのは `from_check_result` 経由のみ）。
 - **状態のスコープ**: 既定監査 sink・解決済みポリシー・override 適用記録は builder インスタンス単位。
   `AgentRegistry.clone()` は builder を共有するため、系（本番 / 評価等）を分けたい場合は builder を分けて
   注入する。

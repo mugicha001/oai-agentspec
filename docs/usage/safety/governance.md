@@ -4,7 +4,7 @@
 
 エージェントが「何をできるか」をツール単位のポリシーで許可 / 拒否し、決定を監査ログに残す仕組みです。`GovernedAgentBuilder` を `AgentRegistry(agent_builder=...)` に注入すると、registry の遅延構築経路を通る全 spec の tools が govern ラップされ、監査 `AgentHooks` が装着されます。`AgentSpec` / `tools` / `AgentBuilder` Protocol の宣言面は不変です。
 
-外部依存の Agent Governance Toolkit（AGT）に委譲します。ポリシー違反時は AGT 由来の `PolicyViolationError` が送出されます。
+外部依存の Agent Governance Toolkit（AGT）に委譲します。ポリシー違反時は AGT 由来の `PolicyViolationError` が送出されます。捕捉時は `exc.details.get("tool_name")` で拒否されたツール名を取得できます（SDK `Runner` 経由でラップされている場合は `exc.__cause__.details`）。
 
 ## 使い分け
 
@@ -85,6 +85,9 @@ MCP を使う場合も利用者の記述は変わりません（builder を注�
 - build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む）と、MCP 経路は強制と監査がともに失われる（`spec.tools` 経路は強制と per-call の記録が残る）。差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言する
 - deny は per-call であり、同一ターンに複数のツール呼び出しがある場合、deny 発生時点で並行実行済みの兄弟呼び出しの副作用は残る（ターン単位のロールバックではない）
 - 監査の `details` には MCP ツールの引数も全文記録される（URL / 接続情報が入りうるため `audit_sink` の永続先を考慮する）
+- 一方で**例外**の `details` には引数を含めない（`tool_name` / `reason` のみ）。引数の取得先は監査 sink であり、例外からは辿れない
+- `reason` は AGT が生成する説明文で、`allowed_tools` の全量やブロック用の正規表現パターンといった防御構成を含む。エンドユーザー向けのエラーレスポンスへそのまま載せず、`tool_name` のみを使うか定型文へ写す
+- 「引数は例外からは辿れない」は lib が能動的に載せないという意味であり、`policy` は duck typing で利用者のオブジェクトを受け入れ `reason` を文字列として透過するため、自作 policy が `reason` に引数断片を埋めた場合はその文字列が例外へ載る
 
 ## 参照
 

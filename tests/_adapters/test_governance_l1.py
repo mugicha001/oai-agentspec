@@ -28,6 +28,7 @@ from agents.tool_context import ToolContext
 from oai_agentspec._adapters.governance import (
     _evaluate_tool,
     _field_default,
+    _govern_tool,
     _load_policy,
     _make_audit_hooks,
     _require_agt,
@@ -555,7 +556,24 @@ def test_iter_decoded_strings_walks_nested_structures() -> None:
 
 
 class _DenyExc(Exception):
-    """`denied_exc` として注入する fake 拒否例外（AGT `PolicyViolationError` 相当）。"""
+    """`denied_exc` として注入する fake 拒否例外（AGT `PolicyViolationError` 相当）。
+
+    実 AGT `agent_os.exceptions.PolicyViolationError.__init__(self, message,
+    error_code=None, details=None)` と同じ引数構成に揃え、`error_code` の既定
+    （`"POLICY_VIOLATION"`）と、基底 `AgentOSError` が持つ `details or {}` の格納規則まで
+    合わせる（fake が実物から乖離すると、位置渡しへの退行を l1 が検知できなくなる）。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        error_code: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """メッセージ・エラーコード・payload を保持する。"""
+        super().__init__(message)
+        self.error_code = error_code or "POLICY_VIOLATION"
+        self.details = details or {}
 
 
 class _Sink:
@@ -884,3 +902,89 @@ async def test_allowed_mcp_tool_reaches_inner_hooks() -> None:
     await hooks.on_tool_start(_tool_ctx("mcp_read", "{}"), _Named("support"), tool)
 
     assert inner.events == ["tool_start:mcp_read"]
+
+
+# ----------------------------------------------------------------------
+# 拒否例外の構造化 payload（`details`）: 3 経路共通の契約
+# ----------------------------------------------------------------------
+
+
+async def test_deny_exception_details_carries_tool_name_and_reason() -> None:
+    """run 時フック経路の deny 例外が `tool_name` / `reason` の 2 キー payload を載せる。
+
+    メッセージ書式の完全一致 pin を同居させている。既存 deny テストの
+    `pytest.raises(..., match=...)` は `re.search` の部分一致で書式変更を検知しないため、
+    本 assert が唯一の pin である。
+    """
+    sink = _Sink()
+    tool = _origin_tool("mcp_read")
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc) as excinfo:
+        await hooks.on_tool_start(_tool_ctx("mcp_read", '{"q": "x"}'), _Named("support"), tool)
+
+    assert excinfo.value.details == {"tool_name": "mcp_read", "reason": "tool not allowed"}
+    assert str(excinfo.value) == "governance denied tool 'mcp_read': tool not allowed"
+
+
+async def test_deny_exception_details_excludes_arguments() -> None:
+    """拒否例外の payload にツール引数を載せない（機微値の置き場は監査 sink のまま）。
+
+    sentinel（接続文字列）を実際に `arguments` へ流したうえで、payload が 2 キーのままで
+    あることを dict 全体の `==` で固定する（キー名を問わない追加も、`reason` への連結混入も
+    同時に検知する）。`tool_name` と `reason` は互いに異なる文字列にし、両者の入れ替え変異も
+    同じ `==` で検知する。sentinel が sink 側には残ることを併せて固定し、「引数は sink・
+    識別子は例外」の責務分割を pin する。
+    """
+    sentinel = "postgres://user:pw@host/db"
+    arguments = f'{{"dsn": "{sentinel}"}}'
+    sink = _Sink()
+    tool = _origin_tool("mcp_write")
+    policy = _FakePolicy(tool_reason="denied by allowlist")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc) as excinfo:
+        await hooks.on_tool_start(_tool_ctx("mcp_write", arguments), _Named("support"), tool)
+
+    assert excinfo.value.details == {"tool_name": "mcp_write", "reason": "denied by allowlist"}
+    # 引数は sink 側に残る（「引数は sink・識別子は例外」の責務分割）。
+    assert sink.records[-1] == (
+        "support",
+        "tool:mcp_write",
+        "deny",
+        {"reason": "denied by allowlist", "arguments": arguments},
+    )
+
+
+async def test_deny_exception_details_on_fail_closed_path() -> None:
+    """fail-closed 経路（`tool_arguments` が非 str）の deny も同じ 2 キー payload を載せる。"""
+    sink = _Sink()
+    tool = _origin_tool("mcp_read")
+    policy = _FakePolicy()
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+
+    with pytest.raises(_DenyExc) as excinfo:
+        await hooks.on_tool_start(_ArgsCtx(None), _Named("support"), tool)
+
+    assert excinfo.value.details == {
+        "tool_name": "mcp_read",
+        "reason": "tool arguments unavailable for policy evaluation",
+    }
+
+
+async def test_deny_exception_details_on_govern_tool_path() -> None:
+    """build 時ラップ経路（`_govern_tool`）の deny も同じ 2 キー payload を載せる。"""
+    sink = _Sink()
+    invoked: list[str] = []
+    tool = _origin_tool("shell_exec", invoked=invoked)
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    governed = _govern_tool(
+        tool, policy=policy, sink=sink, denied_exc=_DenyExc, agent_name="support"
+    )
+
+    with pytest.raises(_DenyExc) as excinfo:
+        await governed.on_invoke_tool(_tool_ctx("shell_exec", '{"q": "x"}'), '{"q": "x"}')
+
+    assert excinfo.value.details == {"tool_name": "shell_exec", "reason": "tool not allowed"}
+    assert invoked == []  # 実ツール本体は実行されない
