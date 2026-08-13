@@ -4,7 +4,7 @@
 
 エージェントが「何をできるか」をツール単位のポリシーで許可 / 拒否し、決定を監査ログに残す仕組みです。`GovernedAgentBuilder` を `AgentRegistry(agent_builder=...)` に注入すると、registry の遅延構築経路を通る全 spec の tools が govern ラップされ、監査 `AgentHooks` が装着されます。`AgentSpec` / `tools` / `AgentBuilder` Protocol の宣言面は不変です。
 
-外部依存の Agent Governance Toolkit（AGT）に委譲します。ポリシー違反時は AGT 由来の `PolicyViolationError` が送出されます。捕捉時は `exc.details.get("tool_name")` で拒否されたツール名を取得できます（SDK `Runner` 経由でラップされている場合は `exc.__cause__.details`）。
+外部依存の Agent Governance Toolkit（AGT）に委譲します。ポリシー違反時は AGT 由来の `PolicyViolationError` が送出されます。SDK `Runner` 経由では SDK の `UserError` にラップされて着地するため、`except UserError` で捕らえて `exc.__cause__.details.get("tool_name")` から拒否されたツール名を取得します（ラップ前の経路で `PolicyViolationError` を直接捕捉する場合は `exc.details.get("tool_name")`）。
 
 ## 使い分け
 
