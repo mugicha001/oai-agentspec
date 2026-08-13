@@ -29,6 +29,13 @@ FR-2（`resolve_next_agent`）/ FR-4（`next_turn_agent`）の受け入れ基準
   （「開始エージェント決定不能」であり `resolve_next_agent` の `None` とは意味が異なる）。
   Y が未登録なら registry の `KeyError` を握り潰さず伝播する。
 
+FR-9（`action_next_turn_agent`・ADR 0027）はアクション直接起動後の解決を 5 分岐の決定表として
+pin する: ハンドオフ観測ありは `next_turn_agent` へ丸ごと委譲 / 観測なしは包括ルールの
+`next_agent` を `registry.get` で解決 / 包括ルールが禁止のみ・包括ルールが無い（`source` 限定
+のみ）・最終回答者名がキーに不一致の 3 つはいずれも `result.last_agent` へ後退。あわせて
+副作用なし・同一入力で同一結果と、sentinel `_ACTION_DIRECT_SOURCE` が宣言済み `source` と
+衝突しないことを固定する。
+
 `agents` 非依存（宣言層は SDK 型を一切扱わない）。run 完了結果と registry は SDK 型ではなく
 フェイク（`last_agent` / `new_items` を持つ simple object・`get(name)` を持つ simple object）で
 与える。frozen dataclass の等価性・repr は契約に含めないため pin しない（フィールド単位で
@@ -45,11 +52,13 @@ from typing import Any
 
 import pytest
 
-from oai_agentspec import AgentRegistry, AgentSpec
+from oai_agentspec import AgentRegistry, AgentSpec, _adapters
 from oai_agentspec.constants import NEXT_TURN_LOGGER_NAME
 from oai_agentspec.next_turn import (
+    _ACTION_DIRECT_SOURCE,
     NextTurnPolicy,
     NextTurnRule,
+    action_next_turn_agent,
     apply_next_turn_policy,
     next_turn_agent,
     resolve_next_agent,
@@ -1370,3 +1379,293 @@ def test_apply_next_turn_policy_警告はその到達元から効かない禁止
     wiring = derived._next_turn
     assert wiring is not None
     assert wiring.gated == frozenset({"billing", "triage"})
+
+
+# ---------------------------------------------------------------------------
+# action_next_turn_agent: アクション直接起動後の次ターン開始エージェント（FR-9 / ADR 0027）
+# ---------------------------------------------------------------------------
+#
+# 決定表（5 分岐）:
+#   1. ハンドオフ観測あり                    -> 既存 `next_turn_agent` へ丸ごと委譲
+#   2. 観測なし・包括ルールが next_agent あり -> `registry.get(next_agent)`
+#   3. 観測なし・包括ルールが禁止のみ         -> `result.last_agent`
+#   4. 観測なし・包括ルールが無い（source 限定のみ）  -> `result.last_agent`
+#   5. 観測なし・最終回答者名が rules のキーに不一致  -> `result.last_agent`
+#
+# 1 と 2 は同じ結果オブジェクトの「ハンドオフの有無」だけを変えた対で構成し、委譲経路
+# （一致 source ルールの `frontdesk`）と直接起動経路（包括ルールの `lobby`）が戻り値の
+# 名前で識別できるようにする（片方の経路へ倒す変異を両方向で kill する）。
+
+
+def test_action_next_turn_agent_ハンドオフ観測時は既存経路へ委譲する() -> None:
+    """分岐 1: 遷移が観測されたターンは `next_turn_agent` と同一の解決（一致 source 優先）。"""
+    override = _FakeAgent("frontdesk")
+    last = _FakeAgent("billing")
+    registry = _FakeRegistry({"frontdesk": override, "lobby": _FakeAgent("lobby")})
+    result = _FakeResult(last, [_FakeHandoffItem("triage", "billing")])
+
+    returned = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert returned is override
+    # 委譲されていれば包括ルール（lobby）ではなく一致 source ルール（frontdesk）が引かれる。
+    assert registry.calls == ["frontdesk"]
+
+
+def test_action_next_turn_agent_ハンドオフなしで包括ルールが適用される() -> None:
+    """分岐 2: 遷移が観測されないターンは包括ルールの `next_agent` を registry で解決する。"""
+    lobby = _FakeAgent("lobby")
+    last = _FakeAgent("billing")
+    registry = _FakeRegistry({"frontdesk": _FakeAgent("frontdesk"), "lobby": lobby})
+    result = _FakeResult(last, [])
+
+    returned = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert returned is lobby
+    assert returned is not last
+    # 一致 source ルール（frontdesk）は直接起動では選ばれない。
+    assert registry.calls == ["lobby"]
+
+
+def test_action_next_turn_agent_包括ルールが禁止のみならlast_agentへ後退する() -> None:
+    """分岐 3: 包括ルールが次ターン指定を持たなければ `last_agent` を同一性ごと返す。"""
+    policy = NextTurnPolicy(
+        rules={
+            "billing": (
+                NextTurnRule(next_agent="frontdesk", source="triage"),
+                NextTurnRule(no_handoff_on_arrival=True),
+            )
+        }
+    )
+    last = _FakeAgent("billing")
+    registry = _FakeRegistry({"billing": _FakeAgent("billing"), "frontdesk": _FakeAgent("front")})
+    result = _FakeResult(last, [])
+
+    returned = action_next_turn_agent(policy, result, registry)
+
+    assert returned is last
+    # registry を経由した正規化はしない（同名の登録実体へ差し替わらない）。
+    assert returned is not registry.agents["billing"]
+    assert registry.calls == []
+
+
+def test_action_next_turn_agent_包括ルールが無いエントリはlast_agentへ後退する() -> None:
+    """分岐 4: `source` 限定ルールしか無いエントリでは sentinel が一致せず後退する。"""
+    policy = NextTurnPolicy(
+        rules={
+            "billing": (
+                NextTurnRule(next_agent="frontdesk", source="triage"),
+                NextTurnRule(next_agent="lobby", source="server"),
+            )
+        }
+    )
+    last = _FakeAgent("billing")
+    registry = _FakeRegistry({"frontdesk": _FakeAgent("frontdesk"), "lobby": _FakeAgent("lobby")})
+    result = _FakeResult(last, [])
+
+    returned = action_next_turn_agent(policy, result, registry)
+
+    assert returned is last
+    assert registry.calls == []
+
+
+def test_action_next_turn_agent_キー不一致はlast_agentへ後退する() -> None:
+    """分岐 5: 最終回答者名が `policy.rules` のキーに無ければ後退する。"""
+    last = _FakeAgent("shipping")
+    registry = _FakeRegistry({"frontdesk": _FakeAgent("frontdesk"), "lobby": _FakeAgent("lobby")})
+    result = _FakeResult(last, [])
+
+    returned = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert returned is last
+    assert registry.calls == []
+
+
+def test_action_next_turn_agent_last_agent属性の欠落はNoneを返す() -> None:
+    """`last_agent` を読み取れないターンは「開始エージェント決定不能」（None）。"""
+    registry = _FakeRegistry({"lobby": _FakeAgent("lobby")})
+    result = _ResultWithoutLastAgent([])
+
+    assert action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry) is None
+    assert registry.calls == []
+
+
+def test_action_next_turn_agent_last_agentのアクセス例外でもNoneを返す() -> None:
+    """`last_agent` の読み出しが例外を送出しても伝播させず None を返す（防御的読み取り）。"""
+    registry = _FakeRegistry({"lobby": _FakeAgent("lobby")})
+    result = _ResultRaisingLastAgent([])
+
+    assert action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry) is None
+    assert registry.calls == []
+
+
+def test_action_next_turn_agent_未登録のYはKeyErrorが伝播する() -> None:
+    """包括ルールの Y が registry に無ければ `KeyError` を握り潰さずそのまま伝播する。"""
+    registry = _FakeRegistry({"frontdesk": _FakeAgent("frontdesk")})
+    result = _FakeResult(_FakeAgent("billing"), [])
+
+    with pytest.raises(KeyError, match="lobby") as excinfo:
+        action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert type(excinfo.value) is KeyError
+
+
+def test_action_next_turn_agent_registryと結果を変更しない() -> None:
+    """副作用なし: 登録内容・結果オブジェクト・`new_items` の列を変更しない。"""
+    lobby = _FakeAgent("lobby")
+    last = _FakeAgent("billing")
+    registry = _FakeRegistry({"lobby": lobby})
+    registered_before = dict(registry.agents)
+    items: list[Any] = []
+    result = _FakeResult(last, items)
+
+    action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert registry.agents == registered_before
+    assert result.last_agent is last
+    assert result.new_items is items
+    assert items == []
+
+
+def test_action_next_turn_agent_同一入力で同一結果を返す() -> None:
+    """決定的: 同じ宣言・結果から何度呼んでも同じ実体が返る。"""
+    lobby = _FakeAgent("lobby")
+    registry = _FakeRegistry({"lobby": lobby})
+    result = _FakeResult(_FakeAgent("billing"), [])
+
+    first = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+    second = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert first is lobby
+    assert second is lobby
+
+
+def test_action_direct_source_は宣言に書けない制御文字を含む() -> None:
+    """sentinel の非衝突根拠を固定する（`NextTurnRule.source` は非空 str しか検証しない）。
+
+    利用者が宣言する `source` はエージェント名であり NUL 制御文字を含まない。sentinel が
+    その前提を満たすこと（NUL を含み、可読な名前と一致しないこと）を pin する。
+    """
+    assert "\x00" in _ACTION_DIRECT_SOURCE
+    assert _ACTION_DIRECT_SOURCE.strip("\x00") != _ACTION_DIRECT_SOURCE
+
+
+def test_action_next_turn_agent_sentinelは宣言済みsourceと衝突しない() -> None:
+    """宣言側の `source` が sentinel と一致しない限り、選定は必ず包括ルールへ倒れる。
+
+    到達元を限定したルールを複数並べても、直接起動では 1 件も発動せず包括ルールが選ばれる
+    （sentinel が第 1 ループを通過してしまう退行を検知する）。
+    """
+    lobby = _FakeAgent("lobby")
+    policy = NextTurnPolicy(
+        rules={
+            "billing": (
+                NextTurnRule(next_agent="frontdesk", source="triage"),
+                NextTurnRule(next_agent="tech", source="server"),
+                NextTurnRule(next_agent="lobby"),
+            )
+        }
+    )
+    registry = _FakeRegistry(
+        {"frontdesk": _FakeAgent("frontdesk"), "tech": _FakeAgent("tech"), "lobby": lobby}
+    )
+    result = _FakeResult(_FakeAgent("billing"), [])
+
+    returned = action_next_turn_agent(policy, result, registry)
+
+    assert returned is lobby
+    assert registry.calls == ["lobby"]
+
+
+# ---------------------------------------------------------------------------
+# 観測の抽出は 1 ターンに 1 回だけ (レビュー指摘 #88-R3)
+# ---------------------------------------------------------------------------
+#
+# `action_next_turn_agent` は `extract_turn_observation(result)` で観測を取り、ハンドオフ
+# 有りなら `next_turn_agent` へ委譲する。委譲先の `resolve_next_agent` は同じ result に対して
+# 2 回目の `extract_turn_observation` を走らせるため、`new_items` の全走査がターンごとに
+# 二重に起きる。挙動は同じでも、観測は毎ターンの窓口で走る決定的な純関数であり、取得済みの
+# 結果を使い回せる。挙動そのものは既存 103 件が pin しているため、ここでは回数だけを固定する。
+
+
+def test_action_next_turn_agent_ハンドオフ有りでも観測抽出は1回だけ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ハンドオフを観測したターンでも `extract_turn_observation` は 1 回しか呼ばれない。
+
+    委譲のために取った観測を捨てて委譲先で取り直すと、`new_items` の走査が二重に走る。
+    """
+    real = _adapters.extract_turn_observation
+    seen: list[Any] = []
+
+    def _spy(result: Any) -> Any:
+        seen.append(result)
+        return real(result)
+
+    monkeypatch.setattr(_adapters, "extract_turn_observation", _spy)
+
+    override = _FakeAgent("frontdesk")
+    registry = _FakeRegistry({"frontdesk": override, "lobby": _FakeAgent("lobby")})
+    result = _turn(_FakeAgent("billing"), ("triage", "billing"))
+
+    returned = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert returned is override
+    assert len(seen) == 1
+    assert seen[0] is result
+
+
+def test_action_next_turn_agent_ハンドオフ無しでも観測抽出は1回だけ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ハンドオフ無しの経路（委譲しない）でも観測抽出は 1 回のまま（回帰防止）。
+
+    委譲側を直す過程で非委譲側に余分な抽出が増えないことを、同じ物差しで固定する。
+    """
+    real = _adapters.extract_turn_observation
+    seen: list[Any] = []
+
+    def _spy(result: Any) -> Any:
+        seen.append(result)
+        return real(result)
+
+    monkeypatch.setattr(_adapters, "extract_turn_observation", _spy)
+
+    lobby = _FakeAgent("lobby")
+    registry = _FakeRegistry({"lobby": lobby})
+    result = _turn(_FakeAgent("billing"))
+
+    assert action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry) is lobby
+    assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# ハンドオフ有り + 上書き不発の後退（分岐 1 の後退側・観測 1 回化リファクタの死角）
+# ---------------------------------------------------------------------------
+#
+# 分岐 1（ハンドオフ観測あり）は「上書きが発動する側」だけが直接 pin されており、
+# 「発動しない側」は非ハンドオフ経路と共有する `read_last_agent` の後退で偶然
+# カバーされている。`action_next_turn_agent` を通した後退を明示的に固定する。
+
+
+def test_action_next_turn_agent_ハンドオフ有りでも上書き不発ならlast_agentへ後退する() -> None:
+    """ハンドオフを観測しても上書きが発動しなければ `last_agent` を同一性ごと返す。
+
+    最終回答者 `shipping` は `policy.rules` のキーに無いため発動ルールを選べない
+    （観測されたハンドオフは `triage -> shipping` で非空）。registry を経由した正規化は
+    行わないため、戻り値は `result.last_agent` の実体そのもので registry.get は呼ばれない。
+    """
+    last = _FakeAgent("shipping")
+    registry = _FakeRegistry(
+        {
+            "shipping": _FakeAgent("shipping"),
+            "frontdesk": _FakeAgent("frontdesk"),
+            "lobby": _FakeAgent("lobby"),
+        }
+    )
+    result = _turn(last, ("triage", "shipping"))
+
+    returned = action_next_turn_agent(_SOURCE_MATCHED_POLICY, result, registry)
+
+    assert returned is last
+    assert returned is not registry.agents["shipping"]
+    assert registry.calls == []

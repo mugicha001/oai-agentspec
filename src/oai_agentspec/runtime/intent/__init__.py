@@ -7,8 +7,12 @@ Protocol（`IntentClassifier` / `ContextBuilder` / `CandidateGenerator`）、
 （`confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
 `MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` /
 `make_trained_estimator` / `ml_inference_from_estimator` / `fit_ml_estimator`）、
-および 1 行ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator` /
-`intent_classifier_from_ml_inference`）を再エクスポートする。
+1 行ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator` /
+`intent_classifier_from_ml_inference`）、アクション宣言（`ActionSpec` / `ActionCatalog` /
+`ActionPlanner` / `ParameterSpec` / `param` / `PARAM_UNSET`）、スロットと計画（`Slot` /
+`SlotState` / `Origin` / `SlotSuggestion` / `ActionPlan` / `PlanResult` / `ParamUsage`）、
+結線の宣言型（`CandidateSource` / `LLMFiller`）、および候補契約（`ExecutableIntent` /
+`ExecutableSuggestion`）を再エクスポートする。
 
 型は pydantic に依存するため、本窓口は PEP 562 (`__getattr__`) による遅延再エクスポートに
 統一する。窓口 import 自体は intent extra 未導入でも壊れず、属性アクセス時に初めて
@@ -47,6 +51,27 @@ __all__ = [
     "intent_classifier_from_model",
     "intent_classifier_from_generator",
     "intent_classifier_from_ml_inference",
+    # --- アクション宣言（FR-1/FR-2/FR-3） ---
+    "ActionSpec",
+    "ActionCatalog",
+    "ActionPlanner",
+    "ParameterSpec",
+    "param",
+    "PARAM_UNSET",
+    # --- スロットと計画（FR-5/FR-8） ---
+    "Slot",
+    "SlotState",
+    "Origin",
+    "SlotSuggestion",
+    "ActionPlan",
+    "PlanResult",
+    "ParamUsage",
+    # --- 結線の宣言型（FR-3） ---
+    "CandidateSource",
+    "LLMFiller",
+    # --- 候補契約（FR-4） ---
+    "ExecutableIntent",
+    "ExecutableSuggestion",
 ]
 
 
@@ -60,6 +85,8 @@ _TYPE_SYMBOLS = frozenset(
         "IntentPrediction",
         "IntentCandidate",
         "ConsistencyReport",
+        "ExecutableIntent",
+        "ExecutableSuggestion",
     }
 )
 _PROTOCOL_SYMBOLS = frozenset({"IntentClassifier", "ContextBuilder", "CandidateGenerator"})
@@ -88,6 +115,28 @@ _FACTORY_SYMBOLS = frozenset(
         "intent_classifier_from_ml_inference",
     }
 )
+_ACTION_SYMBOLS = frozenset(
+    {
+        "ActionSpec",
+        "ActionCatalog",
+        "ActionPlanner",
+        "ParameterSpec",
+        "param",
+        "PARAM_UNSET",
+    }
+)
+_SLOT_SYMBOLS = frozenset(
+    {
+        "Slot",
+        "SlotState",
+        "Origin",
+        "SlotSuggestion",
+        "ActionPlan",
+        "PlanResult",
+        "ParamUsage",
+    }
+)
+_BINDING_SYMBOLS = frozenset({"CandidateSource", "LLMFiller"})
 
 
 def __getattr__(name: str) -> Any:
@@ -134,6 +183,18 @@ def __getattr__(name: str) -> Any:
         from . import factories as _factories
 
         value = getattr(_factories, name)
+    elif name in _ACTION_SYMBOLS:
+        from . import actions as _actions
+
+        value = getattr(_actions, name)
+    elif name in _SLOT_SYMBOLS:
+        from . import slots as _slots
+
+        value = getattr(_slots, name)
+    elif name in _BINDING_SYMBOLS:
+        from . import binding as _binding
+
+        value = getattr(_binding, name)
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value

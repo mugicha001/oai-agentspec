@@ -20,7 +20,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from ._validation import validate_bool
 from .constants import NEXT_TURN_LOGGER_NAME
@@ -215,7 +215,23 @@ def resolve_next_agent(policy: NextTurnPolicy, result: Any) -> str | None:
     """
     from . import _adapters
 
-    observation = _adapters.extract_turn_observation(result)
+    return _resolve_from_observation(policy, _adapters.extract_turn_observation(result))
+
+
+def _resolve_from_observation(policy: NextTurnPolicy, observation: Any) -> str | None:
+    """抽出済みのターン観測から次ターン開始エージェント名を解決する（副作用なし・決定的）。
+
+    `resolve_next_agent` から観測を消費する部分だけを切り出したもの。観測は毎ターンの窓口で
+    走る決定的な純関数の結果であるため、既に取得済みの観測を持つ呼び出し側
+    （`action_next_turn_agent`）が再抽出せずに使い回せる。
+
+    Args:
+        policy: 次ターン上書きの宣言。
+        observation: `_adapters.extract_turn_observation` が返したターン観測。
+
+    Returns:
+        上書き先のエージェント名（Y）。上書きが発動しない場合は None。
+    """
     last_agent = observation.last_agent
     if last_agent is None or not observation.handoffs:
         return None
@@ -262,6 +278,63 @@ def next_turn_agent(policy: NextTurnPolicy, result: Any, registry: AgentRegistry
     from . import _adapters
 
     name = resolve_next_agent(policy, result)
+    if name is not None:
+        return registry.get(name)
+    return _adapters.read_last_agent(result)
+
+
+# アクション直接起動の選定に使う sentinel。`NextTurnRule.source` の検証は非空 str のみで
+# 識別子制約が無いため、宣言済みの `source` と衝突しないことは型ではなくテストで固定する
+# （エージェント名に NUL 制御文字は現れない）。
+_ACTION_DIRECT_SOURCE: Final[str] = "\x00action-direct\x00"
+
+
+def action_next_turn_agent(
+    policy: NextTurnPolicy, result: Any, registry: AgentRegistry
+) -> Any | None:
+    """アクション直接起動の後に、次ターンの開始エージェントを決める（副作用なし・決定的）。
+
+    候補ボタンの押下などでハンドオフ遷移を経ずに実行エージェントを起動したターンでは、
+    `next_turn_agent` の発動条件（ハンドオフ遷移の観測）が成立せず上書きが働かない。本関数は
+    その場合に限り、最終回答者 X のエントリから **包括ルール**（`source` を持たないルール）を
+    選び、次ターン指定（`next_agent`）があれば `registry.get(Y)` で解決する。
+
+    ハンドオフ遷移が 1 件以上観測されたターンは `next_turn_agent` と同一の解決へ倒れるため、
+    通常の会話フローの解決規則は一切変わらない（観測を取り直さずに済むよう、委譲ではなく
+    取得済みの観測で `_resolve_from_observation` を呼ぶ形にしてある）。包括ルールの選定は
+    既存の `_select_rule` に
+    registry へ登録され得ない sentinel を渡して行うため、選定規則を二重実装しない
+    （一致 `source` を探す第 1 段は必ず外れ、包括ルールの第 2 段へ倒れる）。
+
+    上書きが発動しない場合（包括ルールが次ターン指定を持たない / 包括ルールが無い /
+    最終回答者名が `policy.rules` のキーに無い）は `result.last_agent` をそのまま返す
+    （registry を経由した正規化はしないため、SDK が返した実体の同一性が保たれる）。
+
+    Args:
+        policy: 次ターン上書きの宣言。
+        result: run 完了結果（`last_agent` / `new_items` を持つ前提）。
+        registry: 上書き先 Y を解決する registry（`apply_next_turn_policy` の派生 registry）。
+
+    Returns:
+        次ターンの開始エージェント（不透明値）。決定できない場合は None。
+
+    Raises:
+        KeyError: 上書き先 Y が registry に登録されていない場合（registry から伝播する）。
+    """
+    from . import _adapters
+
+    observation = _adapters.extract_turn_observation(result)
+    name: str | None = None
+    if observation.handoffs:
+        # ハンドオフ有りは `next_turn_agent` と同一の解決（観測の再抽出だけを避けた形）。
+        name = _resolve_from_observation(policy, observation)
+    elif (last_agent := observation.last_agent) is not None:
+        entry = policy.rules.get(last_agent)
+        if entry is not None:
+            rule = _select_rule(tuple(entry), _ACTION_DIRECT_SOURCE)
+            if rule is not None:
+                name = rule.next_agent
+
     if name is not None:
         return registry.get(name)
     return _adapters.read_last_agent(result)

@@ -13,7 +13,9 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from ._readonly import ReadOnlyAnyMapping
 
 
 class ConfidenceLevel(StrEnum):
@@ -220,3 +222,92 @@ class IntentContext[TContext](BaseModel):
         ),
     )
     run_context: TContext | None = Field(default=None, description="Pass-through run_context.")
+
+
+class ExecutableIntent(IntentCandidate):
+    """実行可能アクションを指す候補 1 件。候補生成方式に依存しない固定契約（FR-4）。
+
+    既存 `IntentCandidate` のサブクラスであるため `IntentPrediction.candidates` へそのまま
+    載せられる。親型の必須フィールド `text` は `action_id` から自動補完するので、利用者は
+    同じ名前を 2 度書かない。
+    """
+
+    model_config = {"frozen": True}
+    action_id: str = Field(description="Registered action_id this candidate points at.")
+    # 読み取り専用へ正規化する（`_readonly.ReadOnlyAnyMapping`）。frozen は属性の再束縛だけを
+    # 禁じるため、素の dict のままだと候補が運ぶ実行入力を宣言後に差し替えられる。
+    # `validate_default=True` は既定の空 Mapping も同じ正規化へ通すために必要である。
+    parameters: ReadOnlyAnyMapping = Field(
+        default_factory=dict,
+        validate_default=True,
+        description="Parameter values the candidate already carries. Keys are parameter names.",
+    )
+    source: str = Field(
+        description="Which generator produced this candidate. Not validated by the library."
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _fill_text_from_action_id(cls, data: Any) -> Any:
+        """`text` を `action_id` から補完し、双方明示された場合の不一致を拒否する。
+
+        `mode="before"` なのは、親型の `text` が必須であり、必須チェックより前に埋める必要が
+        あるためである。`action_id` を持たない入力（親型そのままの dict やモデルインスタンス
+        の再検証）では何もせずそのまま返す。ここで例外を出すと、本来「`action_id` が必須」
+        という素直な `ValidationError` になるべき入力が別の失敗へすり替わる。
+
+        Args:
+            data: 検証前の入力。Mapping とは限らない。
+
+        Returns:
+            `text` を補完した新しい dict。入力が Mapping でないか `action_id` を持たない
+            場合は入力そのもの。
+
+        Raises:
+            ValueError: `text` と `action_id` の双方が明示され両者が一致しない場合。黙って
+                どちらかを採ると、候補の表示名と実行先の宣言が食い違ったまま下流へ流れる。
+        """
+        if not isinstance(data, Mapping) or "action_id" not in data:
+            return data
+        action_id = data["action_id"]
+        text = data.get("text")
+        if text is None:
+            return {**data, "text": action_id}
+        if text != action_id:
+            raise ValueError(
+                f"ExecutableIntent.text must match action_id: text={text!r} action_id={action_id!r}"
+            )
+        return data
+
+
+class ExecutableSuggestion(BaseModel):
+    """候補生成の結果一式（FR-4）。`IntentPrediction` を丸ごと持たない。
+
+    `candidates` を `tuple[ExecutableIntent, ...]` として直接持つのは、`IntentPrediction` を
+    経由すると純 dict 経路で親型へ coerce され `action_id` / `parameters` が落ちるためである
+    （設計 §3.10・実測 1）。`report` / `metadata` は `IntentPrediction` を丸ごと持つ代わりに
+    分解して持つが、保持の仕方は同じではない。`report` は generator が返したモデルをそのまま
+    保持し、`metadata` は値を保ったまま読み取り専用へ正規化して保持する（防御的コピーを
+    取り込むため、渡した Mapping との同一性は保たれない）。
+
+    `context.run_context` に利用者の任意型が載るため、**直列化の成立は契約に含めない**
+    （FR-1）。
+    """
+
+    model_config = {"frozen": True}
+    candidates: tuple[ExecutableIntent, ...] = Field(
+        description="Candidates in generator order, already filtered to registered actions."
+    )
+    context: IntentContext[Any] = Field(
+        description="The IntentContext the candidates were generated from."
+    )
+    report: ConsistencyReport | None = Field(
+        default=None, description="Pass-through of IntentPrediction.report."
+    )
+    # `parameters` と同じく読み取り専用へ正規化する（`_readonly.ReadOnlyAnyMapping`）。
+    # frozen は属性の再束縛だけを禁じるため、素の Mapping のままだと宣言後に中身を
+    # 差し替えられる。None は「判定材料を返さない generator」の表明であり素通しする。
+    metadata: ReadOnlyAnyMapping | None = Field(
+        default=None,
+        description="Pass-through of IntentPrediction.metadata. Read-only; None means absent.",
+    )
