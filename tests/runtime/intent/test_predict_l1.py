@@ -980,6 +980,37 @@ async def test_missing_field_falls_back_per_slot_when_on_invalid_slot_is_skip(
     )
 
 
+async def test_explicit_none_default_falls_back_to_default_not_to_needs_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """明示 `default=None` の宣言は後退時も `Origin.DEFAULT` の解決になる（FR-7 L221）。
+
+    後退先の判定は「既定値が None でないこと」ではなく「既定の宣言があること」
+    （`has_default`）である。`param(default=None, by_llm=True)` が予測で埋まらない場合、
+    値だけを見ると `NEEDS_USER`（値 None）と区別できないため、状態と `origin` で照合する。
+    """
+    _spy_filler(monkeypatch)
+    catalog = _catalog(
+        _spec(
+            parameters=(
+                param("note", str | None, by_llm=True, default=None),
+                param("region", str, by_llm=True),
+            ),
+            on_invalid_slot="skip",
+        )
+    )
+    context = _context()
+    plans = _build_plans(catalog, (_intent("run_load_test"),), context)
+    filler, _ = _filler(_response({"region": _suggestion("jp")}))
+
+    filled, _usage = await _predict_params(plans, context, llm_filler=filler, prompts=None)
+
+    note = _slot(filled[0], "note")
+    assert (note.state, note.value, note.origin) == (SlotState.RESOLVED, None, Origin.DEFAULT)
+    region = _slot(filled[0], "region")
+    assert (region.state, region.value, region.origin) == (SlotState.RESOLVED, "jp", Origin.LLM)
+
+
 async def test_missing_field_raises_when_on_invalid_slot_is_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

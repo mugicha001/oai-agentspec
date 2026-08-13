@@ -364,6 +364,27 @@ async def test_一部の応答だけ_usage_を持つ場合は未取得としな�
     assert usage == AgentRunUsage(model_calls=2, input_tokens=5, output_tokens=6)
 
 
+async def test_requests_が_0_でも_total_tokens_があれば未取得としない(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """未取得判定は `requests` 単独ではなく `total_tokens` も見る。
+
+    `requests == 0` でもトークンが載っている応答はトークンを取得できているため、
+    None へ倒さず合算値を返す（`requests` だけを見る実装はここで落ちる）。
+    """
+    responses = [
+        _usage_response(
+            "RESP", Usage(requests=0, input_tokens=5, output_tokens=6, total_tokens=11)
+        ),
+    ]
+    monkeypatch.setattr(agents.Runner, "run", _stub_run("RESP", responses))
+    agent = _filler_agent(FakeModel().queue_text("RESP"))
+
+    _text, usage = await run_filler_prompt(agent, (), "fill me")
+
+    assert usage == AgentRunUsage(model_calls=1, input_tokens=5, output_tokens=6)
+
+
 def test_AgentRunUsage_は_frozen_な値型() -> None:
     """`AgentRunUsage` は agents 非依存の frozen dataclass（上位層が SDK 型に触れない）。"""
     assert dataclasses.is_dataclass(AgentRunUsage)
