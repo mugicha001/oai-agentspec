@@ -17,6 +17,7 @@ from .integrity import (
 from .next_turn import (
     NextTurnPolicy,
     NextTurnRule,
+    action_next_turn_agent,
     apply_next_turn_policy,
     next_turn_agent,
     resolve_next_agent,
@@ -71,6 +72,7 @@ __all__ = [
     "ToolSpec",
     "WorkflowFrozenError",
     "WorkflowGraph",
+    "action_next_turn_agent",
     "apply_next_turn_policy",
     "default_input_filter",
     "dynamic_prompt",
