@@ -240,7 +240,7 @@ by_llm=True, ...)` のキーワード引数形で足りる。
 
 ## Confirmation
 
-強制手段（`tests/_adapters/test_intent_adapter_l2.py` のみ既存ファイルへの追記。他は**新規作成**）:
+強制手段（いずれも**新規作成**）:
 
 - `tests/runtime/intent/test_catalog_l1.py`: `bind()` が frozen な `ActionPlanner` を返し
   catalog を変異させないこと / `ActionCatalog` が `validate` / `plan` を持たないこと /
@@ -263,9 +263,11 @@ by_llm=True, ...)` のキーワード引数形で足りる。
 - `tests/runtime/intent/test_catalog_plan_l2.py`: `predict=False` で LLM 0 回 /
   `detail=True` が `PlanResult(plans, suggestion, usage)` を返し `report` / `metadata` を
   捨てないこと。
-- `tests/_adapters/test_intent_adapter_l2.py`（既存ファイルへ追記）: 予測エージェント専用
-  `AgentRegistry` で `AgentSpec` から実体化して 1 回走らせること・`max_turns` が内部定数 1 で
-  あること・`guardrails` の登録名が境界へ振り分けて装着されること・`guardrails` 空なら装着 0 件で
-  あること・発火時に SDK 例外が伝播し後退しないこと。
+- `tests/runtime/intent/test_predict_l1.py`: 予測エージェント専用の `AgentRegistry` を
+  `runtime/intent` 側が組んで `AgentSpec` から実体化すること・`guardrails` の登録名が境界へ
+  振り分けて装着されること・`guardrails` 空なら装着 0 件であること。
+- `tests/_adapters/test_intent_filler_adapter_l2.py`: `run_filler_prompt` が構築済みの agent を
+  1 回走らせること・`max_turns` が内部定数 1 であること・ガードレール発火時に SDK 例外が伝播し
+  後退しないこと・usage の詰め替え。
 
 `docs/QUALITY-GUARANTEES.md` に登録済み（source = ADR-0029）。

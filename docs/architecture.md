@@ -119,7 +119,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `tool_registry.py` | `ToolSpec` / `ToolRegistry`。Tool の宣言（生関数 + メタデータ）の一元登録・遅延構築 + キャッシュ・照会・enabled 動的トグル。`agents` 非依存のコア層（SDK 結線は `_adapters/tools.py`）。詳細は「Tool Registry」節 |
 | `agent_names.py` | `AgentNames`（エージェント名をクラス属性として宣言する基底クラス）/ `validate_agent_names`（定数簿の宣言集合と registry の登録名集合の整合検査）。実行時 import は標準ライブラリ（`keyword` / `inspect` / `typing`）のみで `agents` 非依存のコア最下層リーフ。`AgentRegistry` からの依存辺を持たない任意の追加手段。詳細は「エージェント名定数簿」節 |
 | `handoffs.py` | `HandoffEdge` / `HandoffGraph` / `from_specs`。宣言的ハンドオフトポロジを registry の public API 経由で反映 |
-| `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
+| `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `action_next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
 | `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
@@ -160,6 +160,7 @@ __all__ = [
     "ToolSpec",      # Tool メタデータ宣言 dataclass
     "WorkflowGraph",
     "function_tool",         # HITL: 承認必須ツール宣言用（_adapters 再エクスポート・コア公開）
+    "action_next_turn_agent", # 次ターン: アクション直接起動（ハンドオフ非観測）後の解決
     "apply_next_turn_policy", # 次ターン: 名前整合検証 + 到達時ハンドオフ禁止を結線した派生 registry
     "default_input_filter", # ヘルパー
     "dynamic_prompt", # ヘルパー
@@ -704,13 +705,14 @@ frozen / unfrozen の混在継承を許可しないため構造統合せず、6 
 ### 配置と依存方向
 
 - `next_turn.py`（コア直下・`agents` 非依存）: 宣言型（`NextTurnRule` / `NextTurnPolicy`）・解決関数
-  （`resolve_next_agent`）・組み立てヘルパ（`next_turn_agent`）・結線関数（`apply_next_turn_policy`）。
+  （`resolve_next_agent`）・組み立てヘルパ（`next_turn_agent` / `action_next_turn_agent`）・結線関数
+  （`apply_next_turn_policy`）。
   `await` も `Runner` 参照も持たない宣言 + 純関数であり、handoff 宣言と同じ宣言層に属する
 - `_adapters/next_turn.py`: SDK 結線の単一窓口。run 完了結果からの観測抽出（`extract_turn_observation`）・
   到達記録ストア・記録 `on_handoff` 合成・`is_enabled` ゲート合成を持ち、`from agents` はここに閉じる
 - `next_turn.py` から `_adapters` への参照は `registry.py` と同じく関数内遅延 import とし、参照箇所を
   限定する。公開シンボルは `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` /
-  `apply_next_turn_policy` の 5 つ
+  `action_next_turn_agent` / `apply_next_turn_policy` の 6 つ
 
 ### 宣言 -> 解決 -> 継続のデータフロー
 
@@ -755,6 +757,27 @@ X のエントリから発動ルールを選ぶ規則は解決（`resolve_next_a
 指定を持たない（禁止のみの）場合は「上書きなし」（`None`）を返す。`next_turn_agent` は「上書きなし」の
 ときに `result.last_agent` をそのまま返し、`last_agent` も取得できないときのみ `None`（開始エージェント
 決定不能）を返す。上書き先 Y が registry に未登録なら registry の `KeyError` をそのまま伝播する。
+
+### アクション直接起動後の窓口解決（`action_next_turn_agent`）
+
+候補ボタンの押下などでハンドオフ遷移を経ずに実行エージェントを起動したターンでは、`next_turn_agent` の
+発動条件（ハンドオフ観測）が成立せず上書きが働かない。`action_next_turn_agent(policy, result, registry)` は
+この経路専用の窓口であり、解決は次の 5 分岐で決まる。
+
+| # | 条件 | 戻り値 |
+|---|---|---|
+| 1 | ハンドオフ遷移を 1 件以上観測した | `next_turn_agent(policy, result, registry)` へ丸ごと委譲する |
+| 2 | 非観測・最終回答者 X のエントリの包括ルールが `next_agent` を持つ | `registry.get(Y)` |
+| 3 | 非観測・当該包括ルールが `next_agent` を持たない（禁止のみ） | `result.last_agent` の実体 |
+| 4 | 非観測・当該エントリに包括ルール（`source` なし）が無い | `result.last_agent` の実体 |
+| 5 | 非観測・最終回答者名が `policy.rules` のキーに無い / `last_agent` を読めない | `result.last_agent` の実体（読めなければ `None`） |
+
+後退する 3 経路（3 / 4 / 5）は `registry.get` を呼ばず `result.last_agent` の実体をそのまま返すため、SDK が
+返した実体の同一性が保たれる。包括ルールの選定は既存 `_select_rule` に、registry へ登録され得ない
+sentinel（`_ACTION_DIRECT_SOURCE`・NUL 制御文字で挟んだ非公開定数）を遷移元として渡して行う。一致
+`source` を探す第 1 段は必ず外れ、包括ルールの第 2 段へ倒れるため、選定規則を二重実装しない。sentinel が
+利用者の宣言済み `source` と衝突しないことは、`NextTurnRule.source` の検証が非空 str のみで識別子制約を
+持たないため型ではなくテストで固定する。
 
 ### 到達時ハンドオフ禁止の意味論と実現形
 
@@ -807,8 +830,10 @@ X のエントリから発動ルールを選ぶ規則は解決（`resolve_next_a
 
 記録の追記とゲートの参照は SDK が呼ぶ公式 callback の内側で行う読み書きのみであり、`await` も `Runner` 参照も
 独自の実行ループも持たない（hooks 合成と同種の薄い結線）。このため build-don't-run の逸脱には当たらず、
-逸脱として列挙する関数（`runtime/intent` の `fit_ml_estimator` と `runtime/resilience` の `failsafe_call`）の
-一覧には追加しない。
+逸脱として列挙する 4 例（`runtime/intent` の `fit_ml_estimator` / `runtime/resilience` の
+`failsafe_call` / `runtime/observability` の `enable_agent365_tracing`・`enable_otel_logging` /
+`runtime/intent` の `ActionPlanner.plan()` 内のパラメータ予測）の一覧には追加しない。
+この一覧は `./CLAUDE.md`「設計の核」の build-don't-run 項目と対で維持する。
 
 ### 防御的読み取りと制限
 
@@ -2312,7 +2337,14 @@ adapter は `Agent(name="intent-classifier", instructions=system or None, model=
 `DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
 `intent_classifier_from_generator` / `confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
 `MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` / `make_trained_estimator` /
-`fit_ml_estimator` / `ml_inference_from_estimator` / `intent_classifier_from_ml_inference`（計 24 件）。
+`fit_ml_estimator` / `ml_inference_from_estimator` / `intent_classifier_from_ml_inference` /
+`ActionSpec` / `ActionCatalog` / `ActionPlanner` / `ParameterSpec` / `param` / `PARAM_UNSET` /
+`Slot` / `SlotState` / `Origin` / `SlotSuggestion` / `ActionPlan` / `PlanResult` / `ParamUsage` /
+`CandidateSource` / `LLMFiller` / `ExecutableIntent` / `ExecutableSuggestion`（計 41 件）。
+
+アクション実行後の次ターン開始エージェント解決（`action_next_turn_agent`）は本窓口ではなく
+コア `__all__` に載る（`agents` 非依存の宣言層の関心事であり intent 固有型を扱わないため。
+「Next-Turn Agent Override」節を参照）。
 
 ### ML ベース分類器支援
 
@@ -2322,8 +2354,8 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
 一切依存せず（estimator は duck-typed `Any`）、SDK 隔離・単方向依存の規約は「SDK 隔離と依存性注入（DI）」
 節が SoT で本節では再掲しない。
 
-ファイル構成は推論側 `_ml.py` と学習側 `_ml_training.py` の 2 分割。学習側に build-don't-run の唯一の
-逸脱（`fit_ml_estimator` が `estimator.fit()` を駆動する）を物理隔離する。検討経緯は
+ファイル構成は推論側 `_ml.py` と学習側 `_ml_training.py` の 2 分割。学習側に build-don't-run の
+逸脱 1 例目（`fit_ml_estimator` が `estimator.fit()` を駆動する）を物理隔離する。検討経緯は
 `docs/adr/0004-intent-ml-fit-deviation.md` を参照する。
 
 - **推論側（`_ml.py`）**:
@@ -2364,6 +2396,296 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
 依存はライブラリ本体に一切追加しない（sklearn は examples 実行時のみ `[dependency-groups]` の `examples`
 グループで導入する）。
 
+### 実行可能意図の宣言と決定的スロット確定
+
+分類（カテゴリ名を返す）に加えて、「次に実行したい意図をパラメータ付きで予測し、追加の文章入力
+なしで実行できる形に整える」経路を同じ `runtime/intent` に置く。アプリ起動時に実行可能アクションと
+パラメータの埋め方を 1 箇所へ宣言し、各ターンの終わりに「候補ごとに何が埋まっていて何が足りないか」を
+決定的に確定し、足りない分だけを 1 ターン 1 回の予測で埋める。ボタン押下の瞬間は LLM 呼び出し 0 回で
+あり、待ち時間も従量課金も発生しない。実行そのものは利用側の `Runner.run` であり lib は実行 API を
+持たない。追加依存は無い（`pydantic` / `string` / `inspect` / `enum.StrEnum` はいずれも既存）。
+
+#### 入口の二重化（`HandoffGraph` と `ActionCatalog`）
+
+エージェントの起動経路は 2 系統ある。`HandoffGraph` は**会話の遷移**
+（LLM がハンドオフを選ぶ）を宣言し、`ActionCatalog` は**候補からの直接起動**（利用者がボタンを
+押す）を宣言する。両者は同一の `AgentRegistry` を別観点から参照する関係であり、`ActionCatalog` は
+registry へ新しいエージェントを足さない。`ActionSpec.action_agent` が指す先は、利用者が
+`AgentRegistry` へ登録済みの任意のエージェント名でよく、ハンドオフグラフ上のノードと同一であっても
+よい。名前が未登録であることは起動時検証で集約 `KeyError` として落ちる。
+
+#### モジュール配置
+
+| モジュール | 内容 |
+|---|---|
+| `actions.py` | `ActionSpec` / `ParameterSpec` / `ActionCatalog` / `ActionPlanner` / `param` / `PARAM_UNSET` と既定マージ解決 3 関数・パス解決ヘルパ |
+| `slots.py` | `Slot` / `SlotState` / `Origin` / `SlotSuggestion` / `ActionPlan` / `PlanResult` / `ParamUsage` |
+| `binding.py` | `CandidateSource` / `LLMFiller`（結線の宣言型） |
+| `types.py` | `ExecutableIntent` / `ExecutableSuggestion` |
+| `_models.py` / `_validate.py` / `_suggest.py` / `_predict.py` | frozen モデル生成の汎用ビルダ / 起動時検証 / 候補取得と allowlist 除外 / 予測委譲（いずれも非公開） |
+| `_readonly.py` | 宣言後に中身が書き換わらない `Mapping` の型エイリアス（非公開・ドメイン型を import しない葉） |
+
+`ActionCatalog.bind` と `ActionPlanner.validate` / `plan` は `slots` / `_validate` / `_suggest` / `_predict` を
+関数内遅延 import で呼ぶ（`next_turn.py -> _adapters` と同型の idiom）。`actions.py` のモジュール
+レベル依存は `_models.py` のみで、`actions` と `slots` の実行時循環は成立しない。`_models.py` は
+ドメイン型を 1 つも import せず、呼び出し側が組み立てた annotation を引数で受ける汎用ビルダに徹する。
+`runtime/intent/slots.py` のスロットは「1 パラメータの解決状態」であり、`runtime/lightning` の
+`prompt_slot`（APO のプロンプト分割）とは別概念である。
+
+#### 宣言と結線（`ActionCatalog`）
+
+`ActionCatalog` は `register` で内部状態が変わるため plain な mutable クラスとし
+（既存 `ToolRegistry` と同型）、宣言型（`ActionSpec` / `ParameterSpec` / `ActionPlan` / `Slot` /
+`SlotSuggestion` / `ExecutableSuggestion`）は frozen pydantic モデルとする。`ActionCatalog` の
+公開メソッドは 4 つ（`register` / `names` / `get` / `bind`）で、純粋な宣言簿に徹する。
+
+結線は `bind` の 1 箇所へ集約する。`bind` は catalog を変異させず、bind 時点の宣言簿
+スナップショットと結線を載せた frozen な `ActionPlanner` を返す。`validate` / `plan` は
+`ActionPlanner` の公開メソッドであり、未結線のまま `plan()` を呼ぶ形は構造的に存在しない
+（`ActionCatalog` にメソッドが無い）。`bind()` を複数回呼ぶと独立した `ActionPlanner` が
+複数できるだけで、bind 後の `register()` は既存の `ActionPlanner` に影響しない（同じ宣言簿を
+別結線で使い回せる）。3 つの関心事が混ざるため、関心事ごとの frozen 宣言型で受ける。
+
+```python
+planner = catalog.bind(
+    registry=registry,                                   # (1) アプリ既存資産の解決簿
+    prompts=prompts,
+    guardrail_registry=my_guardrails,
+    candidates=CandidateSource(generator=my_generator),  # (2) 候補の出どころ
+    llm_filler=LLMFiller(model=my_model,                 # (3) 不足の埋め方
+                         guardrails=("no_pii",)),
+)
+```
+
+| 型 | フィールド | 役割 |
+|---|---|---|
+| `CandidateSource` | `generator`（必須）/ `context_builder=None` / `history_limit=None` | 候補の出どころ。`generator` は `CandidateGenerator` Protocol の実装。`context_builder` と `history_limit` は排他（同時指定は宣言時に `ValidationError`） |
+| `LLMFiller` | `model`（必須）/ `on_invalid_response="error"` / `guardrails=()` | 不足の埋め方。**渡さなければ穴埋め経路が存在せず、従量課金が発生しない**。`guardrails` はガードレールの登録名 tuple（opt-in。解決簿は `bind(guardrail_registry=...)` 側） |
+
+`bind` は DI 対象を `ActionPlanner` へ載せるだけで実行しない。予測エージェントの実体は利用者が渡さず、lib が
+`AgentSpec(name=<lib 固定名>, instructions=<合成済み>, model=<`LLMFiller.model`>)` を宣言し、
+予測エージェント専用の `AgentRegistry` で解決する。これにより「予測エージェントは業務エージェントとは
+別に置き `session` を渡さない」が構造的に保証され、`guardrails` の名前解決と境界（input / output）
+振り分けは `AgentRegistry` の既存結線がそのまま担う。ガードレール発火時は SDK 例外
+（`InputGuardrailTripwireTriggered` / `OutputGuardrailTripwireTriggered`）を握り潰さず伝播し、
+`on_invalid_response="skip"` の後退は適用しない（発火は「応答が壊れている」ではなく「危険な内容を
+検出した」安全事象のため）。後退が必要な場合は `failsafe_call` で `planner.plan()` を包む。
+
+必須結線が欠けた場合の規則は 3 つ（`bind()` 未呼び出しの状態は構造的に存在しないため規則を
+持たない）。
+
+| 状況 | 挙動 |
+|---|---|
+| `candidates=None` のまま `plan()` | `RuntimeError`（候補生成は代替不能。`validate()` だけの利用は妨げない） |
+| `prompts=None` かつ `prompt` セグメント宣言がある状態で `validate()` | `RuntimeError`（セグメント解決の検査が黙ってスキップされない。セグメント宣言が 0 件なら `prompts=None` でも正常完了） |
+| `llm_filler=None` かつ `NEEDS_LLM` あり・`predict=True` | 予測段をスキップし、決定的段の `plans` と `ParamUsage(runs=0, model_calls=0, candidates=0, input_tokens=None, output_tokens=None)` を返す |
+
+最後の 1 件だけ例外を送出しないのは、`LLMFiller` を渡さないこと自体が「穴埋め経路を持たない構成」と
+いう利用者の明示的な意思表示であり、例外にするとその意思表示が使えなくなるためである。「予測が
+必要なのに穴埋め経路が無い」ことは `usage.runs == 0` と、`plan.slots` に `NEEDS_LLM` が残ることで
+利用者へ伝わる。
+
+#### 起動時検証（`planner.validate()`）
+
+宣言の不整合は押された瞬間ではなく起動時に全件まとめて落とす。検査は 9 種で、いずれも LLM 呼び出し
+0 回である。
+
+| # | 検査 | 違反時 |
+|---|---|---|
+| 1 | `ActionSpec.action_agent` が `registry.names()` に存在するか | 集約 `KeyError` |
+| 2 | `label` のプレースホルダ ⊆ 宣言パラメータ名、かつ `label` 全体が render 可能（`Template(label).substitute(...)` を試行する） | 差分列挙 `ValueError` |
+| 3 | `prompt` の各セグメントが `prompts` で解決できるか | 列挙 `ValueError` |
+| 4 | テンプレのプレースホルダ ⊆ `prompt_vars` のキー（マージ後・走査対象はカタログ既定 / アクション宣言 / `param(prompt=...)` の全セグメント） | 差分列挙 `ValueError` |
+| 5 | `prompt_vars` のキーがどのテンプレでも未使用でないか（カタログ全体・走査対象は 4 と同じ） | `ValueError` |
+| 6 | 同一 `prompt_vars` キーが異なるパスへ宣言されていないか | `ValueError` |
+| 7 | `context` 指定時の `from_context` / `prompt_vars` のパス構造解決（中間が `None` は違反としない） | 列挙 `ValueError` |
+| 8 | `by_llm=True` が 0 件なのに `prompt` / `prompt_vars` / `param(prompt=...)` / `max_suggestions>1` を宣言していないか | `ValueError` |
+| 9 | `LLMFiller.guardrails` の各登録名が `bind(guardrail_registry=...)` で解決できるか（結線自体が無い場合は `ValueError`） | 列挙 `KeyError` |
+
+「埋まる経路が宣言に無いパラメータ」は WARNING 1 行のみで例外を送出しない。8 は当該 `ActionSpec`
+自身の宣言のみを判定対象とし、`ActionCatalog` 由来のマージ分は対象としない（このため
+`ActionPlan.spec` は as-declared のまま保持する）。8 が `param(prompt=...)` と `max_suggestions>1` も
+違反条件に含めるのは、この 2 つが穴埋め段でしか効かない宣言だからである（`confirm=True` は
+ユーザー確認一般に関わるため対象外。`max_suggestions` は既定値 `1` を宣言と数えない）。
+
+2 が名前の包含関係だけでなく render 可能性まで見るのは、`Template.get_identifiers()` が
+`label="Pay $100"` のような裸の `$` を黙って無視するためである。`ActionPlan.label` の生成は
+`safe_substitute` ではなく `substitute` を使うため、この形は押下時ではなく起動時に落とす
+（リテラルの `$` は `$$` と書く）。7 が中間の `None` を違反としないのは、パス解決
+（`_resolve_path`）が「中間が `None`」を「解決できないので次のパスを試す」正常系として扱う
+ためで、構造は正しく値が無いだけの代表 context でアプリが起動できなくなることを避ける。
+非 `None` のオブジェクトに存在しない属性 / キーは引き続き違反である。
+
+`lockdown()` を通した `PromptStore` に対して manifest 未掲載のセグメントを `prompt` が要求した
+場合に限り、`validate()` は集約 `ValueError` ではなく `PromptTemplateIntegrityError` を送出する
+（インテグリティ違反を宣言ミスへ埋もれさせない fail-closed 維持）。manifest 掲載済みのセグメントは
+lockdown 後も解決され検証は通常どおり完了する。運用上は `planner.validate()` を `lockdown()` の
+**前**に呼ぶ。
+
+#### 毎ターンの窓口（`await planner.plan(query)`）
+
+毎ターンの呼び出しは 1 本に畳む。内部順序は次のとおり。
+
+```
+await planner.plan(query, *, predict=True, detail=False)
+  (0) 未検証なら validate() を 1 度だけ実行（LLM 0 回・冪等。以降の plan() では再実行しない）
+  (1) ContextBuilder.build(query) -> IntentContext
+      generator.generate(context) を 1 回だけ呼ぶ                    <- LLM 0〜1 回
+      catalog.names() の allowlist で未登録 action_id / 非 ExecutableIntent を除外（WARNING 1 行）
+      -> ExecutableSuggestion（report は素通し、metadata は値を保ったまま読み取り専用へ正規化して保持）
+  (2) 決定的なスロット確定                                          <- LLM / network / env 参照 0
+      既定マージ解決の結果を ActionPlan へ載せる
+      -> tuple[ActionPlan, ...]（候補と同順・同数）
+      predict=False ならここで返す
+  (3) NEEDS_LLM を持つ plan があり llm_filler が結線されているときだけ     <- Runner.run ちょうど 1 回
+      セグメントを重複排除して 1 本のプロンプトへ合成し、全候補の不足をまとめて予測する
+      1 件も無ければ Runner.run 0 回で (2) の結果をそのまま返す
+```
+
+| 引数 | 既定 | 契約 |
+|---|---|---|
+| `predict` | `True` | `False` なら段 (3) を実行しない。候補生成器が非 LLM なら全経路で LLM 0 回 |
+| `detail` | `False` | `False` は `tuple[ActionPlan, ...]` を返す。`True` は `PlanResult(plans, suggestion, usage)` を返し、`suggestion`（`report` / `metadata`）と `usage`（`ParamUsage`）を取れる |
+
+`detail=False` は戻り値を絞るだけで情報を捨てない。予測の応答は raw `str` として受け、コードフェンス
+剥がし・`ConfidenceLevel` 降順の stable sort・`max_suggestions` での切り捨てを lib 側が行う
+（上限は提示用スキーマの `maxItems` として LLM へ伝えるが、応答検証用の派生モデルには上限を付けない。
+上限超過で応答全体が失われないようにするため）。段 (3) が `Runner.run` を 1 回駆動することは
+build-don't-run の逸脱 4 例目であり、`./CLAUDE.md` と本ドキュメントの逸脱一覧に登録する。lib は
+独自の実行ループ・再試行・モデル切替を持たず、再試行等は `runtime/resilience` へ委ねる。
+
+#### 予測段（`_predict.py`）
+
+段 (3) の実装は `_predict.py` に閉じる。全候補の不足パラメータを `candidate_<index>` をキーとする
+1 つの複合モデルへまとめ、`Runner.run` を 1 回だけ駆動する（鍵に `action_id` でなく候補列の位置を
+使うのは、同一 `action_id` の候補が複数あっても衝突しないため）。
+
+- **プロンプト合成の重複排除は render 後の本文を鍵にする。** セグメント名で排除すると、同名
+  セグメントを異なる `prompt_vars` で使う 2 候補の一方の本文が他方で上書きされ、別テナント・別
+  ユーザー向けに解決された本文が混ざる。積むのは「計画のマージ済みセグメント」と「`NEEDS_LLM` の
+  パラメータが宣言したセグメント」だけで、既に確定したパラメータのセグメントは積まない。
+- **提示用モデルと検証用モデルを分ける。** 提示側は `_slots_model`（宣言型そのまま）で組み、検証側は
+  値型を `Any` へ緩め全フィールドを任意にしたモデルで
+  受ける。検証側まで宣言型で縛ると 1 スロットの型違いで応答全体が `ValidationError` になり、
+  型不一致が `on_invalid_slot` ではなく `on_invalid_response` の管轄へ倒れてしまう。宣言型の検査は
+  スロット単位に `TypeAdapter` で行う（`slots.apply` と同型）。
+- **予測エージェント専用の `AgentRegistry` は `_predict.py` が組む。** `AgentSpec(name=FILLER_AGENT_NAME,
+  instructions=<合成済み>, model=<`LLMFiller.model`>, guardrails=<登録名>)` を宣言し、登録名から実体への
+  解決と境界（input / output）振り分けは registry の `_wire` へ委ねる（dispatch を二重実装しない）。
+  `FILLER_AGENT_NAME` は `runtime/intent` 側の module 定数であり、利用者の業務 registry には触れない。
+- **`_adapters/intent.py` の `run_filler_prompt` は構築済みの不透明な agent を受け取り 1 回走らせる
+  だけ**（`(応答テキスト, 利用量)` を返す。`max_turns` は同モジュールの内部定数 `1`）。専用 registry の
+  生成・`AgentSpec` 宣言・ガードレール登録名の解決を adapter 側へ置かないのは、`registry.py` が
+  `_adapters` を import しているため `_adapters -> registry` が相互参照になるからである。
+- **`history_items` が予測段への唯一の会話経路である。** `IntentQuery.utterance` は system 指示部へ
+  連結しない（プロンプト注入経路を増やさない）。`IntentQuery(history=...)` を渡さない構成では、
+  予測エージェントは発話の内容を知らないまま候補・パラメータ宣言・セグメント本文だけで推測する。
+
+確定した挙動:
+
+| 事象 | 挙動 |
+|---|---|
+| `confirm=False` かつ `max_suggestions>=2` | 信頼度降順で切り捨てた先頭 1 件を `RESOLVED` の値に採用する |
+| 予測値の型不一致 | `on_invalid_slot` の管轄。フィールド単位に扱い、他スロット・他候補の計画は保持する（応答全体の parse 失敗は `on_invalid_response` の管轄） |
+| `prompts` 未結線 + セグメント宣言あり | `RuntimeError`（`bind` の規則 2 と同じ扱い） |
+| 予測対象があるのに会話（`IntentContext.history_items`）が空 | `run_filler_prompt` を呼ぶ前に `RuntimeError`。会話は `history_items` からしか予測エージェントへ届かない（`utterance` は指示部へ連結しない）ため、空のまま駆動すると文脈ゼロの当て推量が例外なく返る暗黙失敗になる。文言は `IntentQuery(history=...)` の結線と現在発話のセッションへの追加の両方へ誘導する |
+| `prompt_vars` の解決値が `None` | 空文字へ展開する（リテラルの `"None"` をプロンプトへ載せない） |
+| `on_invalid_response="error"`（既定） | parse 失敗時に `ValidationError` を伝播する |
+| `on_invalid_slot="error"` | パラメータ名を含む `ValueError` を送出する |
+
+#### 読み取り専用 Mapping（`_readonly.py`）
+
+frozen 宣言型の `model_config = {"frozen": True}` は属性の再束縛だけを禁じ、フィールドが保持する
+`Mapping` の中身は守らない。`spec.prompt_vars["tone"] = "..."` のような書き込みが通ると、起動時検証
+（検査 6 / 7）を通過した宣言を、LLM プロンプトへ展開される直前で差し替えられる。`_readonly.py` は
+「防御的コピー + 読み取り専用ビュー」の 2 段を `Annotated` エイリアスとして共有する。
+
+ビューに `types.MappingProxyType` を使わないのは、`mappingproxy` が pickle 不可で `copy.deepcopy` /
+`model_copy(deep=True)` / `pickle` の 3 経路が `TypeError` になるためである。代わりに `__deepcopy__` /
+`__reduce__` を持つ薄い `Mapping` サブクラスを置き、3 経路すべてで「値が保たれ・読み取り専用のまま・
+元とは別実体」を満たす。直列化時は素の dict へ戻す（読み取り専用 Mapping のまま流すと `model_dump()`
+が `UserWarning`、`model_dump_json()` が `PydanticSerializationError` になる）。
+
+適用先は 6 フィールドで、`ActionSpec.prompt_vars` / `ActionPlanner.prompt_vars` /
+`ExecutableIntent.parameters` / `ActionPlan.resolved_prompt_vars` / `ExecutableSuggestion.metadata`
+（`| None` で `None` は素通し）は pydantic の validator 経由、`ActionCatalog.prompt_vars`（plain
+クラス）は正規化関数の直呼びで適用する。validator 経由の正規化は
+`model_copy(update=...)` では効かない（pydantic の仕様）ため、派生は `model_validate` 経由で作る。
+
+#### スロットの表現（`Slot` / `SlotState` / `Origin`）
+
+1 パラメータの解決状態は `Slot` 1 型 + enum 2 種で表す。
+
+| enum | 値 |
+|---|---|
+| `SlotState` | `resolved` / `needs_llm` / `needs_confirmation` / `needs_user` |
+| `Origin` | `candidate` / `run_context` / `default` / `llm` / `user_confirmed` / `user_input` |
+
+`Slot` の公開面は `name` / `state` / `value` / `origin` / `detail` / `suggestions` / `from_user` の
+7 件。値の出どころは連結文字列ではなく `origin`（enum）と `detail`（`run_context` のパス。
+`Origin.LLM` では `None`）の 2 フィールドに分かれる。`model_validator` が状態とフィールドの整合 6 条件を
+強制する。
+
+| # | 条件 |
+|---|---|
+| 1 | `NEEDS_LLM` / `NEEDS_USER` は `origin is None` かつ `value is None` |
+| 2 | `NEEDS_LLM` は `suggestions == ()` |
+| 3 | `NEEDS_CONFIRMATION` は `value is None` |
+| 4 | `NEEDS_CONFIRMATION` は `len(suggestions) >= 1` |
+| 5 | `RESOLVED` は `origin is not None` |
+| 6 | `detail is not None` なら `origin is RUN_CONTEXT` |
+
+`RESOLVED` + `value is None` は意図的に通す（`param(..., default=None)` を明示宣言した場合に
+正当に発生する。`value` の `None` は「未解決」ではなく「値が `None` であること」を意味し、状態は
+`state` が持つ）。
+
+`ActionPlan` の公開面は `slots` / `label` / `ready` / `pending` / `action_agent` / `input_json` /
+`apply()` の 7 件。`slots` は宣言順（`ActionSpec.parameters` の順）を保つ読み取り経路で、
+`pending` は利用者に聞くべきスロット（`NEEDS_CONFIRMATION` / `NEEDS_USER`）だけを返す。
+`label` は未解決スロットを `…` にした表示用文字列である。`apply(answers)` は元の `ActionPlan` を
+変更せず新しいインスタンスを返し、提示値と一致する回答は `USER_CONFIRMED`、それ以外は `USER_INPUT`
+として記録する。`input_json` は `spec.parameters_model()` で型検証したうえで直列化した `str` で、
+`ready` が偽なら `ValueError` になる。`ActionPlan.model_dump()` には `spec` / `action_agent` /
+`resolved_*` / `run_context` 由来のキーが現れない。
+
+穴埋め後の書き戻しは lib の責務ではなく、アプリが `slot.from_user`（`origin` が `USER_INPUT` /
+`USER_CONFIRMED` のいずれか。`origin is None` でも `False` を返す）で材料を選り分けて自身のストアへ
+書き戻す。lib は `run_context` へ書き込まない（`from_context` は読み取り専用の宣言である）。
+次ターンでの再利用は `param(..., from_context=(...))` の宣言で表現する。
+
+| `origin` | 由来 | アプリが記憶すべきか |
+|---|---|---|
+| `USER_INPUT` | 利用者が自分で入力した値 | 記憶する（宣言からは導けない新情報） |
+| `USER_CONFIRMED` | 提示値を利用者が確認して確定した値 | 記憶する（利用者の意思が通っている） |
+| `CANDIDATE` | 候補生成器が載せた値 | 記憶しない（毎ターン再生成される） |
+| `RUN_CONTEXT` | run context から読んだ値 | 記憶しない（既にアプリ側が持つ値であり二重管理になる） |
+| `DEFAULT` | 宣言の `default` | 記憶しない（宣言が単一ソース） |
+| `LLM` | 予測エージェントの推測値 | 記憶しない（利用者が確認していない推測） |
+
+#### 実行と実行後（利用側のコード）
+
+`ActionPlan` は実行先エージェントの**名前**（`action_agent`）だけを持ち、`AgentRegistry` を参照する
+フィールドもプロパティも持たない。実行先の解決は利用者が明示的に書く。
+
+```python
+result = await Runner.run(registry.get(plan.action_agent), input=plan.input_json)
+next_agent = action_next_turn_agent(next_turn_policy, result, registry)
+```
+
+**到達時ハンドオフ禁止（`no_handoff_on_arrival`）を宣言している構成では、実行先を
+`apply_next_turn_policy` が返す派生 registry から解決する。** 到達記録の前置合成と `is_enabled`
+ゲートは派生 registry にしか設置されないため（「到達時ハンドオフ禁止の意味論と実現形」節）、
+元の registry から解決すると、宣言した禁止が乗っていない実体で実行されて無症状で効かない。
+lib が `plan.agent` のような解決済み実体を提供しないのは、どの registry を使ったかを呼び出し箇所へ
+明示的に現すためである。
+
+実行後の会話は `action_next_turn_agent`（コア `__all__`）で窓口エージェントへ戻す。直接起動では
+ハンドオフ遷移が観測されないため、既存 `next_turn_agent` の発動条件（ハンドオフ観測）に掛からない。
+`action_next_turn_agent` はハンドオフ遷移を観測した場合は `next_turn_agent` へ丸ごと委譲し、
+観測しない場合は `last_agent` に対応する規則束の**包括ルール**（`source is None`）を適用して
+`registry.get(next_agent)` を返す（該当なしは `last_agent` へフォールバック）。詳細は
+「Next-Turn Agent Override」節が SoT である。
+
 ## Resilience（Model Retry / Run Budget / Failsafe・`runtime/resilience`）
 
 Model 呼び出しの一時失敗リトライ・run 全体の予算超過制御・任意例外の宣言的着地の宣言型を
@@ -2371,8 +2693,8 @@ Model 呼び出しの一時失敗リトライ・run 全体の予算超過制御�
 （`ModelSettings.retry` / `Runner.run(hooks=...)`）へコンパイルする、または SDK に依存しない純粋な
 着地関数（Failsafe）を提供するのみで、lib 独自の実行ループ・再試行・`Runner` 参照を持たない
 （build-don't-run）。`failsafe_call` は利用者が渡す thunk を 1 回 await する薄い結線であり、
-build-don't-run の逸脱として `./CLAUDE.md` に明記された 2 関数のうちの 1 つ（もう 1 つは
-`runtime/intent` の `fit_ml_estimator`）。例外は SDK の伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]`
+build-don't-run の逸脱として `./CLAUDE.md` に明記された 4 例のうちの 1 つである。例外は SDK の
+伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]`
 extra で opt-in 導入し、extra は追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア
 `__all__`・`AgentSpec` のフィールド集合は不変。設計判断の検討経緯は
 `docs/adr/0002-resilience-declarative-compilation.md`（Model Retry / Run Budget）・
@@ -2887,8 +3209,26 @@ intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（fro
 耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
 検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
 空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
-PEP 562 遅延再エクスポートと `__all__` 24 件の pin、履歴のみモード（`utterance=""` + history）の
+PEP 562 遅延再エクスポートと `__all__` 41 件の pin、履歴のみモード（`utterance=""` + history）の
 end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
+
+実行可能意図の宣言と決定的スロット確定も同じ 2 層で検証する。L1 は宣言型の frozen と名前検証・
+`on_invalid_slot` の値検証・`ParameterSpec.model_json_schema()` が警告なしで成立すること・既定
+マージ解決 3 関数・`Slot` の `model_validator` 6 条件（意図的に通す `RESOLVED` + `value=None` の
+1 通りのみが成功すること）・`slot.from_user` と `plan.pending` の判定・`ActionPlan.model_dump()` に
+`spec` / `action_agent` / `resolved_*` / `run_context` 由来のキーが現れないこと・`ActionPlan` が
+`AgentRegistry` を参照するフィールドとプロパティを持たないこと・`parameters_model()` のキャッシュ
+同一性と例外変換・起動時検証 9 種の集約・allowlist 除外の WARNING・結線宣言型（`CandidateSource` /
+`LLMFiller`）の validator と frozen・`bind()` が catalog を変異させず frozen な `ActionPlanner` を
+返すこと・必須結線 3 規則を `agents` 非依存で pin する。L2 は
+`planner.plan()` の LLM 呼び出し回数（不足ありで 1 回 / 不足なしで 0 回 / `predict=False` で 0 回）と
+`detail=True` の戻り値を `FakeModel` で検証する。予測段（`_predict.py`）の合成・専用 `AgentRegistry` の
+生成・ガードレール登録名の境界振り分けは L1 で pin し、adapter（`run_filler_prompt`）は構築済み agent を
+1 回走らせること・`max_turns` が内部定数 1 であること・ガードレール発火時の SDK 例外伝播・usage の
+詰め替えを `FakeModel` で検証する。コア `__all__` のメンバ集合が
+「既存 36 件 + `action_next_turn_agent`」と完全一致することと、直接起動時の次ターン解決の決定表
+（ハンドオフ観測あり = 既存経路へ委譲 / なし = 包括ルール / 包括ルールが `next_agent` なし /
+キー不一致 / `last_agent` なし）および sentinel `source` の非衝突は L1 で pin する。
 
 ML ベース分類器支援は同じ 2 層で検証する。L2 の `test_ml_l2.py` / `test_ml_training_l2.py` は
 `predict_proba` / `classes_` / `fit` を持つ duck-typed fake estimator（sklearn 非依存）で

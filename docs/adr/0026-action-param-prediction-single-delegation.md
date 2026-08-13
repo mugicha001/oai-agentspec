@@ -76,14 +76,18 @@ build-don't-run の逸脱に `ActionPlanner.plan()` 内のパラメータ予測�
 
 強制手段:
 
-- `tests/runtime/intent/test_catalog_plan_l2.py`（**新規作成**）: 「候補 3 件・不足 5 件で
-  `Runner.run` が 1 回」「不足 0 件で 0 回」「`predict=False` で 0 回」を `FakeModel.calls` の
-  件数で pin する。
-- `tests/runtime/intent/test_predict_l1.py`（**新規作成**）: 同一プロンプトセグメントを 2 候補が
-  要求したとき、合成結果に当該セグメントの本文が 1 回だけ現れることを pin する。
-- `tests/_adapters/test_intent_adapter_l2.py`（既存ファイルへ追記）: `run_filler_prompt` が
-  `AgentSpec` から `AgentBuilder` 経由で実体化して 1 回走らせること、`RunResult` からの usage 抽出と
-  未取得判定を検証する。
+- `tests/runtime/intent/test_predict_l1.py`（**新規作成**）: 「候補 3 件・不足 5 件で予測の駆動が
+  1 回」「不足 0 件で 0 回」を pin する。あわせて同一プロンプトセグメントを 2 候補が要求したとき、
+  合成結果に当該セグメントの本文が 1 回だけ現れることを pin する。
+- `tests/runtime/intent/test_catalog_plan_l2.py`（**新規作成**）: `predict=False` / `llm_filler`
+  未結線で `Runner.run` が 0 回であることと、`planner.plan()` から `_predict_params` への委譲が
+  1 回であることを pin する。
+- `tests/_adapters/test_intent_filler_adapter_l2.py`（**新規作成**）: `run_filler_prompt` が
+  構築済みの agent を受け取って 1 回走らせること、`RunResult` からの usage 抽出と未取得判定を
+  検証する。予測エージェント専用 registry の生成と `AgentSpec` の宣言・ガードレール登録名の解決は
+  `runtime/intent/_predict.py` が担う（`registry.py` が `_adapters` を import しているため
+  `_adapters -> registry` は相互参照になる）。Decision の「SDK 接触は `run_filler_prompt` 1 関数に
+  閉じる」はこの分担でも維持される。
 - SDK 隔離 grep（`_adapters` 外に `from agents` / `import agents` を許さない既存計測）に
   新規モジュールを含める。
 
