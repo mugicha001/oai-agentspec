@@ -1,15 +1,23 @@
 """通常の AgentSpec で ShellTool のスキル（environment.skills）を使う例。
 
+スキルを使う本線は SandboxAgent + `Skills` capability（`examples/sandbox/skills.py`）。
+本例はその対比として、サンドボックスを使わない別経路を示す。
+
 スキル機構はサンドボックス専用ではない。SDK の `ShellTool`（次世代 shell ツール）は
 通常の `Agent` に渡せる Tool であり、`environment` にスキル（名前・説明・置き場所）を
 宣言すると、モデルはシェル経由でスキル本文（SKILL.md）を読んで手順に従う:
 
     AgentSpec(tools=[ShellTool(executor=..., environment={"type": "local", "skills": [...]})])
 
+ただしこの経路では、SDK はスキルフォルダの発見もシステムプロンプトへの一覧注入も
+行わない（`environment["skills"]` は TypedDict の入れ物にすぎない）。そのため下記の
+`load_local_skills` のようなメタデータ収集を利用側で自作する必要がある。sandbox 側の
+`Skills` capability はこれを SDK 内で行うため、自作コードは不要になる。
+
 スキルの実体は `examples/skills/<スキル名>/SKILL.md`（frontmatter に name / description、
 本文に手順）。この `<フォルダ>/SKILL.md` レイアウトは SDK の sandbox `Skills` capability が
 実行時発見に使う形式と同一で、`LocalDirLazySkillSource` で SandboxAgentSpec からも同じ
-フォルダを共有できる。
+フォルダを共有できる（`examples/sandbox/skills.py` が同じフォルダを使う）。
 
 本例のスキル本文には「回答へ固有マーカーを含める」という指示が入っている。実行後に
 (1) executor が記録したコマンドログに SKILL.md の読み取りが現れること、(2) 最終回答に
