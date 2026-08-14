@@ -541,7 +541,10 @@ def _deny_tool_call(
         denied_exc: 送出する例外クラス（AGT `PolicyViolationError`）。
 
     Raises:
-        denied_exc: 常に送出する（戻らない）。
+        denied_exc: 常に送出する（戻らない）。送出する例外は
+            `details={"tool_name": ..., "reason": ...}` を持ち、利用側はメッセージ文言を
+            パースせずに拒否ツール名と理由を取得できる。ツール引数は `details` に載せない
+            （引数の置き場は監査 sink のまま。ADR-0030）。
     """
     sink.record(
         agent_id=agent_name,
@@ -549,7 +552,10 @@ def _deny_tool_call(
         decision="deny",
         details={"reason": reason, "arguments": arguments},
     )
-    raise denied_exc(f"governance denied tool {tool_name!r}: {reason}")
+    raise denied_exc(
+        f"governance denied tool {tool_name!r}: {reason}",
+        details={"tool_name": tool_name, "reason": reason},
+    )
 
 
 def _govern_tool(
@@ -654,7 +660,8 @@ def _make_audit_hooks(
     Raises:
         denied_exc: 返されたフックの `on_tool_start` が、MCP 由来ツールでポリシー違反を検出した
             場合、または引数（`context.tool_arguments`）が取得できず評価不能な場合（fail-closed）
-            に送出する（`policy` 指定時のみ）。
+            に送出する（`policy` 指定時のみ）。送出する例外は `_deny_tool_call` と同じ
+            `details={"tool_name": ..., "reason": ...}` を持つ（ツール引数は載せない）。
     """
     # `chain_agent_hooks` は関数内遅延 import に留める（トップレベル禁止）。
     # `import oai_agentspec` -> `_adapters/__init__.py` -> `governance` の連鎖で本モジュールは

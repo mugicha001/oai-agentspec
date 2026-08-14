@@ -838,7 +838,8 @@ async def test_real_sdk_mcp_function_tool_is_evaluated_by_audit_hooks() -> None:
     偽装 origin ではなく `MCPUtil.to_function_tool` の生成物を `on_tool_start` へ渡し、
     ポリシー評価が実際に走ることをエンドツーエンドで固定する。deny 側だけでは
     「常に deny」変異と区別できないため、同一ツールを allow するポリシーで素通ることも
-    併せて確認する。
+    併せて確認する。deny 側では実 `PolicyViolationError` の構造化 payload（`details`）も
+    同居して固定する（fake 例外ではなく実 AGT 例外で成立することの実証）。
     """
     server = _StubMCPServer(name="srv")
     tool = _real_mcp_function_tool(server)
@@ -856,8 +857,21 @@ async def test_real_sdk_mcp_function_tool_is_evaluated_by_audit_hooks() -> None:
         denied_exc=PolicyViolationError,
         agent_name="bot",
     )
-    with pytest.raises(PolicyViolationError, match="read"):
+    with pytest.raises(PolicyViolationError, match="read") as excinfo:
         await deny_hooks.on_tool_start(ctx, _Named("bot"), tool)
+    # 実 `PolicyViolationError` 上で拒否 payload が成立することを併せて固定する。`reason` は
+    # AGT 生成の人間可読文言（機械判別のキーではない）ため値をリテラル固定せず、非空であること
+    # と送出メッセージへ載っていることの 2 点で見る（`in` だけでは空文字が常に真で素通りする）。
+    assert set(excinfo.value.details) == {"tool_name", "reason"}, (
+        f"拒否例外の payload キー集合が変わった: {excinfo.value.details!r}"
+    )
+    assert excinfo.value.details["tool_name"] == "read"
+    assert excinfo.value.details["reason"]
+    assert excinfo.value.details["reason"] in str(excinfo.value)
+    assert excinfo.value.error_code == "POLICY_VIOLATION"
+    # 本経路は `from_check_result` を通らないため `check_result` は None のまま（ADR-0030 の
+    # Consequences。由来の判別に `check_result` を使う利用側コードが従来どおり動く前提）。
+    assert excinfo.value.check_result is None
     assert [(e.action, e.decision) for e in deny_sink.get_entries()] == [
         ("tool_start:read", "allow"),
         ("tool:read", "deny"),
@@ -1258,6 +1272,13 @@ async def test_agent_hooks_replacement_drops_mcp_enforcement_not_spec_tools() ->
         "（build 時ラップが tool 自身へ焼き込まれる前提が壊れた）。"
         f" 実際の __cause__: {excinfo.value.__cause__!r}"
     )
+    # docs が案内する取得形（`exc.__cause__.details`）が実 `Runner.run` 経由の公開経路で
+    # 成立することの実証（`__cause__` は参照なので payload がラップで失われる経路は無い）。
+    cause = excinfo.value.__cause__
+    assert set(cause.details) == {"tool_name", "reason"}, (
+        f"公開経路で辿れる拒否 payload のキー集合が変わった: {cause.details!r}"
+    )
+    assert cause.details["tool_name"] == "echo"
     assert invoked == []  # 実関数へは到達しない
     # per-call の `tool:` レコードはラップ内で記録されるため残る（消えるのはフック由来の記録のみ）。
     assert [(e.agent_id, e.action, e.decision) for e in tool_sink.get_entries()] == [
