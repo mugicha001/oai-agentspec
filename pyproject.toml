@@ -55,6 +55,13 @@ lightning = [
     # patch リリース (0.3.x) を含めて固定する。次の 0.3.x が出たら回帰確認の上で pin を上げる。
     "agentlightning[apo]>=0.3,<0.3.1",
 ]
+finetune = [
+    # openai-agents の推移依存として既に入っているが、runtime/finetune/ 配下（段階的に
+    # `client.fine_tuning.jobs.*` を呼ぶ `_adapters`）が直接依存する意図で明示宣言する。
+    # 範囲は openai-agents 0.17.4 の `Requires-Dist: openai<3,>=2.36.0` と一致させる
+    # （`fine_tuning.jobs.create` の `method` パラメータ = DPO 指定はこの下限で利用できる）。
+    "openai>=2.36.0,<3",
+]
 governance = [
     # ツール単位ポリシー強制 (`govern`) + 監査ログ + openai-agents 連携アダプタを使う。
     # `[openai-agents]` extra で core / integrations / structlog を取り込む（軽量・grpc/azure/

@@ -1,4 +1,4 @@
-"""lib 独自例外（9 種）の統一窓口（再エクスポート専用・agents 非依存）。
+"""lib 独自例外（10 種）の統一窓口（再エクスポート専用・agents 非依存）。
 
 利用者が例外の定義元モジュールを把握しなくても ``oai_agentspec.exceptions`` 単体を
 import すれば全種を捕捉できるようにする窓口。定義元は変更せず（既存の公開契約を維持）、
@@ -6,15 +6,17 @@ import すれば全種を捕捉できるようにする窓口。定義元は変�
 
 シンボルは取得方法で 2 系統に分かれる。
 
-- 直 import（7 種）: ``RegistryFrozenError`` / ``IntegrityError`` /
+- 直 import（8 種）: ``RegistryFrozenError`` / ``IntegrityError`` /
   ``PromptTemplateIntegrityError`` / ``PromptResolutionError`` / ``WorkflowFrozenError`` /
-  ``RunBudgetExceeded`` / ``ConversationError``。定義元モジュール（``.registry`` /
-  ``.integrity`` / ``.prompts`` / ``.workflow.graph`` /
-  ``.runtime.resilience._errors`` / ``.runtime.conversation.types``）はいずれも
+  ``RunBudgetExceeded`` / ``ConversationError`` / ``FineTuneError``。定義元モジュール
+  （``.registry`` / ``.integrity`` / ``.prompts`` / ``.workflow.graph`` /
+  ``.runtime.resilience._errors`` / ``.runtime.conversation.types`` /
+  ``.runtime.finetune.types``）はいずれも
   ``agents`` / ``openai`` は非依存で、追加の外部依存も持たない。窓口 import 時に
   発火しても NFR-1（SDK 隔離）にも extra 未導入耐性にも抵触しないため、
   ``runtime/resilience/__init__.py`` の直 import 分（``ModelRetryPolicy`` 等）と
-  同じ理由で直 import としてよい。
+  同じ理由で直 import としてよい（``finetune`` extra は ``openai`` を宣言するが、
+  ``.runtime.finetune.types`` は純データ層で追加の外部依存を発火しない）。
 
 - PEP 562 遅延取得（2 種）: ``OptimizeError``（``.runtime.lightning.types``）/
   ``ConversationClientError``（``.runtime.cli._models``）。この 2 種は
@@ -39,12 +41,14 @@ from .integrity import IntegrityError, PromptTemplateIntegrityError
 from .prompts import PromptResolutionError
 from .registry import RegistryFrozenError
 from .runtime.conversation.types import ConversationError
+from .runtime.finetune.types import FineTuneError
 from .runtime.resilience._errors import RunBudgetExceeded
 from .workflow.graph import WorkflowFrozenError
 
 __all__ = [
     "ConversationClientError",  # noqa: F822 - PEP 562 __getattr__ による遅延解決（下記参照）
     "ConversationError",
+    "FineTuneError",
     "IntegrityError",
     "OptimizeError",  # noqa: F822 - PEP 562 __getattr__ による遅延解決（下記参照）
     "PromptResolutionError",
