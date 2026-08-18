@@ -386,6 +386,11 @@ def test_sft_tools_invalid_element_raises_even_with_skip_missing() -> None:
             {"input": [{"role": "user"}], "expected_output": "回答"},
             id="message-without-content-or-tool-calls",
         ),
+        pytest.param({"input": [42], "expected_output": "回答"}, id="message-element-not-dict"),
+        pytest.param(
+            {"input": [{"content": "x"}], "expected_output": "回答"},
+            id="message-element-without-role",
+        ),
     ],
 )
 def test_sft_missing_or_boundary_cases_raise_by_default(case: dict[str, Any]) -> None:
@@ -403,6 +408,15 @@ def test_sft_missing_or_boundary_cases_raise_by_default(case: dict[str, Any]) ->
         pytest.param({"input": [], "expected_output": "回答"}, id="input-empty-list"),
         pytest.param({"input": 123, "expected_output": "回答"}, id="input-invalid-type"),
         pytest.param({"input": "質問", "expected_output": []}, id="output-empty-array"),
+        pytest.param(
+            {"input": [{"role": "user"}], "expected_output": "回答"},
+            id="message-without-content-or-tool-calls",
+        ),
+        pytest.param({"input": [42], "expected_output": "回答"}, id="message-element-not-dict"),
+        pytest.param(
+            {"input": [{"content": "x"}], "expected_output": "回答"},
+            id="message-element-without-role",
+        ),
     ],
 )
 def test_sft_missing_or_boundary_cases_are_skipped_when_opted_in(case: dict[str, Any]) -> None:
@@ -722,6 +736,10 @@ def test_validate_flags_tool_message_without_content(tmp_path: Path) -> None:
             {"role": "assistant", "content": "回答", "weight": 1.0}, id="weight-float-1.0"
         ),
         pytest.param({"role": "assistant", "content": "回答", "weight": True}, id="weight-bool"),
+        pytest.param({"role": "assistant", "content": "回答", "weight": 2}, id="weight-int-2"),
+        pytest.param(
+            {"role": "assistant", "content": "回答", "weight": -1}, id="weight-int-minus1"
+        ),
     ],
 )
 def test_validate_flags_invalid_weight(tmp_path: Path, message: dict[str, Any]) -> None:
@@ -730,6 +748,21 @@ def test_validate_flags_invalid_weight(tmp_path: Path, message: dict[str, Any]) 
     report = validate_dataset(_write_jsonl(tmp_path, [record]), method="sft")
 
     assert report.ok is False
+
+
+@pytest.mark.parametrize("weight", [pytest.param(0, id="weight-0"), pytest.param(1, id="weight-1")])
+def test_validate_accepts_legal_weight_on_assistant(tmp_path: Path, weight: int) -> None:
+    """assistant の weight 0 / 1 は合法値として合格する（過大検知の退行 pin）。"""
+    record = {
+        "messages": [
+            {"role": "user", "content": "質問"},
+            {"role": "assistant", "content": "回答", "weight": weight},
+        ]
+    }
+    report = validate_dataset(_write_jsonl(tmp_path, [record]), method="sft")
+
+    assert report.ok is True
+    assert report.violations == ()
 
 
 def test_validate_does_not_check_weight_for_dpo(tmp_path: Path) -> None:
@@ -772,9 +805,112 @@ def test_validate_flags_unparsable_json_line(tmp_path: Path) -> None:
     assert [v.line for v in report.violations] == [2]
 
 
+def test_validate_flags_non_dict_message_in_sft_messages() -> None:
+    """messages 要素が dict でない場合は違反として報告する。"""
+    record = {"messages": ["user: hi", {"role": "assistant", "content": "a"}]}
+    report = validate_dataset([record], method="sft")
+
+    assert report.ok is False
+    assert any("dict でない" in violation.reason for violation in report.violations)
+    assert any("messages[0]" in violation.reason for violation in report.violations)
+
+
+def test_validate_flags_non_dict_message_in_dpo_preferred_output() -> None:
+    """DPO の出力配列要素が dict でない場合も違反として報告する。"""
+    record = {
+        "input": {"messages": [{"role": "user", "content": "質問"}]},
+        "preferred_output": ["p"],
+        "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+    }
+    report = validate_dataset([record], method="dpo")
+
+    assert report.ok is False
+    assert any("dict でない" in violation.reason for violation in report.violations)
+    assert any("preferred_output[0]" in violation.reason for violation in report.violations)
+
+
 # ----------------------------------------------------------------------
 # validate_dataset: 違反ケース（DPO）
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("record", "expected_reason_fragment"),
+    [
+        pytest.param(123, "JSON オブジェクトでない", id="record-not-dict"),
+        pytest.param(
+            {
+                "input": "質問",
+                "preferred_output": [{"role": "assistant", "content": "良"}],
+                "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+            },
+            "'input' が JSON オブジェクトでない",
+            id="input-not-dict",
+        ),
+        pytest.param(
+            {
+                "input": {"tools": []},
+                "preferred_output": [{"role": "assistant", "content": "良"}],
+                "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+            },
+            "'input.messages' が存在しない",
+            id="input-messages-key-missing",
+        ),
+        pytest.param(
+            {
+                "input": {"messages": [{"role": "user", "content": "質問"}]},
+                "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+            },
+            "'preferred_output'",
+            id="preferred-output-missing",
+        ),
+        pytest.param(
+            {
+                "input": {"messages": [{"role": "user", "content": "質問"}]},
+                "preferred_output": [],
+                "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+            },
+            "'preferred_output'",
+            id="preferred-output-empty-list",
+        ),
+        pytest.param(
+            {
+                "input": {"messages": [{"role": "user", "content": "質問"}]},
+                "preferred_output": "良",
+                "non_preferred_output": [{"role": "assistant", "content": "悪"}],
+            },
+            "'preferred_output'",
+            id="preferred-output-not-list",
+        ),
+        pytest.param(
+            {
+                "input": {"messages": [{"role": "user", "content": "質問"}]},
+                "preferred_output": [{"role": "assistant", "content": "良"}],
+            },
+            "'non_preferred_output'",
+            id="non-preferred-output-missing",
+        ),
+        pytest.param(
+            {
+                "input": {"messages": [{"role": "user", "content": "質問"}]},
+                "preferred_output": [{"role": "assistant", "content": "良"}],
+                "non_preferred_output": [],
+            },
+            "'non_preferred_output'",
+            id="non-preferred-output-empty-list",
+        ),
+    ],
+)
+def test_validate_flags_structural_violations_for_dpo(
+    record: Any, expected_reason_fragment: str
+) -> None:
+    """DPO レコードの構造違反はバリデータ経路で ok=False と理由付きで報告される。"""
+    report = validate_dataset([record], method="dpo")
+
+    assert report.ok is False
+    assert any(expected_reason_fragment in violation.reason for violation in report.violations), [
+        violation.reason for violation in report.violations
+    ]
 
 
 def test_validate_flags_non_assistant_role_in_preference_output(tmp_path: Path) -> None:
@@ -1307,6 +1443,40 @@ def test_validate_accepts_records_built_by_to_sft_dataset() -> None:
 
     assert report.ok is True
     assert report.checked == 2
+
+
+# ----------------------------------------------------------------------
+# 変換ヘルパ: エラーメッセージの位置情報
+# ----------------------------------------------------------------------
+
+
+def test_sft_case_error_message_reports_one_based_case_index() -> None:
+    """ケース位置は 1 始まりで載る（2 件目の不備なら「ケース 2」）。"""
+    with pytest.raises(FineTuneError) as exc_info:
+        to_sft_dataset([{"input": "質問", "expected_output": "回答"}, {"input": "質問のみ"}])
+
+    assert "ケース 2" in exc_info.value.message
+
+
+def test_dpo_case_error_message_reports_one_based_case_index() -> None:
+    """DPO も同様にケース位置を 1 始まりで載せる。"""
+    with pytest.raises(FineTuneError) as exc_info:
+        to_dpo_dataset(
+            [
+                {"input": "質問", "preferred_output": "良", "non_preferred_output": "悪"},
+                {"input": "質問", "preferred_output": "良"},
+            ]
+        )
+
+    assert "ケース 2" in exc_info.value.message
+
+
+def test_tools_error_message_reports_zero_based_element_position() -> None:
+    """`tools=` の不正要素は 0 始まりの位置表記で載る（2 要素目なら tools[1]）。"""
+    with pytest.raises(FineTuneError) as exc_info:
+        to_sft_dataset([{"input": "質問", "expected_output": "回答"}], tools=[{}, 42])
+
+    assert "tools[1]" in exc_info.value.message
 
 
 # ----------------------------------------------------------------------

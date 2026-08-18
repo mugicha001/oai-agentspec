@@ -1,7 +1,7 @@
 """L1: `oai_agentspec.exceptions` 統一窓口の契約テスト（直 import + PEP 562 遅延）。
 
 `runtime/resilience/__init__.py` の窓口テストパターンを踏襲する。lib 独自例外 10 種を
-再エクスポートする窓口で、コア層と外部依存ゼロの extra 例外（7 種）は直 import、
+再エクスポートする窓口で、コア層と外部依存ゼロの extra 例外（8 種）は直 import、
 外部依存を持つ extra 例外（`OptimizeError` / `ConversationClientError`）は PEP 562 遅延取得。
 定義実体は既存モジュールに残るため isinstance / issubclass は完全互換。
 """
@@ -21,16 +21,13 @@ _DIRECT_SYMBOLS = {
     "WorkflowFrozenError",
     "RunBudgetExceeded",
     "ConversationError",
+    "FineTuneError",
 }
 _LAZY_SYMBOLS = {
     "OptimizeError",
     "ConversationClientError",
 }
-# `finetune` extra の構造化エラー（取得方法は実装側の選択に委ねず membership のみ pin する）。
-_FINETUNE_SYMBOLS = {
-    "FineTuneError",
-}
-_EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS | _FINETUNE_SYMBOLS
+_EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
@@ -42,7 +39,7 @@ def test_all_membership_pinned() -> None:
 
 
 def test_direct_symbols_are_directly_imported() -> None:
-    """直 import 対象 7 種は module import 時点で `__dict__` に載る。"""
+    """直 import 対象 8 種は module import 時点で `__dict__` に載る。"""
     from oai_agentspec import exceptions as mod
 
     for name in _DIRECT_SYMBOLS:
@@ -75,12 +72,13 @@ def test_lazy_symbols_match_definition_module() -> None:
 
 
 def test_direct_symbols_match_definition_modules() -> None:
-    """直 import 7 種の実体も定義元と `is` 一致する（isinstance / issubclass 完全互換）。"""
+    """直 import 8 種の実体も定義元と `is` 一致する（isinstance / issubclass 完全互換）。"""
     from oai_agentspec import exceptions as mod
     from oai_agentspec.integrity import IntegrityError, PromptTemplateIntegrityError
     from oai_agentspec.prompts import PromptResolutionError
     from oai_agentspec.registry import RegistryFrozenError
     from oai_agentspec.runtime.conversation.types import ConversationError
+    from oai_agentspec.runtime.finetune.types import FineTuneError
     from oai_agentspec.runtime.resilience._errors import RunBudgetExceeded
     from oai_agentspec.workflow.graph import WorkflowFrozenError
 
@@ -91,6 +89,7 @@ def test_direct_symbols_match_definition_modules() -> None:
     assert mod.WorkflowFrozenError is WorkflowFrozenError
     assert mod.RunBudgetExceeded is RunBudgetExceeded
     assert mod.ConversationError is ConversationError
+    assert mod.FineTuneError is FineTuneError
 
 
 def test_all_symbols_are_resolvable_and_are_exception_classes() -> None:

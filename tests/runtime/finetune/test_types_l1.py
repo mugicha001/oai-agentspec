@@ -195,6 +195,23 @@ def test_build_result_does_not_write_without_save(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+def test_save_overwrites_existing_file_instead_of_appending(tmp_path: Path) -> None:
+    """save は既存ファイルを上書きする（追記しない・2 回目の records だけが残る）。"""
+    target = tmp_path / "train.jsonl"
+    first = (
+        {"messages": [{"role": "user", "content": "1 回目 a"}]},
+        {"messages": [{"role": "user", "content": "1 回目 b"}]},
+    )
+    second = ({"messages": [{"role": "user", "content": "2 回目"}]},)
+    DatasetBuildResult(records=first, skipped=0).save(target)
+    DatasetBuildResult(records=second, skipped=0).save(target)
+
+    lines = target.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert [json.loads(line) for line in lines] == list(second)
+    assert "1 回目" not in target.read_text(encoding="utf-8")
+
+
 # ----------------------------------------------------------------------
 # DatasetViolation / DatasetValidationReport
 # ----------------------------------------------------------------------
