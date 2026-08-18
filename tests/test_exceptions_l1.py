@@ -1,6 +1,6 @@
 """L1: `oai_agentspec.exceptions` 統一窓口の契約テスト（直 import + PEP 562 遅延）。
 
-`runtime/resilience/__init__.py` の窓口テストパターンを踏襲する。lib 独自例外 9 種を
+`runtime/resilience/__init__.py` の窓口テストパターンを踏襲する。lib 独自例外 10 種を
 再エクスポートする窓口で、コア層と外部依存ゼロの extra 例外（7 種）は直 import、
 外部依存を持つ extra 例外（`OptimizeError` / `ConversationClientError`）は PEP 562 遅延取得。
 定義実体は既存モジュールに残るため isinstance / issubclass は完全互換。
@@ -26,15 +26,19 @@ _LAZY_SYMBOLS = {
     "OptimizeError",
     "ConversationClientError",
 }
-_EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
+# `finetune` extra の構造化エラー（取得方法は実装側の選択に委ねず membership のみ pin する）。
+_FINETUNE_SYMBOLS = {
+    "FineTuneError",
+}
+_EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS | _FINETUNE_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 9 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 10 件で設計仕様通りのメンバ集合と一致する。"""
     from oai_agentspec import exceptions as mod
 
     assert set(mod.__all__) == _EXPECTED_ALL
-    assert len(mod.__all__) == 9
+    assert len(mod.__all__) == 10
 
 
 def test_direct_symbols_are_directly_imported() -> None:
@@ -90,7 +94,7 @@ def test_direct_symbols_match_definition_modules() -> None:
 
 
 def test_all_symbols_are_resolvable_and_are_exception_classes() -> None:
-    """`__all__` の全 9 シンボルは getattr で解決でき、いずれも BaseException のサブクラス。"""
+    """`__all__` の全 10 シンボルは getattr で解決でき、いずれも BaseException のサブクラス。"""
     from oai_agentspec import exceptions as mod
 
     for name in mod.__all__:
@@ -108,8 +112,23 @@ def test_getattr_unknown_attribute_raises() -> None:
 
 
 def test_dir_includes_all_symbols_even_before_access() -> None:
-    """`dir()` は未 import 状態でも `__all__` の全 9 シンボルを含む。"""
+    """`dir()` は未 import 状態でも `__all__` の全 10 シンボルを含む。"""
     from oai_agentspec import exceptions as mod
 
     listing = set(mod.__dir__())
     assert _EXPECTED_ALL.issubset(listing)
+
+
+def test_finetune_error_is_exposed_from_window() -> None:
+    """`FineTuneError` は窓口から取得でき、定義元と `is` 一致する（完全互換）。"""
+    from oai_agentspec.exceptions import FineTuneError
+    from oai_agentspec.runtime.finetune import FineTuneError as DefinedFineTuneError
+
+    assert FineTuneError is DefinedFineTuneError
+
+
+def test_finetune_error_is_listed_in_all() -> None:
+    """`__all__` に `FineTuneError` が含まれる（窓口の公開契約）。"""
+    from oai_agentspec import exceptions as mod
+
+    assert "FineTuneError" in mod.__all__
