@@ -101,7 +101,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops` / `runtime/observability`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/finetune` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops` / `runtime/observability`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse` / Agent 365 オブザーバビリティ拡張 `microsoft_agents_a365` 系 / OTel SDK `opentelemetry`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -124,7 +124,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `action_next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
-| `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
+| `exceptions.py` | lib 独自例外 10 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
 | `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/observability`（オブザーバビリティ連携・公開窓口・`observability` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）/ `runtime/deterministic`（決定的応答モデルと応答ビルダの公開窓口・extra 不要＝追加依存なし。詳細は「決定的応答モデル」節）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
@@ -243,12 +243,12 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 壊れず、遅延 2 種の親パッケージ（`runtime.lightning` / `runtime.cli`）を連鎖 import しない（PEP 562 遅延の
 実効性を subprocess 隔離テストで担保する）。
 
-`__all__` は次の 9 例外を掲載する。取得方式は依存の重さで振り分ける:
+`__all__` は次の 10 例外を掲載する。取得方式は依存の重さで振り分ける:
 
-- **直 import（7 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
+- **直 import（8 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
   `PromptTemplateIntegrityError`（`integrity`）/ `PromptResolutionError`（`prompts`）/
   `WorkflowFrozenError`（`workflow/graph`）/ `RunBudgetExceeded`（`runtime/resilience/_errors`）/
-  `ConversationError`（`runtime/conversation/types`）
+  `ConversationError`（`runtime/conversation/types`）/ `FineTuneError`（`runtime/finetune/types`）
 - **PEP 562 遅延取得（`__getattr__` / `__dir__`・2 種）**: `OptimizeError`（`runtime/lightning/types`）/
   `ConversationClientError`（`runtime/cli/_models`）。サブモジュール import が親 package `__init__` を
   実行する分の import コスト膨張を避け、将来の import 構造変更に対し窓口を頑健に保つため遅延する。
@@ -1835,7 +1835,8 @@ openai を明示宣言する）であり、公開窓口・extra 未導入契約�
 （規約の SoT は既存節・本節では再掲しない）。`runtime/lightning` との棲み分け: lightning はローカル最適化
 （APO によるプロンプト改善 / RL によるモデル更新）を担い、finetune はマネージドプラットフォーム上の SFT / DPO
 ジョブ向けデータを担う別トラックとして併存する。データセット整形・検証は SDK / openai / ネットワークに一切
-触れない純データ層で、`_adapters` / コアへの依存辺すら持たない（`tools=` で受ける FunctionTool 相当オブジェクトは
+触れない純データ層で、`_adapters` / SDK への依存辺を持たず、コアへは共有 leaf `_validation`
+（bool フィールドの構築時検証）への上向き参照のみを持つ（`tools=` で受ける FunctionTool 相当オブジェクトは
 `name` / `params_json_schema` 属性のダックタイピングで判別するため、import 依存辺は増えない）。
 
 公開窓口は `oai_agentspec.runtime.finetune` の `__init__.py` に集約し、変換ヘルパ（`to_sft_dataset` /
