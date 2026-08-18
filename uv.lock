@@ -2004,6 +2004,9 @@ cli = [
     { name = "rich" },
     { name = "websockets" },
 ]
+finetune = [
+    { name = "openai" },
+]
 governance = [
     { name = "agent-governance-toolkit", extra = ["openai-agents"] },
 ]
@@ -2052,6 +2055,7 @@ requires-dist = [
     { name = "langfuse", marker = "extra == 'llmops-langfuse'", specifier = ">=4.0" },
     { name = "microsoft-agents-a365-observability-extensions-openai", marker = "extra == 'observability'", specifier = ">=1.0" },
     { name = "oai-agentspec", extras = ["llmops"], marker = "extra == 'llmops-langfuse'" },
+    { name = "openai", marker = "extra == 'finetune'", specifier = ">=2.36.0,<3" },
     { name = "openai-agents", specifier = ">=0.17.4" },
     { name = "opentelemetry-exporter-otlp-proto-http", marker = "extra == 'observability'", specifier = ">=1.36" },
     { name = "opentelemetry-sdk", marker = "extra == 'observability'", specifier = ">=1.36" },
@@ -2061,7 +2065,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'serve'", specifier = ">=0.27" },
     { name = "websockets", marker = "extra == 'cli'", specifier = ">=12" },
 ]
-provides-extras = ["conversation", "guardrails", "resilience", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "governance", "intent", "observability"]
+provides-extras = ["conversation", "guardrails", "resilience", "serve", "cli", "llmops", "llmops-langfuse", "lightning", "finetune", "governance", "intent", "observability"]
 
 [package.metadata.requires-dev]
 dev = [

@@ -46,6 +46,8 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ Agent Lightning 最適化 (runtime/lightning 公開窓口・lightning extra・agents/agentlightning 非依存・上位利用支援層)
    │
+   ┊ マネージド Fine-Tuning 統合 (runtime/finetune 公開窓口・finetune extra・agents/openai 非依存・純データ変換層)
+   │
    ┊ AGT ガバナンス (runtime/governance 公開窓口・governance extra・agents/agent-governance-toolkit 非依存・装飾 builder)
    │
    ┊ 意図予測 (runtime/intent 公開窓口・intent extra・agents 非依存・pydantic BaseModel ベース・上位利用支援層)
@@ -99,7 +101,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 - 単方向 import 依存（コア公開 API -> 各層 -> `_adapters` -> `agents`、および runtime -> コア）と公開境界
   （コア `__all__` = 宣言層シンボルのみ / 会話シンボルは `runtime/conversation` 公開窓口 / サーバ入口・CLI
   クライアントは公開 API ツリー外）の整合を保つ。詳細は「会話 Helper（ローカル開発支援）」節を参照。
-- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops` / `runtime/observability`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
+- 依存方向（単方向）: `__init__` -> {`registry`, `handoffs`, `prompts`, `workflow`} -> {`protocols`, `_adapters`} -> `spec` -> (`agents` は `_adapters` のみ)。`spec` と並ぶ最下層に共有 leaf として `_validation`（共有バリデーションヘルパ・`agents` 非依存。`registry` / `next_turn` / `tool_registry` / `realtime/registry` / `realtime/handoffs` / `_adapters` と runtime 各 extra（`runtime/resilience` / `runtime/conversation` / `runtime/finetune` / `runtime/guardrails` / `runtime/lightning` / `runtime/llmops` / `runtime/observability`）が下向きに参照）と `_mermaid`（Mermaid 整形の純フォーマッタ。`handoffs` / `realtime/handoffs` が下向きに参照）と `_registry_core`（registry の遅延構築骨格の純ヘルパ。`registry` / `realtime/registry` が下向きに参照）と `agent_names`（エージェント名定数簿と整合検査。stdlib のみに依存し、コア内のどのモジュールからも参照されない葉。`__init__` が公開のために import するだけ）がある。runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/llmops` / `runtime/governance` / `runtime/deterministic`）はコアへ依存するが、コアは runtime へ依存しない。
 - `workflow/` パッケージは `agents` 非依存であり、SDK 実体（`WorkflowModel` / `workflow_as_tool` / runner シーム本番実装）は `_adapters` に閉じる。依存は `workflow -> _adapters -> agents` の一方向で、循環 import を作らない。`workflow/` がパッケージ化されても（ファサード本体ロジックを内部サブモジュールへ分割しても）この一方向は不変であり、`_adapters` への参照は関数内遅延 import で循環を回避する。
 - `spec.py`（`AgentSpec`）と `protocols.py` は `agents` をランタイム import しない。SDK 型（`Agent`）は `TYPE_CHECKING` ブロック内で `from ._adapters import ...` の型エイリアスとして参照する。
 - `agents` パッケージへの import は `_adapters/` に集約する。計測基準: `grep -rnE "(from agents|import agents)" src/oai_agentspec/ | grep -v _adapters` の結果が空になること。外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse` / Agent 365 オブザーバビリティ拡張 `microsoft_agents_a365` 系 / OTel SDK `opentelemetry`）の import も同様に `_adapters/` 配下のみに閉じる（同型 grep で `_adapters` 外に出ないこと）。
@@ -122,7 +124,7 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | `next_turn.py` | `NextTurnRule` / `NextTurnPolicy` / `resolve_next_agent` / `next_turn_agent` / `action_next_turn_agent` / `apply_next_turn_policy`。次ターン開始エージェントの宣言的上書きと到達時ハンドオフ禁止の宣言・解決・結線。`agents` 非依存（SDK 結線は `_adapters/next_turn.py`）。詳細は「Next-Turn Agent Override」節 |
 | `workflow/` | `WorkflowGraph`（ノード/エッジ宣言 DSL）/ `START` / `END` / `NodeResults` / 内部インタプリタ / 非公開 runner シーム Protocol / `default_input_filter` / `as_agent_spec` / `as_facade_spec`。公開型・宣言値 dataclass 群・`WorkflowGraph` 本体・内部インタプリタ・Agent/Tool 化ファサードのサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする。`agents` 非依存（SDK 型は TYPE_CHECKING / Protocol のみ参照） |
 | `integrity.py` | runtime インテグリティ防御の公開窓口。`lockdown` 関数 + 例外型（`IntegrityError` / `PromptTemplateIntegrityError`）+ 型エイリアス `IntegrityCheck` を公開。`agents` 非依存・標準 lib のみ（`hashlib` / `importlib.metadata` / `pathlib` / `sys`）依存のコア層最下層。`PromptStore.__init__` シグネチャは不変で、検証 / preload は `lockdown` 経由で発火する |
-| `exceptions.py` | lib 独自例外 9 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
+| `exceptions.py` | lib 独自例外 10 種の再エクスポート統一窓口（`oai_agentspec.exceptions`）。定義実体は各モジュールに残し isinstance/issubclass 完全互換を保つ。コア依存鎖に属さない横断窓口で `__init__.py` から import されない。詳細は「例外の統一窓口」節 |
 | `realtime/` | Realtime エージェントの専用宣言ルート（コア公開 API ツリー外・宣言層）。`RealtimeAgentSpec` / `RealtimeHandoffConfig`（`agents` 非依存・最下層）・`RealtimeAgentBuilder` Protocol・`RealtimeAgentRegistry`（2 パス遅延バインド・handoff 結線・validate）・宣言的ハンドオフグラフ DSL（`RealtimeHandoffGraph` / `RealtimeHandoffEdge` / `from_specs`）・公開窓口 `oai_agentspec.realtime` を持つ。SDK 結合（`agents.realtime`）は `_adapters/realtime.py` に閉じ、`realtime/` からの参照は `_adapters`・共有 leaf（`_validation` / `_mermaid`）への上向き単方向のみ。コアから `realtime/` への依存辺はない |
 | `runtime/` | 実行寄り層（ローカル開発支援）の集約 namespace。`runtime/conversation`（会話サービス・公開窓口）/ `runtime/serve`（FastAPI サーバ入口・`serve` extra）/ `runtime/cli`（CLI クライアント・`cli` extra）/ `runtime/llmops`（LLMOps 評価・公開窓口・採点コア `llmops` extra + 任意の観測 `llmops-langfuse` extra）/ `runtime/lightning`（Agent Lightning プロンプト最適化・公開窓口・`lightning` extra）/ `runtime/governance`（AGT ガバナンス・公開窓口・`governance` extra）/ `runtime/intent`（意図予測・公開窓口・`intent` extra）/ `runtime/resilience`（Resilience 宣言型・公開窓口・`resilience` extra）/ `runtime/observability`（オブザーバビリティ連携・公開窓口・`observability` extra）/ `runtime/hooks`（hooks 合成ヘルパーの公開窓口・extra 不要＝`agents` はコア依存。run 単位 `RunHooksBase` 用 `chain_hooks` と agent 単位 `AgentHooksBase` 用 `chain_agent_hooks` の 2 ヘルパーを持つ）/ `runtime/deterministic`（決定的応答モデルと応答ビルダの公開窓口・extra 不要＝追加依存なし。詳細は「決定的応答モデル」節）を直下サブパッケージに持つ。各サブパッケージの `__init__.py` を公開窓口とする。`runtime/__init__.py` は再エクスポートしない最小の予約 namespace。runtime からコア（`_adapters` / `registry` / `constants`）と宣言層型（read-only）への上向き参照のみを持ち、コアは runtime へ依存しない |
 
@@ -241,12 +243,12 @@ lib 独自例外は各モジュールに定義実体を持つが、利用者が 
 壊れず、遅延 2 種の親パッケージ（`runtime.lightning` / `runtime.cli`）を連鎖 import しない（PEP 562 遅延の
 実効性を subprocess 隔離テストで担保する）。
 
-`__all__` は次の 9 例外を掲載する。取得方式は依存の重さで振り分ける:
+`__all__` は次の 10 例外を掲載する。取得方式は依存の重さで振り分ける:
 
-- **直 import（7 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
+- **直 import（8 種・追加依存ゼロ）**: `RegistryFrozenError`（`registry`）/ `IntegrityError`・
   `PromptTemplateIntegrityError`（`integrity`）/ `PromptResolutionError`（`prompts`）/
   `WorkflowFrozenError`（`workflow/graph`）/ `RunBudgetExceeded`（`runtime/resilience/_errors`）/
-  `ConversationError`（`runtime/conversation/types`）
+  `ConversationError`（`runtime/conversation/types`）/ `FineTuneError`（`runtime/finetune/types`）
 - **PEP 562 遅延取得（`__getattr__` / `__dir__`・2 種）**: `OptimizeError`（`runtime/lightning/types`）/
   `ConversationClientError`（`runtime/cli/_models`）。サブモジュール import が親 package `__init__` を
   実行する分の import コスト膨張を避け、将来の import 構造変更に対し窓口を頑健に保つため遅延する。
@@ -1824,6 +1826,126 @@ callable のとき既定 build が SDK 規約 `(context, agent) -> str` の動�
 `tool_mocks` / `approvals` 未指定時は rollout を宣言どおり実行する。
 
 Agent Lightning を LLMOps トラックへ振り分けた検討経緯は `docs/rationale/agt-governance-integration.md` を参照。
+
+## マネージド Fine-Tuning 統合（データセット整形・検証支援）
+
+OpenAI / Azure OpenAI のマネージド fine-tuning API（SFT / DPO）向けのデータセット整形（chat / preference 形式への
+変換）と持ち込み JSONL の検証を提供する層。`runtime/` 配下の一員（`runtime/finetune`・`finetune` extra。extra は
+openai を明示宣言する）であり、公開窓口・extra 未導入契約・SDK 隔離方針は llmops / lightning と同型に従う
+（規約の SoT は既存節・本節では再掲しない）。`runtime/lightning` との棲み分け: lightning はローカル最適化
+（APO によるプロンプト改善 / RL によるモデル更新）を担い、finetune はマネージドプラットフォーム上の SFT / DPO
+ジョブ向けデータを担う別トラックとして併存する。データセット整形・検証は SDK / openai / ネットワークに一切
+触れない純データ層で、`_adapters` / SDK への依存辺を持たず、コアへは共有 leaf `_validation`
+（bool フィールドの構築時検証）への上向き参照のみを持つ（`tools=` で受ける FunctionTool 相当オブジェクトは
+`name` / `params_json_schema` 属性のダックタイピングで判別するため、import 依存辺は増えない）。
+
+公開窓口は `oai_agentspec.runtime.finetune` の `__init__.py` に集約し、変換ヘルパ（`to_sft_dataset` /
+`to_dpo_dataset`）・検証ヘルパ（`validate_dataset`）・ケース型（`DpoCase`・frozen dataclass）・結果型
+（`DatasetBuildResult` / `DatasetValidationReport` / `DatasetViolation`）・エラー型（`FineTuneError` /
+`FineTuneFailureKind`）はここから参照する。コア `__all__` には載せない。`DatasetBuildResult` は既定で plain な
+レコード列 + `skipped` 件数を返すのみで、JSONL 書き出しは `result.save(path)` の明示呼び出しに限る
+（`OptimizeResult.save` と同一の opt-in 書込契約）。`save(path)` は非 ASCII をエスケープせず utf-8 のまま書き
+（`ensure_ascii=False`）、書込先が書込不能・不正なら `OSError`、レコードに JSON へ変換できない値が含まれるなら
+`TypeError` を送出する（fail-closed・いずれも呼び出し側へ伝播）。既存ファイルは上書きし（追記しない）、
+シンボリックリンクはリンク先へ追従し、作成されるファイルのパーミッションはプロセスの umask に依存する。
+`FineTuneError` は `OptimizeError` と同型の
+kind StrEnum + message + keyword-only 追加情報（`report`）の型枠に従う。
+
+### 変換ヘルパの契約（単一 / 複数ターン二形受理と非改変透過）
+
+- **input の二形受理**: `input` が文字列なら user 1 件のメッセージへ包み（単一ターン）、messages 形式のリストなら
+  そのまま透過採用する（複数ターン）。SFT は `expected_output` を最終 assistant メッセージとして末尾へ付し、
+  DPO は `input.messages` へ透過する。出力側（`expected_output` / `preferred_output` / `non_preferred_output`）も
+  「文字列（assistant 1 件へ包む）」と「assistant メッセージ配列（透過採用）」の二形を受ける。
+- **メッセージの非改変透過（契約）**: ヘルパは messages リスト要素の存在検査（`role` あり + `content` または
+  `tool_calls` のいずれかあり・content の presence 判定は型非依存）のみを行い、要素 dict を改変・複製整形せず
+  出力へ載せる。assistant の `weight`（loss masking）・parts 配列の `content`（vision）・`tool_call_id` 等の
+  キーはすべて保全される。末尾付加する `expected_output` 由来の assistant には `weight` を付さない（既定の
+  学習対象）。role 値・構造の厳密検証は `validate_dataset` に一元化する（検証仕様の二重管理回避）。
+- **system 競合**: `system=` と input リスト内 system メッセージの両方が存在する場合はエラー（暗黙マージ・暗黙
+  置換をしない・skip 対象外）。`to_dpo_dataset` は `system=` を持たず、input リスト内 system の透過で表現する。
+- **`tools=` / `parallel_tool_calls=` の透過**: 内容を解釈せずレコードレベル（SFT はレコード直下 / DPO は
+  `input` 内）へ透過する。関数引数のため全レコード共通で、レコードごとに異なる tools は持ち込み JSONL の責務と
+  する（plain dict ケースのレコード別 `"tools"` キーはヘルパの読み取り対象外）。`tools=` 由来のリストは 1 度だけ
+  組み立てて全レコードで同一オブジェクトを共有参照するため、変換後に 1 レコードの tools リストを変更すると全
+  レコードへ波及する（messages 要素の非改変透過と同じく、呼び出し側の後続変更が結果へ波及する契約）。
+- **欠落・境界の規則**: フィールド欠落・空 input リスト・文字列でもリストでもない型・空の出力配列は既定エラーで、
+  明示の `skip_missing=True` 時のみ除外 + 件数報告（暗黙補完なし）。
+- **`cases` の誤用ガード**: `cases` に単一の dict / 文字列 / bytes を渡した場合は `skip_missing` に依らず
+  エラーとする（dict はキー文字列の列、`str` / `bytes` は 1 文字（1 バイト）ずつのケース列として誤読され、
+  `skip_missing=True` では空データセットを無言で返してしまうため）。1 件だけを変換する場合も `[case]` のように
+  列へ包む。`validate_dataset` の `source` ガードと同一方針だが、`source` は文字列 / `Path` を JSONL ファイル
+  パスとして受理するため、拒否対象は単一 dict のみである。
+
+### tools= の FunctionTool 相当写像（ToolRegistry 橋渡し）
+
+`tools=` は「plain dict（非解釈透過）」と「FunctionTool 相当オブジェクト」の混在リストを受ける。dict でない要素は
+`name` / `params_json_schema` 属性の両方を持てば FunctionTool 相当として検出し（`ToolRegistry` の属性アクセスが
+返す SDK `FunctionTool` はこの条件を満たす）、`{"type": "function", "function": {"name": ..., "description": ...,
+"parameters": <params_json_schema>}}` へ写像する。これにより学習データの tools 定義と推論時（Registry 経由で
+Agent に渡す定義）の一致を構造的に担保する。写像の規則:
+
+- `description` はそのまま写像し、空文字でも含める（属性が無い、または値が `None` の場合は空文字。SDK の
+  `FunctionTool.description` は `str | None` である。省略と空文字の意味差を lib が
+  解釈しない）。スキーマ内容（`parameters`）は非解釈のまま置き換えるだけで、lib はツール仕様を抱え込まない。
+- `strict_json_schema` は写像に含めない。FT 学習データの tools 定義における `strict` フィールドの公式裏付けが
+  無く、含めるとプラットフォーム非受理・検証誤検知のリスクがあるため。SDK の `function_tool` は strict モードの
+  schema 変換を `params_json_schema` 自体に反映するため、strict フラグを落としても parameters の内容一致は
+  保たれる。strict 入りの定義が必要な利用者は plain dict 経由で渡せる（未知フィールド許容規則により合法）。
+- 変換は呼び出し時点の属性値の静的スナップショットであり、`is_enabled` の動的トグルは評価しない（学習データに
+  載せるか否かは利用者が渡すリストで制御する）。
+- dict でも FunctionTool 相当でもない要素は常時エラー（`tools=` は呼び出し単位の引数のため `skip_missing` の
+  対象外）。
+
+### validate_dataset の合法集合
+
+`validate_dataset(source, method=..., raise_on_invalid=False)` は JSONL（ファイルパスまたは dict 列）を
+OpenAI 公式の SFT / DPO データ形式を準拠先として検証し、違反ゼロのみ合格とする（fail-closed）。
+`raise_on_invalid=True` 明示時のみ `FineTuneError(VALIDATION_FAILED, report=...)` を送出する。検証規則は
+単一 / 複数ターンを区別しない。`DatasetValidationReport.checked` はレコード件数を表し、`violations` の件数は
+`checked` を超えうる（1 レコードからメッセージ単位の違反とレコード単位の違反が同時に出るため）。
+
+- **引数検証（`raise_on_invalid` に依らない）**: `method` が `"sft"` / `"dpo"` 以外なら
+  `FineTuneError(VALIDATION_FAILED)` を送出する。`source` に単一の dict を渡した場合も同様に送出する
+  （dict をキー文字列の列として誤読しないため。受ける形はレコードの列またはファイルパスである）。いずれも検証を
+  開始せずレコードを読まない。
+- **検証対応 method の範囲**: 検証が対応するのは `sft` / `dpo` の 2 形式のみで、他の識別子は受理しない。これは
+  ジョブ投入側の method passthrough（lib が method 詳細設定・識別子を解釈せずプラットフォームへ透過する）とは
+  別方針であり、検証仕様を lib が持つ形式に限る意図的な差異である。
+- **ファイル source の読み込み semantics**: 全量を文字列へ読み込まず行単位で逐次読み込む。BOM は `utf-8-sig` で
+  除去し、空行はスキップして `checked` に数えない。`DatasetViolation.line` は空行を含む物理行番号（1 始まり）で
+  あり、dict 列 source の場合は 1 始まりの要素位置を指す。ファイルを読めない場合は `OSError` を呼び出し側へ
+  伝播する（fail-closed）。
+- **レコード単位の必須要件（SFT のみ）**: `method="sft"` のレコードは `messages` に role `"assistant"` の
+  メッセージが 1 件以上必要で、無ければ違反とする（準拠先は OpenAI 公式 cookbook
+  `Chat_finetuning_data_prep.ipynb` の検証項目 `example_missing_assistant_message`）。メッセージ単位の違反とは
+  独立に報告し（メッセージ単位の違反があるレコードでも両方を報告する）、`weight` の値は判定に用いない
+  （全 assistant が `weight: 0` でも欠落とはしない）。ただし `record` が dict でない / `messages` キーが欠落
+  している / `messages` が非リスト・空リストの 3 経路では、構造の違反へ本要件を重ねて報告しない。DPO は
+  `input.messages` が prompt であり assistant は `preferred_output` / `non_preferred_output` 側で必須化される
+  ため、本要件を適用しない。
+
+- **ツール系**: レコードレベル `tools` / `parallel_tool_calls`（DPO は `input` 内）を任意フィールドとして許容し、
+  role の合法値に `"tool"` を含む。`tool_calls` を許容する role は `"assistant"` のみで、「content 無しでも合法」
+  は tool_calls を持つ assistant に限る。role `"tool"` は `content` 必須 + `tool_call_id` キー存在必須（値は
+  非解釈）。tools / tool_calls の内部構造は検証しない（正しいツール入り JSONL を不合格にする誤検知を出さない
+  ことを設計意図とする）。
+- **weight**: SFT に限り、assistant メッセージのみ許容・値は整数 0 / 1 のみ合法（0.5・float の 1.0・true 等は
+  違反）。値まで検証するのは、公式仕様が明確で誤検知の余地が無く、不正 weight は loss masking の silent 失敗と
+  してジョブ失敗にすらならない可能性があり投入前検出の価値が最も高いため。DPO 側のメッセージ・出力配列に
+  weight があっても違反にしない（受理可否はプラットフォームへ委ねる）。
+- **content**: 合法型は文字列または parts 配列（vision）の二形。parts の内部構造は非解釈。文字列でもリストでも
+  ない型・空リスト `[]` は違反。content 規則は DPO の `input.messages`・出力配列にも同一に適用する。
+- **未知キーの許容**: 既知キー（`role` / `content` / `tool_calls` / `tool_call_id` / `weight`）以外の未知キーは
+  違反にしない（レコードレベルの未知フィールドも同規則）。プラットフォームのフィールド追加で検証が鮮度切れして
+  正しい JSONL を不合格にする誤検知リスクの方が、未知キーの見逃しより重いための意図的設計であり、帰結として
+  既知キーの typo は検出されない（最終判定はプラットフォームが行う）。
+- **DPO の 1 ターン学習制約**: プラットフォームは 1 例につき最後の assistant メッセージ 1 件を preferred /
+  non_preferred として学習するが、ヘルパ・`validate_dataset` は出力配列長 1 超を違反にせず形式検証に徹する。
+  ツール入りレコード・DPO 複数ターン input・未知キーを含め、受理可否の最終判定はプラットフォームが行う。
+
+train / val 分割はジェネリックな `runtime.lightning.train_val_split` が finetune のレコード列にもそのまま適用
+できる（finetune 側に分割 API は持たない）。
 
 ## 内容ガードレール（ローカル品質ゲート支援）
 

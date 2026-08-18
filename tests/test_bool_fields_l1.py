@@ -107,6 +107,10 @@ def _valid_kwargs_map() -> dict[str, dict[str, Any]]:
             "call_id": "call-1",
             "approve": True,
         },
+        "oai_agentspec.runtime.finetune.types.DatasetValidationReport": {
+            "checked": 0,
+            "violations": (),
+        },
         "oai_agentspec.runtime.guardrails._detectors.Detection": {"triggered": True},
         "oai_agentspec.runtime.lightning.config.OptimizeConfig": {},
         "oai_agentspec.runtime.lightning.types.CoverageReport": {

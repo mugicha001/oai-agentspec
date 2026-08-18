@@ -1,7 +1,7 @@
 """L1: `oai_agentspec.exceptions` 統一窓口の契約テスト（直 import + PEP 562 遅延）。
 
-`runtime/resilience/__init__.py` の窓口テストパターンを踏襲する。lib 独自例外 9 種を
-再エクスポートする窓口で、コア層と外部依存ゼロの extra 例外（7 種）は直 import、
+`runtime/resilience/__init__.py` の窓口テストパターンを踏襲する。lib 独自例外 10 種を
+再エクスポートする窓口で、コア層と外部依存ゼロの extra 例外（8 種）は直 import、
 外部依存を持つ extra 例外（`OptimizeError` / `ConversationClientError`）は PEP 562 遅延取得。
 定義実体は既存モジュールに残るため isinstance / issubclass は完全互換。
 """
@@ -21,6 +21,7 @@ _DIRECT_SYMBOLS = {
     "WorkflowFrozenError",
     "RunBudgetExceeded",
     "ConversationError",
+    "FineTuneError",
 }
 _LAZY_SYMBOLS = {
     "OptimizeError",
@@ -30,15 +31,15 @@ _EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 9 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 10 件で設計仕様通りのメンバ集合と一致する。"""
     from oai_agentspec import exceptions as mod
 
     assert set(mod.__all__) == _EXPECTED_ALL
-    assert len(mod.__all__) == 9
+    assert len(mod.__all__) == 10
 
 
 def test_direct_symbols_are_directly_imported() -> None:
-    """直 import 対象 7 種は module import 時点で `__dict__` に載る。"""
+    """直 import 対象 8 種は module import 時点で `__dict__` に載る。"""
     from oai_agentspec import exceptions as mod
 
     for name in _DIRECT_SYMBOLS:
@@ -71,12 +72,13 @@ def test_lazy_symbols_match_definition_module() -> None:
 
 
 def test_direct_symbols_match_definition_modules() -> None:
-    """直 import 7 種の実体も定義元と `is` 一致する（isinstance / issubclass 完全互換）。"""
+    """直 import 8 種の実体も定義元と `is` 一致する（isinstance / issubclass 完全互換）。"""
     from oai_agentspec import exceptions as mod
     from oai_agentspec.integrity import IntegrityError, PromptTemplateIntegrityError
     from oai_agentspec.prompts import PromptResolutionError
     from oai_agentspec.registry import RegistryFrozenError
     from oai_agentspec.runtime.conversation.types import ConversationError
+    from oai_agentspec.runtime.finetune.types import FineTuneError
     from oai_agentspec.runtime.resilience._errors import RunBudgetExceeded
     from oai_agentspec.workflow.graph import WorkflowFrozenError
 
@@ -87,10 +89,11 @@ def test_direct_symbols_match_definition_modules() -> None:
     assert mod.WorkflowFrozenError is WorkflowFrozenError
     assert mod.RunBudgetExceeded is RunBudgetExceeded
     assert mod.ConversationError is ConversationError
+    assert mod.FineTuneError is FineTuneError
 
 
 def test_all_symbols_are_resolvable_and_are_exception_classes() -> None:
-    """`__all__` の全 9 シンボルは getattr で解決でき、いずれも BaseException のサブクラス。"""
+    """`__all__` の全 10 シンボルは getattr で解決でき、いずれも BaseException のサブクラス。"""
     from oai_agentspec import exceptions as mod
 
     for name in mod.__all__:
@@ -108,8 +111,23 @@ def test_getattr_unknown_attribute_raises() -> None:
 
 
 def test_dir_includes_all_symbols_even_before_access() -> None:
-    """`dir()` は未 import 状態でも `__all__` の全 9 シンボルを含む。"""
+    """`dir()` は未 import 状態でも `__all__` の全 10 シンボルを含む。"""
     from oai_agentspec import exceptions as mod
 
     listing = set(mod.__dir__())
     assert _EXPECTED_ALL.issubset(listing)
+
+
+def test_finetune_error_is_exposed_from_window() -> None:
+    """`FineTuneError` は窓口から取得でき、定義元と `is` 一致する（完全互換）。"""
+    from oai_agentspec.exceptions import FineTuneError
+    from oai_agentspec.runtime.finetune import FineTuneError as DefinedFineTuneError
+
+    assert FineTuneError is DefinedFineTuneError
+
+
+def test_finetune_error_is_listed_in_all() -> None:
+    """`__all__` に `FineTuneError` が含まれる（窓口の公開契約）。"""
+    from oai_agentspec import exceptions as mod
+
+    assert "FineTuneError" in mod.__all__
