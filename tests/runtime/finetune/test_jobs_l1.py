@@ -573,7 +573,17 @@ class _FakeClock:
 
     `monotonic()` は現在時刻を返すだけで進めず、`sleep(seconds)` が待機秒数を記録して
     その分だけ時計を進める（ポーリングループの経過時間を決定的に再現する）。
+
+    `sleep(0)` は時計を進めないため、待機ループの deadline 判定を緩める退行
+    （`remaining <= 0` を `remaining < 0` にする等）を入れると `sleep(0)` が無限に
+    繰り返され、テストが失敗ではなく**停止しなくなる**（`_FakeRetriever` も最後の
+    payload を反復するため止まらない）。退行を必ず失敗として観測できるよう、
+    `_MAX_SLEEPS` 回を超えた時点で `AssertionError` を送出する。
     """
+
+    # 実テストの最大待機回数は 4 回（timeout=10.0 / poll_interval=3.0 の経路）。
+    # 正常系が到達しえない値を上限とし、暴走のみを捕捉する。
+    _MAX_SLEEPS = 100
 
     def __init__(self) -> None:
         self.now = 0.0
@@ -583,6 +593,12 @@ class _FakeClock:
         return self.now
 
     async def sleep(self, seconds: float) -> None:
+        if len(self.sleeps) >= self._MAX_SLEEPS:
+            raise AssertionError(
+                f"待機ループが {self._MAX_SLEEPS} 回を超えました"
+                f"（直近の待機秒数: {seconds}・経過: {self.now}）。"
+                "deadline 判定が退行してループが停止しなくなっている可能性があります"
+            )
         self.sleeps.append(seconds)
         self.now += seconds
 
@@ -715,6 +731,20 @@ def test_wait_job_poll_interval_default_is_30_seconds() -> None:
     assert parameters["poll_interval"].default == 30.0
     assert parameters["timeout"].default is inspect.Parameter.empty
     assert parameters["timeout"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_submit_job_file_wait_timeout_default_is_300_seconds() -> None:
+    """file_wait_timeout の既定値は 300.0 秒（ADR 0032 Decision の確定値）。
+
+    既存テストは `file_wait_timeout` を常に明示指定して呼ぶため、既定値そのものを
+    読む経路が無く、定数を書き換える退行が全スイート緑のまま生存する。兄弟の
+    `wait_job.poll_interval` と同じくシグネチャレベルで固定する。
+    """
+    import inspect
+
+    parameters = inspect.signature(submit_job).parameters
+    assert parameters["file_wait_timeout"].default == 300.0
+    assert parameters["file_wait_timeout"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 async def test_wait_job_raises_timeout_error_adr_0031(monkeypatch: pytest.MonkeyPatch) -> None:
