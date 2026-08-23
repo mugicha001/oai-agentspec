@@ -46,7 +46,7 @@ runtime（`runtime/conversation` / `runtime/serve` / `runtime/cli` / `runtime/ll
    │
    ┊ Agent Lightning 最適化 (runtime/lightning 公開窓口・lightning extra・agents/agentlightning 非依存・上位利用支援層)
    │
-   ┊ マネージド Fine-Tuning 統合 (runtime/finetune 公開窓口・finetune extra・agents/openai 非依存・純データ変換層)
+   ┊ マネージド Fine-Tuning 統合 (runtime/finetune 公開窓口・finetune extra・agents/openai 非依存・純データ変換層 + ジョブ管理の薄い結線)
    │
    ┊ AGT ガバナンス (runtime/governance 公開窓口・governance extra・agents/agent-governance-toolkit 非依存・装飾 builder)
    │
@@ -1827,7 +1827,7 @@ callable のとき既定 build が SDK 規約 `(context, agent) -> str` の動�
 
 Agent Lightning を LLMOps トラックへ振り分けた検討経緯は `docs/rationale/agt-governance-integration.md` を参照。
 
-## マネージド Fine-Tuning 統合（データセット整形・検証支援）
+## マネージド Fine-Tuning 統合（データセット整形・検証・ジョブ管理）
 
 OpenAI / Azure OpenAI のマネージド fine-tuning API（SFT / DPO）向けのデータセット整形（chat / preference 形式への
 変換）と持ち込み JSONL の検証を提供する層。`runtime/` 配下の一員（`runtime/finetune`・`finetune` extra。extra は
@@ -1946,6 +1946,49 @@ OpenAI 公式の SFT / DPO データ形式を準拠先として検証し、違�
 
 train / val 分割はジェネリックな `runtime.lightning.train_val_split` が finetune のレコード列にもそのまま適用
 できる（finetune 側に分割 API は持たない）。
+
+### 学習ジョブ管理（submit_job / get_job / wait_job）
+
+整形・検証済みデータセットの FT ジョブ投入・照会・完了待機を提供する。レイヤー構成は 2 層:
+`runtime/finetune/jobs.py`（openai 非依存の純ロジック層。引数検証・リクエスト body 組み立て・キー衝突検出・
+状態 → `JobStatus` 写像・lib 内唯一のポーリング）から `_adapters/finetune.py`（`from openai` の単一窓口。
+files アップロード / `fine_tuning.jobs.create` / `.retrieve` の単発 async 呼び出しと、openai 例外 →
+`FineTuneError(API_ERROR)` 変換（理由文言保全））へ、関数内遅延 import で到達する（extra 未導入でも公開窓口の
+import が壊れない契約を維持する）。extra 不在時は `_adapters` 側の遅延ガードが生 `ImportError` + 導入ヒントを
+送出し、`jobs.py` 側で `FineTuneError(EXTRA_MISSING)` へ変換する（lightning / judge と同型の分業）。
+
+公開 API は `submit_job` / `get_job` / `wait_job` の 3 関数と `JobRef` / `JobResult` / `JobStatus` の 3 型
+（いずれも `oai_agentspec.runtime.finetune` 公開窓口から参照する。コア `__all__` には載せない）。関数はすべて
+async・client 以降は keyword-only で、`wait_job` は `timeout` が必須 keyword（既定なし = 無限待機経路なし）・
+`poll_interval` は既定 30 秒。
+
+- **train / val の受理形は型で分岐する**: `str` は**アップロード済みファイル id** としてそのまま使用し
+  （再アップロードしない）、ローカル JSONL ファイルは `Path` で渡す。`DatasetBuildResult` / レコード列は
+  メモリ内容を JSONL bytes 化して `files.create(purpose="fine-tune")` でアップロードする。
+  `validate_dataset` の `source` では `str` が**ファイルパス**を意味するのと逆であることに注意
+  （ジョブ投入側は `str` をパスと解釈するヒューリスティックを持たない）。train / val は独立判定で混在可。
+- **アップロード経路はファイル処理完了を待つ**: データを渡してアップロードした場合、`_adapters/finetune.py` の
+  `wait_file_processed` が SDK の `files.wait_for_processing` へ 1 回委譲し、処理完了を待ってからジョブを
+  作成する（上限は `submit_job` の `file_wait_timeout`・既定 300 秒。非正値は `CONFIG_MISSING`、処理の失敗は
+  `API_ERROR`、上限超過は `TIMEOUT`）。ファイル id（`str`）を渡した経路では状態確認も待機も行わない。
+  判断の詳細と却下案は `docs/adr/0032-file-processing-wait-in-upload.md` を参照。
+- **キー衝突検出**: 占有キー集合は常時 `{"model", "training_file", "method"}` + **実際に指定された**任意引数の
+  担当キー（`training_type` → `"trainingType"`、`suffix` / `seed` / `metadata` / `integrations` → 同名、
+  `val` 指定時のみ `"validation_file"`）。`extra_body` の各キーと占有集合の交差（同一階層・同一キー名）を
+  全件収集し、交差があれば `FineTuneError(CONFIG_MISSING, 衝突キー名列挙)`、無ければ body 直下へ追加する
+  （マージ・上書きしない。`method` 内は別階層につき判定対象外）。
+- **suffix 制約のプラットフォーム差**: OpenAI は最大 64 文字、Azure は 18 文字・ドット不可。lib は検証せず、
+  プラットフォームエラーを `API_ERROR` として理由文言ごと保全する。
+- **Azure の `model_ref` はデプロイ前参照**: ジョブ成功時の `JobResult.model_ref` は fine-tuned モデルの
+  参照であり、Azure では推論利用に Azure 側のデプロイ操作（control plane）が別途必要となる。デプロイは
+  スコープ外で利用者責任とする。
+- **未知ジョブ状態は非終端**: 状態写像は終端 3 種（succeeded / failed / cancelled）+ queued のみを判定し、
+  それ以外（プラットフォームが将来追加する状態を含む）はすべて `JobStatus.RUNNING` へ倒す。生の状態文字列は
+  常に `JobResult.raw_status` へ保全する。
+
+`wait_job` は build-don't-run の例外として、必須 `timeout` の下で単発照会（`get_job` 相当）を
+`poll_interval` 間隔で反復する lib が実装する唯一のポーリングループである（timeout 到達で `FineTuneError(TIMEOUT)`・
+ジョブは取り消さない）。判断の詳細と却下案は `docs/adr/0031-wait-job-polling-isolation.md` を参照。
 
 ## 内容ガードレール（ローカル品質ゲート支援）
 
