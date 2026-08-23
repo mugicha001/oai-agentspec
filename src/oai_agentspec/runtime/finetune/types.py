@@ -1,8 +1,8 @@
 """Fine-Tuning データ層の plain 型（外部 SDK 非依存）。
 
 本モジュールは `agents` / `openai` を一切 import しない純データ層で、変換・検証ヘルパ
-（`dataset`）と公開窓口が扱う型のみを定義する（NFR-1）。すべて `@dataclass(frozen=True)`
-（lightning / llmops の結果型と一致・Pydantic 非導入）。
+（`dataset`）・学習ジョブ管理（`jobs`）と公開窓口が扱う型のみを定義する（NFR-1）。
+すべて `@dataclass(frozen=True)`（lightning / llmops の結果型と一致・Pydantic 非導入）。
 
 `DatasetBuildResult.save` は利用者指定パスへの opt-in 書込のみで、明示呼び出しが唯一の
 書込経路である（`OptimizeResult.save` と同一契約）。
@@ -14,7 +14,7 @@ import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from ..._validation import validate_bool
 
@@ -25,9 +25,17 @@ class FineTuneFailureKind(StrEnum):
     Attributes:
         VALIDATION_FAILED: データ不備（欠落 / 不正な形式 / system 競合 / `tools=` の不正要素）
             またはデータセット検証の不合格。
+        EXTRA_MISSING: `finetune` extra が未導入で必要な依存を import できない。
+        CONFIG_MISSING: 必須設定の不在および設定の不整合（重複指定による衝突を含む）。
+        API_ERROR: プラットフォーム API がエラーを返した。
+        TIMEOUT: 待機がタイムアウトした。
     """
 
     VALIDATION_FAILED = "validation_failed"
+    EXTRA_MISSING = "extra_missing"
+    CONFIG_MISSING = "config_missing"
+    API_ERROR = "api_error"
+    TIMEOUT = "timeout"
 
 
 @dataclass(frozen=True)
@@ -148,3 +156,93 @@ class DatasetBuildResult:
         """
         body = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in self.records)
         Path(path).write_text(body, encoding="utf-8")
+
+
+class JobStatus(StrEnum):
+    """学習ジョブの状態（プラットフォームの生の状態文字列を写像した plain 型）。
+
+    終端は SUCCEEDED / FAILED / CANCELLED の 3 種で、QUEUED / RUNNING は非終端である。
+    未知の状態値（プラットフォーム固有の中間状態を含む）は例外にせず RUNNING（非終端）へ
+    倒すため、状態一覧の追加により待機が失敗することはない（FR-6）。
+
+    Attributes:
+        QUEUED: 実行待ち（非終端）。
+        RUNNING: 実行中。未知の状態値のフォールバック先でもある（非終端）。
+        SUCCEEDED: 正常終了（終端）。
+        FAILED: 失敗して終了（終端）。
+        CANCELLED: 取り消されて終了（終端）。
+    """
+
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+_TERMINAL_STATUSES: Final[frozenset[JobStatus]] = frozenset(
+    {JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED}
+)
+
+
+def _map_status(raw_status: str) -> JobStatus:
+    """プラットフォームの生の状態文字列を `JobStatus` へ写像する（FR-6）。
+
+    終端 3 種と `queued` のみを判定し、それ以外（`running` / 未知の中間状態 / 空文字を
+    含む）はすべて RUNNING へ倒す。例外は送出しない。
+
+    Args:
+        raw_status: プラットフォームが返す生の状態文字列。
+
+    Returns:
+        写像後の `JobStatus`。判定できない値は `JobStatus.RUNNING`。
+    """
+    for terminal in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED):
+        if raw_status == terminal.value:
+            return terminal
+    if raw_status == JobStatus.QUEUED.value:
+        return JobStatus.QUEUED
+    return JobStatus.RUNNING
+
+
+@dataclass(frozen=True)
+class JobRef:
+    """投入した学習ジョブの参照（投入時に確定する識別子のみを持つ）。
+
+    Attributes:
+        job_id: プラットフォームが払い出したジョブ ID。
+        training_file_id: 学習データのファイル ID（アップロード済み / 利用者指定）。
+        validation_file_id: 検証データのファイル ID。指定していない場合は None。
+    """
+
+    job_id: str
+    training_file_id: str
+    validation_file_id: str | None
+
+
+@dataclass(frozen=True)
+class JobResult:
+    """学習ジョブの照会結果（生の状態文字列を保全する）。
+
+    Attributes:
+        job_id: 照会したジョブ ID。
+        status: 写像後の状態。
+        raw_status: プラットフォームが返した生の状態文字列（写像で失わない）。
+        model_ref: 学習済みモデルの参照。未確定の場合は None。
+        error_message: 失敗理由の文言。無い場合は None。
+    """
+
+    job_id: str
+    status: JobStatus
+    raw_status: str
+    model_ref: str | None
+    error_message: str | None
+
+    @property
+    def is_terminal(self) -> bool:
+        """状態が終端 3 種（succeeded / failed / cancelled）のいずれかかを返す。
+
+        Returns:
+            終端なら True、非終端（queued / running）なら False。
+        """
+        return self.status in _TERMINAL_STATUSES
