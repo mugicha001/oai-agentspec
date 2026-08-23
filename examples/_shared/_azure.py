@@ -324,7 +324,8 @@ def build_finetune_client() -> AsyncOpenAI:
         - `AZURE_OPENAI_FINETUNE_ENDPOINT` のみ設定して `AZURE_OPENAI_FINETUNE_API_KEY` を
           設定しないと、推論リソースのキーが FT 用リソースのホストへ提示される。
 
-        いずれも認証は失敗するが、失敗する前にキーは相手ホストへ到達している。
+        いずれも認証は失敗するが、失敗する前にキーは相手ホストへ到達している。この 2 つは
+        クライアント構築時に `ValueError` で止める（下記 Raises）。
 
     Returns:
         FT ジョブ API を呼べる `AsyncOpenAI` 互換クライアント。
@@ -332,19 +333,45 @@ def build_finetune_client() -> AsyncOpenAI:
     Raises:
         KeyError: 必須の環境変数が未設定の場合（`OPENAI_API_KEY` /
             `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_API_KEY`）。
-        ValueError: `FINETUNE_PROVIDER` が未知の値の場合。
+        ValueError: `FINETUNE_PROVIDER` が未知の値の場合。または**接続先が推論用と
+            別になるのに対応する FT 用キーが未設定**の場合（キーの越境送信を防ぐため、
+            送信前に止める）。具体的には (1) `OPENAI_BASE_URL` が設定済みで
+            `OPENAI_FINETUNE_BASE_URL` / `OPENAI_FINETUNE_API_KEY` がいずれも未設定、
+            (2) `AZURE_OPENAI_FINETUNE_ENDPOINT` が `AZURE_OPENAI_ENDPOINT` と異なるのに
+            `AZURE_OPENAI_FINETUNE_API_KEY` が未設定。キーが継承されない構成
+            （FT 用キーを設定済み・接続先が推論用と同一）では発火しない。
     """
     _load_dotenv()
     if finetune_provider() == "openai":
-        api_key = os.environ.get("OPENAI_FINETUNE_API_KEY") or os.environ["OPENAI_API_KEY"]
         # base_url は OPENAI_BASE_URL を継承しない: 推論用ゲートウェイ（chat-models 専用等）は
         # Files / fine_tuning API を持たず 404 になるため。FT 用は明示指定を要求する。
         base_url = os.environ.get("OPENAI_FINETUNE_BASE_URL") or "https://api.openai.com/v1"
+        # 接続先が推論用と別になるのにキーだけ継承する構成を送信前に止める（キーの越境送信防止）。
+        if os.environ.get("OPENAI_BASE_URL") and not os.environ.get("OPENAI_FINETUNE_BASE_URL"):
+            if not os.environ.get("OPENAI_FINETUNE_API_KEY"):
+                raise ValueError(
+                    "推論は OPENAI_BASE_URL のゲートウェイを指していますが、FT の接続先は "
+                    f"{base_url} になります（OPENAI_BASE_URL は継承しません）。"
+                    "ゲートウェイ用の OPENAI_API_KEY を別ホストへ送信しないよう、"
+                    "OPENAI_FINETUNE_API_KEY を設定してください"
+                    "（FT もゲートウェイへ向ける場合は OPENAI_FINETUNE_BASE_URL を設定）"
+                )
+        api_key = os.environ.get("OPENAI_FINETUNE_API_KEY") or os.environ["OPENAI_API_KEY"]
         return AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    endpoint = (
-        os.environ.get("AZURE_OPENAI_FINETUNE_ENDPOINT") or os.environ["AZURE_OPENAI_ENDPOINT"]
-    )
+    ft_endpoint = os.environ.get("AZURE_OPENAI_FINETUNE_ENDPOINT")
+    endpoint = ft_endpoint or os.environ["AZURE_OPENAI_ENDPOINT"]
+    # 別リソースを指すのにキーだけ推論用を継承する構成を送信前に止める（同上）。
+    if (
+        ft_endpoint
+        and ft_endpoint != os.environ.get("AZURE_OPENAI_ENDPOINT")
+        and not os.environ.get("AZURE_OPENAI_FINETUNE_API_KEY")
+    ):
+        raise ValueError(
+            f"AZURE_OPENAI_FINETUNE_ENDPOINT（{ft_endpoint}）は推論用と別のリソースを"
+            "指していますが、FT 用のキーが未設定です。推論リソースのキーを別リソースへ"
+            "送信しないよう、AZURE_OPENAI_FINETUNE_API_KEY を設定してください"
+        )
     api_key = os.environ.get("AZURE_OPENAI_FINETUNE_API_KEY") or os.environ["AZURE_OPENAI_API_KEY"]
     api_version = (
         os.environ.get("AZURE_OPENAI_FINETUNE_API_VERSION") or FINETUNE_API_VERSION_DEFAULT
