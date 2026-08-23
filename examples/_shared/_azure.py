@@ -311,8 +311,28 @@ def build_finetune_client() -> AsyncOpenAI:
         （2025-04-01-preview）を要求する。v1 preview 方式（`/openai/v1/` 系統）を試す場合は
         `AZURE_OPENAI_FINETUNE_API_VERSION=preview` を明示する。
 
+    Warning:
+        **接続先を分けたら API キーも必ず分けて設定すること**。接続先（base_url /
+        エンドポイント）は上記のとおり推論用から継承しないが、**API キーは継承する**という
+        非対称があるため、キーだけ未設定にすると推論用のキーが別ホストへ送信される。
+        典型例は 2 つ:
+
+        - 推論を OpenAI 互換ゲートウェイ（`OPENAI_BASE_URL`）へ向けている構成で
+          `OPENAI_FINETUNE_API_KEY` を設定しないと、`api_key` はゲートウェイの仮想キーを
+          継承する一方 `base_url` は `https://api.openai.com/v1` になり、ゲートウェイ用の
+          キーが OpenAI 本家へ送信される。
+        - `AZURE_OPENAI_FINETUNE_ENDPOINT` のみ設定して `AZURE_OPENAI_FINETUNE_API_KEY` を
+          設定しないと、推論リソースのキーが FT 用リソースのホストへ提示される。
+
+        いずれも認証は失敗するが、失敗する前にキーは相手ホストへ到達している。
+
     Returns:
         FT ジョブ API を呼べる `AsyncOpenAI` 互換クライアント。
+
+    Raises:
+        KeyError: 必須の環境変数が未設定の場合（`OPENAI_API_KEY` /
+            `AZURE_OPENAI_ENDPOINT` / `AZURE_OPENAI_API_KEY`）。
+        ValueError: `FINETUNE_PROVIDER` が未知の値の場合。
     """
     _load_dotenv()
     if finetune_provider() == "openai":
