@@ -6,8 +6,8 @@ preference 形式への変換）・持ち込み JSONL の検証と、学習ジ�
 
 データセット変換・検証は `agents` / `openai` を import せずネットワークにも一切触れない
 **純データ層**で、ジョブ管理も SDK 接触を `_adapters/finetune.py` の 1 ファイルに閉じている。
-**`06` / `07` を除く全 example は API キーなしで実行できる**（この 2 本のみ実 API へジョブを
-投入するため接続情報が必要で、従量課金が発生する）。
+**`06` / `07` / `08` を除く全 example は API キーなしで実行できる**（この 3 本のみ実 API へ
+ジョブを投入するため接続情報が必要で、従量課金が発生する）。
 
 ## インストール
 
@@ -54,8 +54,8 @@ uv run python examples/finetune/08_submit_tools_job_live.py --method dpo   # too
 uv run python examples/finetune/06_submit_job_live.py --yes
 ```
 
-`06` / `07` は学習ファイルのアップロードとジョブ作成を実 API に対して行う。実行前に確認
-プロンプトを出し、費用を抑えるため最小データ（10 件）・1 エポックを既定にしている。
+`06` / `07` / `08` は学習ファイルのアップロードとジョブ作成を実 API に対して行う。実行前に
+確認プロンプトを出し、費用を抑えるため最小データ（10 件）・1 エポックを既定にしている。
 
 最小の設定は次の 2 行（gpt-4.1-mini で SFT を試す場合）:
 
@@ -117,7 +117,7 @@ api-version の既定を推論用から分けているのは、`trainingType` �
 - **`skip_missing`**: `to_sft_dataset` / `to_dpo_dataset` に渡すと、必須フィールド欠落等の
   ケースを既定エラーにせず除外し、`DatasetBuildResult.skipped` に件数報告する。
 
-## ジョブ管理の要点（05 / 06 / 07）
+## ジョブ管理の要点（05 / 06 / 07 / 08）
 
 - **設定は解釈せず透過する**: lib はハイパーパラメータの構造・対応モデル一覧・`training_type` の
   許容値・`suffix` の長さ制約（OpenAI は 64 文字 / Azure は 18 文字・ドット不可）を保持しない。
@@ -143,10 +143,15 @@ api-version の既定を推論用から分けているのは、`trainingType` �
   既定 30 秒）。無限待機の経路を持たない。詳細は `docs/adr/0031-wait-job-polling-isolation.md`。
 - **Azure の `model_ref` はデプロイ前参照**: 推論に使うには Azure 側でのデプロイ操作が別途必要
   （本ライブラリのスコープ外・利用者責任）。
-- **接続先の分離**: `06` / `07` は既定で推論用の接続情報を再利用するが、FT が使えるリージョンは
-  限られるため別リソースになることがある。その場合は `AZURE_OPENAI_FINETUNE_ENDPOINT` /
-  `_API_KEY`（OpenAI 直接続なら `OPENAI_FINETUNE_API_KEY`）を設定する。未設定なら推論用へ
-  フォールバックする（`examples/_shared/_azure.py` の `build_finetune_client`）。
+- **接続先の分離**: `06` / `07` / `08` は既定で推論用の接続情報を再利用するが、FT が使える
+  リージョンは限られるため別リソースになることがある。その場合は
+  `AZURE_OPENAI_FINETUNE_ENDPOINT` / `_API_KEY`（OpenAI 直接続なら
+  `OPENAI_FINETUNE_API_KEY`）を設定する。未設定なら推論用へフォールバックする
+  （`examples/_shared/_azure.py` の `build_finetune_client`）。
+  **接続先を分けたら API キーも必ず分けて設定する**: エンドポイント / base_url は推論用から
+  継承しないのに API キーは継承するため、キーだけ未設定にすると推論用のキーが別ホストへ
+  送信される（例: 推論を OpenAI 互換ゲートウェイへ向けている構成で FT 用キーを設定しないと、
+  ゲートウェイの仮想キーが `api.openai.com` へ送られる）。
 
 ## RFT（強化学習ファインチューニング）を使う場合
 

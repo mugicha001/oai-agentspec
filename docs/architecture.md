@@ -1959,8 +1959,8 @@ import が壊れない契約を維持する）。extra 不在時は `_adapters` 
 
 公開 API は `submit_job` / `get_job` / `wait_job` の 3 関数と `JobRef` / `JobResult` / `JobStatus` の 3 型
 （いずれも `oai_agentspec.runtime.finetune` 公開窓口から参照する。コア `__all__` には載せない）。関数はすべて
-async・client 以降は keyword-only で、`wait_job` は `timeout` が必須 keyword（既定なし = 無限待機経路なし）・
-`poll_interval` は既定 30 秒。
+async。`submit_job` は `train` 以降が keyword-only、`get_job` / `wait_job` は `(client, job_id)` を positional で
+受ける。`wait_job` は `timeout` が必須 keyword（既定なし = 無限待機経路なし）・`poll_interval` は既定 30 秒。
 
 - **train / val の受理形は型で分岐する**: `str` は**アップロード済みファイル id** としてそのまま使用し
   （再アップロードしない）、ローカル JSONL ファイルは `Path` で渡す。`DatasetBuildResult` / レコード列は
