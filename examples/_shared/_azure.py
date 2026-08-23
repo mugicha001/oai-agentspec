@@ -229,6 +229,120 @@ build_client = azure_client
 model_name = azure_deployment
 
 
+# FT ジョブ API の既定 api-version。推論用（AZURE_OPENAI_API_VERSION・既定 "preview"）は
+# 継承しない: trainingType（global / developer training）の指定は公式手順が dated 版の
+# 2025-04-01-preview を要求しており、推論の preview を流用する根拠がないため。
+FINETUNE_API_VERSION_DEFAULT = "2025-04-01-preview"
+
+
+def finetune_provider() -> str:
+    """FT ジョブ API の接続先プロバイダを解決する（`EXAMPLES_LLM_PROVIDER` の FT 版）。
+
+    推論と FT で接続先が異なる構成（例: 推論は OpenAI 互換ゲートウェイ、FT は Azure）を
+    扱えるよう、推論用とは独立に指定できる。判定順は次のとおり:
+
+    1. `FINETUNE_PROVIDER` が設定されていればその値
+    2. `AZURE_OPENAI_FINETUNE_ENDPOINT` が設定されていれば "azure"
+       （FT 専用のエンドポイントを設定した意図を尊重する）
+    3. `EXAMPLES_LLM_PROVIDER`（既定 "azure"）
+
+    Returns:
+        "azure" または "openai"。
+
+    Raises:
+        ValueError: `FINETUNE_PROVIDER` に未知の値が設定されている場合（`_provider()` と同じ
+            fail-loud 方針。FT ジョブは従量課金操作であり、typo で意図しないプラットフォームへ
+            投入されるのを防ぐ）。
+    """
+    _load_dotenv()
+    explicit = os.environ.get("FINETUNE_PROVIDER")
+    if explicit:
+        provider = explicit.strip().lower()
+        if provider not in ("azure", "openai"):
+            raise ValueError(
+                f"FINETUNE_PROVIDER={provider!r} は未対応です（受理値: 'azure' | 'openai'）"
+            )
+        return provider
+    if os.environ.get("AZURE_OPENAI_FINETUNE_ENDPOINT"):
+        return "azure"
+    return _provider()
+
+
+def finetune_training_type() -> str | None:
+    """学習実行方式（Azure の training type）を環境変数から解決する。
+
+    学習コストに直結する設定で、`Developer` が最も安価（データレジデンシー保証なし・スポット
+    容量のためプリエンプトあり）、`GlobalStandard` は regional standard より低廉。値は検証せず
+    そのままプラットフォームへ透過するため、表記ゆれ（`Developer` / `developer` 等）で 400 が
+    返る場合は別表記を試すこと。
+
+    Returns:
+        `FINETUNE_TRAINING_TYPE` の値。未設定なら None（この場合フィールド自体を送信しない）。
+    """
+    _load_dotenv()
+    return os.environ.get("FINETUNE_TRAINING_TYPE") or None
+
+
+def build_finetune_client() -> AsyncOpenAI:
+    """fine-tuning ジョブ API 用のクライアントを生成する（FT 専用 env でオーバーライド可能）。
+
+    fine-tuning は推論とは別リソースになることがある。Azure では FT が使えるリージョンが
+    限られ（推論用リソースが FT 非対応リージョンにある構成が普通にありうる）、課金や権限を
+    分けたい運用もあるため、FT 専用の環境変数を任意で受け付ける。接続情報（エンドポイント /
+    キー）は**未設定なら推論用の設定へフォールバック**するので、同一リソースで済む利用者は
+    何も設定しなくてよい。api-version のみ FT 固有の既定を持つ（下記 Note）。
+
+    参照する環境変数:
+        FINETUNE_PROVIDER                  接続先（"azure" | "openai"）。判定順は
+                                           `finetune_provider()` を参照
+        AZURE_OPENAI_FINETUNE_ENDPOINT     未設定なら AZURE_OPENAI_ENDPOINT
+        AZURE_OPENAI_FINETUNE_API_KEY      未設定なら AZURE_OPENAI_API_KEY
+        AZURE_OPENAI_FINETUNE_API_VERSION  未設定なら FINETUNE_API_VERSION_DEFAULT
+                                           （推論用の設定は継承しない）
+        OPENAI_FINETUNE_API_KEY            未設定なら OPENAI_API_KEY（provider=openai のとき）
+        OPENAI_FINETUNE_BASE_URL           未設定なら https://api.openai.com/v1
+                                           （OPENAI_BASE_URL は継承しない）
+
+    Note:
+        推論用の設定を継承しない項目が 3 つある。(1) プロバイダ判定: 推論は OpenAI 互換
+        ゲートウェイ・FT は Azure という構成があるため `FINETUNE_PROVIDER` で独立に指定できる。
+        (2) `OPENAI_BASE_URL`: 推論用ゲートウェイは Files / fine_tuning API を持たないことが
+        あり、継承すると 404 になる。(3) api-version: `trainingType` の指定は公式手順が dated 版
+        （2025-04-01-preview）を要求する。v1 preview 方式（`/openai/v1/` 系統）を試す場合は
+        `AZURE_OPENAI_FINETUNE_API_VERSION=preview` を明示する。
+
+    Returns:
+        FT ジョブ API を呼べる `AsyncOpenAI` 互換クライアント。
+    """
+    _load_dotenv()
+    if finetune_provider() == "openai":
+        api_key = os.environ.get("OPENAI_FINETUNE_API_KEY") or os.environ["OPENAI_API_KEY"]
+        # base_url は OPENAI_BASE_URL を継承しない: 推論用ゲートウェイ（chat-models 専用等）は
+        # Files / fine_tuning API を持たず 404 になるため。FT 用は明示指定を要求する。
+        base_url = os.environ.get("OPENAI_FINETUNE_BASE_URL") or "https://api.openai.com/v1"
+        return AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+    endpoint = (
+        os.environ.get("AZURE_OPENAI_FINETUNE_ENDPOINT") or os.environ["AZURE_OPENAI_ENDPOINT"]
+    )
+    api_key = os.environ.get("AZURE_OPENAI_FINETUNE_API_KEY") or os.environ["AZURE_OPENAI_API_KEY"]
+    api_version = (
+        os.environ.get("AZURE_OPENAI_FINETUNE_API_VERSION") or FINETUNE_API_VERSION_DEFAULT
+    )
+
+    if api_version == "preview":
+        return AsyncOpenAI(
+            base_url=f"{endpoint.rstrip('/')}/openai/v1/",
+            api_key=api_key,
+            default_query={"api-version": "preview"},
+        )
+    return AsyncAzureOpenAI(
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=endpoint,
+    )
+
+
 def api_style() -> str:
     """`optimize(apo_api=...)` へ渡す API スタイルをプロバイダ設定から解決する。
 
