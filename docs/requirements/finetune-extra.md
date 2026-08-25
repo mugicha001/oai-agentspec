@@ -98,6 +98,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
   - [ ] WHEN `submit_job` がジョブ作成リクエストを組み立てる THEN 利用者が明示指定していないフィールドを送信しない。特に学習完了後の自動デプロイを有効化するフィールドを lib の既定として付加しない（有効化したい利用者は `extra_body=` で明示指定する）。理由: 自動デプロイはホスティング課金を発生させるため、lib が暗黙に有効化してはならない。
   - [ ] WHEN 重複指定を判定する THEN 判定単位は「送信リクエストの同一階層における同一キー名」とする（`training_type=` は body 直下の `trainingType` を占有し、`suffix` / `seed` / `metadata` / `integrations` は body 直下の同名キーを占有する。`method` 内は別階層のため body 直下とは衝突しない）。占有は当該引数が実際に指定された場合に限り、省略された引数のキーは `extra_body=` から指定してよく衝突とはしない。IF `extra_body=` が既に占有されたキーを含む THEN 暗黙のマージ・上書きをせず、衝突したキー名を含む明確なエラー（`CONFIG_MISSING`）を返す。
   - [ ] WHEN model と method の組み合わせ可否（例: DPO 対応モデルが SFT より狭い）を扱う THEN lib は対応モデル一覧を保持・検証せず、プラットフォームが返すエラーを FR-10 の明確なエラー（理由文言を保全）へ変換して返す（モデル一覧のハードコードは鮮度切れするため方針として非検証を確定する）。
+  - [ ] WHEN `submit_job` が `train` / `val` のデータをアップロードする THEN アップロードしたファイルがプラットフォーム側で処理完了するまで待ってからジョブ作成を行う（未処理ファイルでのジョブ作成をプラットフォームが拒否するため）。待機の上限は `file_wait_timeout`（既定値あり）で利用者が制御でき、IF 非正値が指定される THEN `CONFIG_MISSING` を返す。IF 処理が失敗状態で終わる THEN `API_ERROR`、IF 上限時間内に処理完了しない THEN `TIMEOUT` を、いずれもファイル id を含む明確なエラーとして返す。WHEN 利用者がアップロード済みファイル id（`str`）を渡す THEN lib は状態を確認・待機せず当該 id をそのまま用いる（当該ファイルが利用可能であることは利用者責任）。
   - [ ] WHEN submit を実行する THEN 利用者の明示呼び出しに限り、lib が自動・暗黙にジョブを開始することはない（従量課金操作の明示性）。アップロードしたデータ・ジョブ設定を lib 内に保持しない。
 
 ### FR-6: ステータス照会と model_ref 取得（単発呼び出し）
@@ -156,8 +157,8 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
 - 計測基準: `uv run python -c "import oai_agentspec as m; assert all(hasattr(m,s) for s in m.__all__)"` が finetune extra 未導入でも成功すること。既存 extra の import スモークが finetune 未導入で緑であること。
 
 ### NFR-3: 保守性（env 参照の境界・build-don't-run 整合）
-- 要件: 接続構成は利用者構築の client 注入とし、`runtime/finetune` / `_adapters` は環境変数に依存しない。lib は学習ループを実装せず、全操作を単発 API 呼び出しの薄い結線に限定する。唯一のポーリングループは `wait_job`（FR-7）に隔離し、ADR として記録する。
-- 計測基準: `grep -rnE "os\.environ|getenv" src/oai_agentspec/runtime/finetune/` の結果が空であること、および本機能で追加する `_adapters` の FT 窓口ファイル（`src/oai_agentspec/_adapters/finetune.py`）を同 grep の対象に加えても結果が空であること（`_adapters/` 全体は対象にしない: 既存の `judge.py` / `lightning.py` に本機能と無関係な env 参照が存在するため、全体 grep は基準として成立しない）。ポーリングループが `wait_job` 実装以外に存在しないことをコードレビューで確認し、当該 ADR が `docs/adr/` に存在すること。
+- 要件: 接続構成は利用者構築の client 注入とし、`runtime/finetune` / `_adapters` は環境変数に依存しない。lib は学習ループを実装せず、全操作を単発 API 呼び出しの薄い結線に限定する。lib が実装する唯一のポーリングループは `wait_job`（FR-7）に隔離し、ADR として記録する。
+- 計測基準: `grep -rnE "os\.environ|getenv" src/oai_agentspec/runtime/finetune/` の結果が空であること、および本機能で追加する `_adapters` の FT 窓口ファイル（`src/oai_agentspec/_adapters/finetune.py`）を同 grep の対象に加えても結果が空であること（`_adapters/` 全体は対象にしない: 既存の `judge.py` / `lightning.py` に本機能と無関係な env 参照が存在するため、全体 grep は基準として成立しない）。lib が実装するポーリングループが `wait_job` 実装以外に存在しないことをコードレビューで確認し、当該 ADR が `docs/adr/` に存在すること。
 
 ### NFR-4: 保守性（テストカバレッジ / リント・実通信なし検証）
 - 要件: FT 機能追加後もプロジェクトのテストカバレッジ閾値とリント基準を維持する。実 API 通信・実課金に依存しない単体・統合テスト（fake クライアント / `_adapters` モック）で全 FR を検証する。

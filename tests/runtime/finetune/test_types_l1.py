@@ -1,6 +1,7 @@
 """L1: Fine-Tuning データ層の plain 型（外部 SDK 非依存）を検証する。
 
-`FineTuneFailureKind`（段階 1 は VALIDATION_FAILED のみ・StrEnum 値）・`FineTuneError`
+`FineTuneFailureKind`（5 種の失敗種別・StrEnum 値）・`JobStatus` / `JobRef` / `JobResult`
+（ジョブ管理の plain 型・状態写像・終端判定）・`FineTuneError`
 （kind / message / keyword-only `report`）・`DpoCase`（frozen・既定値の独立性）・
 `DatasetBuildResult`（frozen・`save(path)` の str / Path 両対応・JSONL 書式・非 ASCII 非
 エスケープ・既定では書き出さない opt-in 契約）・`DatasetViolation` / `DatasetValidationReport`
@@ -10,6 +11,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -22,6 +24,12 @@ from oai_agentspec.runtime.finetune import (
     DpoCase,
     FineTuneError,
     FineTuneFailureKind,
+)
+from oai_agentspec.runtime.finetune.types import (
+    JobRef,
+    JobResult,
+    JobStatus,
+    _map_status,
 )
 
 pytestmark = pytest.mark.unit
@@ -38,12 +46,50 @@ def test_failure_kind_validation_failed_string_value() -> None:
     assert isinstance(FineTuneFailureKind.VALIDATION_FAILED, str)
 
 
-def test_failure_kind_member_set_is_pinned_to_validation_failed_only() -> None:
-    """段階 1 のメンバ集合は VALIDATION_FAILED のみ（未使用メンバを持ち込まない）。
+def test_failure_kind_member_set_is_pinned() -> None:
+    """失敗種別のメンバ集合は 5 種で固定する（未使用メンバを持ち込まない）。
 
-    `==` でメンバ名集合を照合し、余分メンバの混入（過大側）も検知できる形で固定する。
+    `==` でメンバ名集合を照合するため、余分メンバの混入（過大側）とメンバ欠落
+    （過小側）の双方を検知できる。
     """
-    assert {member.name for member in FineTuneFailureKind} == {"VALIDATION_FAILED"}
+    assert {member.name for member in FineTuneFailureKind} == {
+        "VALIDATION_FAILED",
+        "EXTRA_MISSING",
+        "CONFIG_MISSING",
+        "API_ERROR",
+        "TIMEOUT",
+    }
+
+
+def test_failure_kind_values_are_pinned_snake_case() -> None:
+    """各メンバの文字列値は snake_case で固定する（既存 validation_failed の値は不変）。
+
+    値は構造化エラーの判別キーとして外部へ露出するため、名前と値の対応を `==` で固定する。
+    """
+    assert {member.name: member.value for member in FineTuneFailureKind} == {
+        "VALIDATION_FAILED": "validation_failed",
+        "EXTRA_MISSING": "extra_missing",
+        "CONFIG_MISSING": "config_missing",
+        "API_ERROR": "api_error",
+        "TIMEOUT": "timeout",
+    }
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        FineTuneFailureKind.EXTRA_MISSING,
+        FineTuneFailureKind.CONFIG_MISSING,
+        FineTuneFailureKind.API_ERROR,
+        FineTuneFailureKind.TIMEOUT,
+    ],
+)
+def test_finetune_error_carries_each_new_kind(kind: FineTuneFailureKind) -> None:
+    """新しい失敗種別を FineTuneError へ渡すと kind 属性で判別できる。"""
+    with pytest.raises(FineTuneError) as exc_info:
+        raise FineTuneError(kind, "boom")
+    assert exc_info.value.kind == kind
+    assert exc_info.value.report is None
 
 
 # ----------------------------------------------------------------------
@@ -235,3 +281,186 @@ def test_dataset_validation_report_holds_fields_and_is_frozen() -> None:
     assert report.violations == (violation,)
     with pytest.raises((AttributeError, TypeError)):
         report.ok = True  # type: ignore[misc]
+
+
+# ----------------------------------------------------------------------
+# JobStatus（StrEnum）
+# ----------------------------------------------------------------------
+
+
+def test_job_status_member_set_is_pinned() -> None:
+    """JobStatus のメンバ集合は 5 種で固定する（過大側・過小側の双方を検知する）。"""
+    assert {member.name for member in JobStatus} == {
+        "QUEUED",
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "CANCELLED",
+    }
+
+
+def test_job_status_values_are_pinned_and_str_like() -> None:
+    """各メンバの文字列値を固定し、StrEnum として str と比較できる。"""
+    assert {member.name: member.value for member in JobStatus} == {
+        "QUEUED": "queued",
+        "RUNNING": "running",
+        "SUCCEEDED": "succeeded",
+        "FAILED": "failed",
+        "CANCELLED": "cancelled",
+    }
+    assert isinstance(JobStatus.RUNNING, str)
+    assert JobStatus.SUCCEEDED == "succeeded"
+
+
+# ----------------------------------------------------------------------
+# 状態写像（_map_status）: FR-6 の未知状態フォールバック規則
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("succeeded", JobStatus.SUCCEEDED),
+        ("failed", JobStatus.FAILED),
+        ("cancelled", JobStatus.CANCELLED),
+        ("queued", JobStatus.QUEUED),
+        ("running", JobStatus.RUNNING),
+    ],
+)
+def test_map_status_maps_known_states(raw: str, expected: JobStatus) -> None:
+    """既知の状態文字列は対応する JobStatus へ写像される（終端 3 種 + queued + running）。"""
+    assert _map_status(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["validating_files", "pausing", "paused", "", "SUCCEEDED_TYPO", "unknown-state"],
+)
+def test_map_status_falls_back_to_running_for_unknown_states(raw: str) -> None:
+    """本要件の列挙に無い状態値は例外にせず RUNNING（非終端）へ倒す（FR-6）。
+
+    状態一覧をハードコードせず終端のみを判定する設計のため、未知値は待機継続側へ倒す。
+    """
+    assert _map_status(raw) == JobStatus.RUNNING
+
+
+def test_map_status_unknown_state_is_not_terminal() -> None:
+    """未知状態から作った JobResult は非終端（wait_job が待機を継続できる）。"""
+    result = JobResult(
+        job_id="ftjob-1",
+        status=_map_status("validating_files"),
+        raw_status="validating_files",
+        model_ref=None,
+        error_message=None,
+    )
+    assert result.is_terminal is False
+
+
+# ----------------------------------------------------------------------
+# JobRef
+# ----------------------------------------------------------------------
+
+
+def test_job_ref_holds_fields() -> None:
+    """JobRef は job_id / training_file_id / validation_file_id を保持する。"""
+    ref = JobRef(job_id="ftjob-1", training_file_id="file-tr", validation_file_id="file-val")
+    assert ref.job_id == "ftjob-1"
+    assert ref.training_file_id == "file-tr"
+    assert ref.validation_file_id == "file-val"
+
+
+def test_job_ref_allows_none_validation_file_id() -> None:
+    """validation_file_id は None を取りうる（val 省略時）。"""
+    ref = JobRef(job_id="ftjob-1", training_file_id="file-tr", validation_file_id=None)
+    assert ref.validation_file_id is None
+
+
+def test_job_ref_is_frozen() -> None:
+    """JobRef は frozen dataclass で属性再代入できない。"""
+    ref = JobRef(job_id="ftjob-1", training_file_id="file-tr", validation_file_id=None)
+    with pytest.raises((AttributeError, TypeError)):
+        ref.job_id = "ftjob-2"  # type: ignore[misc]
+
+
+# ----------------------------------------------------------------------
+# JobResult
+# ----------------------------------------------------------------------
+
+
+def _result(status: JobStatus, raw_status: str) -> JobResult:
+    """テスト用の JobResult を組み立てる（model_ref / error_message は未設定）。"""
+    return JobResult(
+        job_id="ftjob-1",
+        status=status,
+        raw_status=raw_status,
+        model_ref=None,
+        error_message=None,
+    )
+
+
+def test_job_result_holds_fields() -> None:
+    """JobResult は job_id / status / raw_status / model_ref / error_message を保持する。"""
+    result = JobResult(
+        job_id="ftjob-1",
+        status=JobStatus.SUCCEEDED,
+        raw_status="succeeded",
+        model_ref="ft:gpt-4o-mini:acme::abc123",
+        error_message=None,
+    )
+    assert result.job_id == "ftjob-1"
+    assert result.status == JobStatus.SUCCEEDED
+    assert result.raw_status == "succeeded"
+    assert result.model_ref == "ft:gpt-4o-mini:acme::abc123"
+    assert result.error_message is None
+
+
+def test_job_result_keeps_raw_status_for_unknown_state() -> None:
+    """未知状態でも raw_status にプラットフォームの生文字列を保全する（写像で失わない）。"""
+    result = _result(_map_status("validating_files"), "validating_files")
+    assert result.status == JobStatus.RUNNING
+    assert result.raw_status == "validating_files"
+
+
+def test_job_result_keeps_error_message_on_failure() -> None:
+    """失敗時は error_message に理由文言を保全する。"""
+    result = JobResult(
+        job_id="ftjob-1",
+        status=JobStatus.FAILED,
+        raw_status="failed",
+        model_ref=None,
+        error_message="training file is invalid",
+    )
+    assert result.error_message == "training file is invalid"
+
+
+def test_job_result_is_frozen() -> None:
+    """JobResult は frozen dataclass で属性再代入できない。"""
+    result = _result(JobStatus.RUNNING, "running")
+    with pytest.raises((AttributeError, TypeError)):
+        result.status = JobStatus.SUCCEEDED  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELLED],
+)
+def test_job_result_is_terminal_true_for_terminal_states(status: JobStatus) -> None:
+    """終端 3 種（succeeded / failed / cancelled）では is_terminal が True。"""
+    assert _result(status, status.value).is_terminal is True
+
+
+@pytest.mark.parametrize("status", [JobStatus.QUEUED, JobStatus.RUNNING])
+def test_job_result_is_terminal_false_for_non_terminal_states(status: JobStatus) -> None:
+    """非終端（queued / running）では is_terminal が False。"""
+    assert _result(status, status.value).is_terminal is False
+
+
+def test_job_result_is_terminal_is_a_property_not_a_field() -> None:
+    """is_terminal は property であり dataclass フィールドではない。
+
+    bool の dataclass フィールドにすると ADR-0021 の網羅性メタテスト
+    （`tests/test_bool_fields_l1.py`）の走査対象となり構築時検証を要求されるため、
+    導出値であることをクラス属性の型で固定する。
+    """
+    assert isinstance(vars(JobResult).get("is_terminal"), property)
+    assert "is_terminal" not in {f.name for f in dataclasses.fields(JobResult)}
