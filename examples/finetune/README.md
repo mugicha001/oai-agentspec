@@ -27,6 +27,7 @@ pip install 'oai-agentspec[finetune]'
 | `06_submit_job_live.py` | 実 API へ SFT ジョブを投入し状態を照会する（**課金あり**） | `submit_job` + `get_job` |
 | `07_submit_dpo_job_live.py` | 実 API へ DPO ジョブを投入し状態を照会する（**課金あり**） | `to_dpo_dataset` + `submit_job(method="dpo")` |
 | `08_submit_tools_job_live.py` | ツール定義つきの学習データを実 API へ投入する（SFT / DPO 切替・**課金あり**） | `ToolRegistry` + `tools=` + `submit_job` |
+| `09_dataset_from_session.py` | 会話履歴（SDK Session）から SFT データセットを生成する（filter / マスキング付き） | `dataset_from_session` + `SQLiteSession` |
 
 実行（API キー不要）:
 
@@ -36,6 +37,7 @@ uv run python examples/finetune/02_dpo_dataset.py
 uv run python examples/finetune/03_tools_from_registry.py
 uv run python examples/finetune/04_validate_byo_jsonl.py
 uv run python examples/finetune/05_job_body_preview.py
+uv run python examples/finetune/09_dataset_from_session.py
 ```
 
 実行（接続情報が必要・**従量課金が発生する**）:
