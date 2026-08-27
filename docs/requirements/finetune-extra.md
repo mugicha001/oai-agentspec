@@ -76,11 +76,12 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
 ### FR-4: 会話ログ（SDK Session）からの SFT データセット生成
 - ユーザーストーリー: lib 利用者として、運用中の会話履歴（SDK `Session`）から SFT 用データセットを生成したい。なぜなら実運用の対話を（利用者供給の filter で選別して）学習データとして再利用したいから。
 - 受け入れ基準:
-  - [ ] WHEN 利用者が `dataset_from_session(session, ...)` へ SDK `Session`（不透明型）を渡す THEN `_adapters/` 経由で履歴 items を plain データとして抽出し、user / assistant ターンから SFT chat 形式のケース列を生成して返す（`Session` の内部型を `runtime/finetune` ロジック層へ出さない・SDK 隔離維持）。
-  - [ ] WHEN 利用者が filter / transform callable（ケース単位の除外・整形・マスキング関数）を渡す THEN 生成前に各ケースへ適用する。省略時は抽出した全ターンを対象とし、lib は品質自動判定・個人情報の自動マスキングを内蔵しない（品質選別・マスキングロジックは利用者供給。設計論点として明記: 本 FR は `_adapters` への履歴抽出窓口の追加を要し、品質フィルタ / 個人情報の扱いが設計時の主要論点となる）。
-  - [ ] IF 履歴が空、または抽出可能な user / assistant ターンが存在しない THEN 生成不能の理由を示す明確なエラーを返し、空データセットを暗黙に返さない。
-  - [ ] WHEN `Session` へアクセスする THEN 読み取りのみとし、履歴の書込・削除・改変を行わない。
-  - [ ] WHEN 生成対象の形式を定める THEN SFT 形式のみを対象とし、会話ログからの DPO preference 生成（preferred / non_preferred ペアの導出）はスコープ外とする（ペアは会話ログから機械的に決定できないため。DPO データは FR-2 経由で利用者がキュレーションする）。
+  - [x] WHEN 利用者が `dataset_from_session(session, ...)` へ SDK `Session`（不透明型）を渡す THEN `_adapters/` 経由で履歴 items を plain データとして抽出し、user / assistant ターンから SFT chat 形式のケース列を生成して返す（`Session` の内部型を `runtime/finetune` ロジック層へ出さない・SDK 隔離維持）。
+  - [x] WHEN 利用者が filter / transform callable（ケース単位の除外・整形・マスキング関数）を渡す THEN 生成前に各ケースへ適用する。省略時は抽出した全ターンを対象とし、lib は品質自動判定・個人情報の自動マスキングを内蔵しない（品質選別・マスキングロジックは利用者供給。設計論点として明記: 本 FR は `_adapters` への履歴抽出窓口の追加を要し、品質フィルタ / 個人情報の扱いが設計時の主要論点となる）。
+  - [x] IF 履歴が空、または抽出可能な user / assistant ターンが存在しない THEN 生成不能の理由を示す明確なエラーを返し、空データセットを暗黙に返さない。
+  - [x] WHEN `Session` へアクセスする THEN 読み取りのみとし、履歴の書込・削除・改変を行わない。
+  - [x] WHEN 利用者が `system=` を指定する THEN 利用者供給の system 文字列を生成レコードの messages 先頭へ付す（FR-1 の `system=` と同型・`to_sft_dataset` へ委譲）。履歴内の system / developer item は生成対象外（破棄）のため本引数と競合しない。
+  - [x] WHEN 生成対象の形式を定める THEN SFT 形式のみを対象とし、会話ログからの DPO preference 生成（preferred / non_preferred ペアの導出）はスコープ外とする（ペアは会話ログから機械的に決定できないため。DPO データは FR-2 経由で利用者がキュレーションする）。
 
 ### FR-5: FT ジョブの submit（アップロード + ジョブ作成・SFT / DPO 第一級・ジョブ設定の通し道 + method passthrough）
 - ユーザーストーリー: lib 利用者として、整形済みデータセットとジョブ設定（base model / customization method / training type / suffix / seed / hyperparameters）を渡して FT ジョブを 1 呼び出しで開始したい。なぜならファイルアップロードとジョブ作成の boilerplate を手書きせず、かつポータルで選ぶのと同じ設定項目を lib の窓口越しに欠落なく指定したいから。

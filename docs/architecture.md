@@ -1990,6 +1990,49 @@ async。`submit_job` は `train` 以降が keyword-only、`get_job` / `wait_job`
 `poll_interval` 間隔で反復する lib が実装する唯一のポーリングループである（timeout 到達で `FineTuneError(TIMEOUT)`・
 ジョブは取り消さない）。判断の詳細と却下案は `docs/adr/0031-wait-job-polling-isolation.md` を参照。
 
+### 会話ログからの SFT データセット生成（dataset_from_session）
+
+運用中の会話履歴（SDK `Session`・不透明型）から SFT 用データセットを 1 呼び出しで生成する公開 API。
+配置は `runtime/finetune/session_dataset.py`（`dataset.py` は SDK 非接触の純データ層宣言を維持するため
+同居させない。純データ = `dataset.py` / SDK 接触あり = `jobs.py` / Session 読み取りあり =
+`session_dataset.py` の責務単位分割）。公開窓口 `oai_agentspec.runtime.finetune` から
+`dataset_from_session` として参照する（コア `__all__` には載せない）。SDK 接触は
+`_adapters/finetune.py` の `fetch_session_items(session)`（`session.get_items()` を 1 回 await して
+plain データを返すのみ・読み取り専用）に閉じ、生成は読み取り 1 回 + 純データ変換のみで
+lib 自体はネットワークへ接触しない（利用者供給の Session がネットワーク背当て
+（OpenAI Conversations 等）の場合、読み取りは Session 実装経由の通信を伴う。
+build-don't-run 例外リストへの追加は不要）。
+
+データフロー: `Session` → `fetch_session_items`（`get_items()` 1 回・読み取り専用）→ 正規化
+（role が user / assistant の item のみ採用・content をテキスト str へ吸収）→ 累積ペアリング
+（各 assistant ターンを `expected_output`、それ以前の全 user / assistant ターンを input とする
+ケースを assistant ターンごとに 1 件生成。input が空になるケースと、吸収後の content が空になる
+assistant 応答（text フィールドを持たない parts のみ = refusal 等）のケースは生成せず `skipped` に
+計上する。空の `expected_output` を学習させるレコードを silent に混入させない）→
+`case_filter`（False で除外 + `skipped` 計上）→ `case_transform`（戻り dict を採用・dict 以外は
+`VALIDATION_FAILED`）→ `to_sft_dataset(cases, system=system)` へ委譲 → `DatasetBuildResult`。
+`system=` は利用者供給の学習用 system を messages 先頭へ付す（FR-1 経路と同型）。履歴由来の
+system / developer item は正規化で事前除外されるため `system=` と競合しない。`case_transform`
+が input へ system メッセージを注入した場合はこの限りでなく、委譲先 `to_sft_dataset` の競合
+検出が発火する（fail-closed）。ペアリング規則・破棄規則の検討経緯と却下案は
+`docs/adr/0033-session-dataset-pairing.md` を参照。
+
+エラー方針: `session` が None は `FineTuneError(CONFIG_MISSING)`。履歴が空 / 正規化後に採用ターン
+0 件 / assistant ターン 0 件（いずれも filter 適用前の抽出段階）は `FineTuneError(VALIDATION_FAILED)`
+（空データセットを暗黙に返さない）。filter による全ケース除外は空 `DatasetBuildResult`
+（records 空・`skipped` = 全件）の正常返却とする（利用者供給の明示的な除外であり失敗ではない）。
+
+FR-1 経路（`to_sft_dataset` 直呼び）と異なり、本経路は content（parts 配列含む）をテキスト str へ
+吸収する（Responses parts 形式は FT の vision parts 形式と別物のため透過しない）。同様に
+role キーを持たない item（function_call / function_call_output / reasoning 等）は破棄されるため、
+ツール往復は学習データに現れない（tools 入り学習データは持ち込み JSONL / `to_sft_dataset` 直呼び
+経路の責務）。
+
+利用者向け制約: compaction 済み履歴では畳まれたターンが学習ケースにならない（compaction は
+Session ストアの履歴自体を置換する不可逆操作で、compaction item は role なしのため正規化で
+除外される）。全ターンを学習データに使いたい Session では compaction を有効化しない、または
+発火前に生成する。
+
 ## 内容ガードレール（ローカル品質ゲート支援）
 
 宣言したエージェントが「何を言うか」を入出力・中間ツール段で検査する上位利用支援層。`runtime/` 配下の
