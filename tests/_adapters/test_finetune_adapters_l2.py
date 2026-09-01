@@ -23,12 +23,14 @@ from oai_agentspec._adapters import finetune as _ft
 from oai_agentspec._adapters.finetune import (
     _require_openai,
     create_job,
+    fetch_session_items,
     retrieve_job,
     upload_file,
 )
 from oai_agentspec.runtime.finetune import FineTuneError, FineTuneFailureKind
 
 from _helpers.fake_finetune_client import FakeFineTuneClient
+from _helpers.fake_session import UNSET, FakeSession
 
 pytestmark = pytest.mark.integration
 
@@ -454,6 +456,64 @@ async def test_wait_file_processed_openai_error_becomes_api_error() -> None:
 
     assert exc_info.value.kind == FineTuneFailureKind.API_ERROR
     assert _SENTINEL_REASON in exc_info.value.message
+
+
+# ----------------------------------------------------------------------
+# fetch_session_items（Session からの履歴取得・読み取り専用・ADR 0033 Confirmation）
+# ----------------------------------------------------------------------
+
+
+async def test_fetch_session_items_calls_get_items_once_without_limit() -> None:
+    """`get_items` を引数なし（limit を渡さず）で 1 回だけ呼ぶ（全件取得の pin）。
+
+    メソッド名の一致だけでなく引数の不在まで固定する。`limit` を渡す実装だと
+    履歴の一部しか学習対象にならない欠陥が緑のまま残るため、`UNSET`（引数なし）を
+    記録で assert する。
+    """
+    items = [{"role": "user", "content": "a"}]
+    session = FakeSession(items)
+
+    result = await fetch_session_items(session)
+
+    assert result == items
+    assert session.get_items_limits == [UNSET]
+
+
+async def test_fetch_session_items_touches_only_get_items() -> None:
+    """Session へは `get_items` のみ呼ばれる（書込系の非呼び出し・完全一致）。"""
+    session = FakeSession([{"role": "user", "content": "a"}])
+
+    await fetch_session_items(session)
+
+    assert session.calls == ["get_items"]
+
+
+async def test_fetch_session_items_returns_new_list_even_for_tuple() -> None:
+    """戻り値は `list` 型（Session が tuple を返してもリスト化 = コピーの pin）。"""
+
+    class _TupleItemsSession:
+        """`get_items` が tuple を返す最小 Session 相当（duck typing の境界確認用）。"""
+
+        session_id = "tuple-session"
+
+        async def get_items(self, limit: int | None = None) -> tuple[dict[str, Any], ...]:
+            return ({"role": "user", "content": "a"},)
+
+    result = await fetch_session_items(_TupleItemsSession())
+
+    assert isinstance(result, list)
+    assert result == [{"role": "user", "content": "a"}]
+
+
+async def test_fetch_session_items_propagates_session_error_unconverted() -> None:
+    """`get_items` の例外は変換せずそのまま伝播する（本窓口は変換責務を持たない）。"""
+    session = FakeSession(get_items_error=RuntimeError(_SENTINEL_REASON))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await fetch_session_items(session)
+
+    assert not isinstance(exc_info.value, FineTuneError)
+    assert _SENTINEL_REASON in str(exc_info.value)
 
 
 async def test_upload_file_does_not_wait_for_processing() -> None:

@@ -4,6 +4,8 @@
 アップロード（`upload_file`）・ファイル処理完了の待機（`wait_file_processed`）・学習ジョブの
 作成（`create_job`）・ジョブ状態の照会（`retrieve_job`）という単発の SDK 呼び出しだけを提供する。
 ロジック層（`runtime/finetune`）へは plain な str / dict のみを返し、openai の型は一切出さない。
+`fetch_session_items` のみ openai 非接触の例外で、SDK `Session` への duck typing の読み取り
+窓口（`get_items` 1 回）として同居する。
 
 設計の核:
     - **分配規則**: `create_job` は `model` / `training_file` のみを SDK ネイティブ引数として渡し、
@@ -168,6 +170,26 @@ async def wait_file_processed(client: Any, file_id: str, *, timeout: float) -> s
             f"ファイル {file_id} の処理が完了しませんでした（status: {status}）{suffix}",
         )
     return file_id
+
+
+async def fetch_session_items(session: Any) -> list[dict[str, Any]]:
+    """SDK `Session` から履歴 items を全件取得する（読み取り専用・最薄窓口）。
+
+    `session.get_items()` を 1 回だけ await し、結果をリスト化して返す。全件取得のため
+    `limit` は渡さない。`get_items` 以外の属性・メソッドには一切触れない（読み取り専用の
+    実装側担保・FR-4）。duck typing のみで成立するため `agents` / `openai` の import は
+    不要（ImportError ガードも持たない）。
+
+    Args:
+        session: SDK `Session` Protocol 相当のオブジェクト（`get_items` を持つこと）。
+
+    Returns:
+        履歴 items（plain dict の列）のリスト。
+
+    Raises:
+        Exception: `get_items` が送出した例外はそのまま伝播する（本窓口では変換しない）。
+    """
+    return list(await session.get_items())
 
 
 async def create_job(client: Any, body: dict[str, Any]) -> str:

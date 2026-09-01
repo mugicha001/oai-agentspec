@@ -132,7 +132,10 @@ class DatasetBuildResult:
 
     Attributes:
         records: 変換済みレコード（1 要素 = JSONL 1 行）。
-        skipped: `skip_missing=True` により除外したケース件数。
+        skipped: 除外したケース件数。`to_sft_dataset` / `to_dpo_dataset` では
+            `skip_missing=True` による除外、`dataset_from_session` では空 input ケース・
+            空応答ケース（吸収後の content が空になる assistant ターン）・`case_filter` に
+            よる除外がここへ計上される。
     """
 
     records: tuple[dict[str, Any], ...]
