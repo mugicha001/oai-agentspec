@@ -224,12 +224,17 @@ async def test_normalization_boundaries_for_malformed_items_and_content() -> Non
     - 非 str・非 list の未知型 content は `str()` 変換結果（`42` -> `"42"`）が載る
     - 履歴中の非 dict 要素（文字列等）は例外にせず無言で読み飛ばす（ターン破棄と同じく
       skipped に数えない）
+    - role の採用判定は厳密な文字列一致（小文字限定・ADR 0033 Decision 2）。非小文字の
+      role バリアント（"User" / "ASSISTANT"）はターン破棄され、レコードへ現れず skipped
+      にも数えない（判定を大文字小文字非区別へ緩和する変異を検知する pin）
     """
     session = FakeSession(
         [
             "壊れた文字列 item",  # type: ignore[list-item]
+            {"role": "User", "content": "大文字始まり role は破棄される"},
             {"role": "user", "content": None},
             {"role": "assistant", "content": "承知しました"},
+            {"role": "ASSISTANT", "content": "全大文字 role も破棄される"},
             {"role": "user", "content": 42},
             {"role": "assistant", "content": "回答です"},
         ]
@@ -250,6 +255,40 @@ async def test_normalization_boundaries_for_malformed_items_and_content() -> Non
                 {"role": "assistant", "content": "承知しました"},
                 {"role": "user", "content": "42"},
                 {"role": "assistant", "content": "回答です"},
+            ]
+        },
+    )
+    assert result.skipped == 0
+
+
+async def test_multiple_text_parts_are_concatenated_without_separator() -> None:
+    """複数の text parts は separator なしで連結される（ADR 0033 Decision 4 の連結規則）。
+
+    原型（`_session_store._content_text`）と同型の `"".join` であることを pin する
+    （separator を混入させる変異 = 学習データ本文の silent 汚染を検知する）。text を
+    持たない part は無視されることも合わせて固定する。
+    """
+    session = FakeSession(
+        [
+            {"role": "user", "content": "質問"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "A"},
+                    {"type": "refusal", "refusal": "text キーなしは無視"},
+                    {"type": "output_text", "text": "B"},
+                ],
+            },
+        ]
+    )
+
+    result = await dataset_from_session(session)
+
+    assert result.records == (
+        {
+            "messages": [
+                {"role": "user", "content": "質問"},
+                {"role": "assistant", "content": "AB"},
             ]
         },
     )
