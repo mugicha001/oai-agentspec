@@ -1990,13 +1990,14 @@ async。`submit_job` は `train` 以降が keyword-only、`get_job` / `wait_job`
 `poll_interval` 間隔で反復する lib が実装する唯一のポーリングループである（timeout 到達で `FineTuneError(TIMEOUT)`・
 ジョブは取り消さない）。判断の詳細と却下案は `docs/adr/0031-wait-job-polling-isolation.md` を参照。
 
-### 会話ログからの SFT データセット生成（dataset_from_session）
+### 会話ログからのデータセット生成（dataset_from_session / dpo_dataset_from_session）
 
-運用中の会話履歴（SDK `Session`・不透明型）から SFT 用データセットを 1 呼び出しで生成する公開 API。
-配置は `runtime/finetune/session_dataset.py`（`dataset.py` は SDK 非接触の純データ層宣言を維持するため
-同居させない。純データ = `dataset.py` / SDK 接触あり = `jobs.py` / Session 読み取りあり =
-`session_dataset.py` の責務単位分割）。公開窓口 `oai_agentspec.runtime.finetune` から
-`dataset_from_session` として参照する（コア `__all__` には載せない）。SDK 接触は
+運用中の会話履歴（SDK `Session`・不透明型）から SFT 用 / DPO preference 用データセットを 1 呼び出しで
+生成する公開 API。配置は `runtime/finetune/session_dataset.py`（`dataset.py` は SDK 非接触の純データ層
+宣言を維持するため同居させない。純データ = `dataset.py` / SDK 接触あり = `jobs.py` / Session 読み取り
+あり = `session_dataset.py` / 雛形の記入ワークフロー = `dpo_draft.py` の責務単位分割）。公開窓口
+`oai_agentspec.runtime.finetune` から `dataset_from_session` / `dpo_dataset_from_session` として
+参照する（コア `__all__` には載せない）。SDK 接触は
 `_adapters/finetune.py` の `fetch_session_items(session)`（`session.get_items()` を 1 回 await して
 plain データを返すのみ・読み取り専用）に閉じ、生成は読み取り 1 回 + 純データ変換のみで
 lib 自体はネットワークへ接触しない（利用者供給の Session がネットワーク背当て
@@ -2004,18 +2005,24 @@ lib 自体はネットワークへ接触しない（利用者供給の Session �
 build-don't-run 例外リストへの追加は不要）。
 
 データフロー: `Session` → `fetch_session_items`（`get_items()` 1 回・読み取り専用）→ 正規化
-（role が user / assistant の item のみ採用・content をテキスト str へ吸収）→ 累積ペアリング
-（各 assistant ターンを `expected_output`、それ以前の全 user / assistant ターンを input とする
-ケースを assistant ターンごとに 1 件生成。input が空になるケースと、吸収後の content が空になる
+（下記「正規化規則」・content をテキスト str へ吸収）→ 累積ペアリング
+（各テキスト応答の assistant ターンを `expected_output`、それ以前の全採用ターン（変換済みツール
+メッセージを含む）を input とするケースを 1 件生成。input が空になるケースと、吸収後の content が空になる
 assistant 応答（text フィールドを持たない parts のみ = refusal 等）のケースは生成せず `skipped` に
-計上する。空の `expected_output` を学習させるレコードを silent に混入させない）→
+計上する。空の `expected_output` を学習させるレコードを silent に混入させない。加えて、切り出した文脈
+プレフィックスが「対応する role `"tool"` メッセージを欠く `tool_calls`」を含むケース（`function_call` と
+`function_call_output` の間に assistant テキストが挟まる履歴で、スライス境界が往復の途中を切る場合）も
+推論時 API が拒否する dangling tool_call の並びになるため生成せず `skipped` に計上する。判定は文脈
+プレフィックス内で完結し正規化・併合規則には影響しない）→
 `case_filter`（False で除外 + `skipped` 計上）→ `case_transform`（戻り dict を採用・dict 以外は
-`VALIDATION_FAILED`）→ `to_sft_dataset(cases, system=system)` へ委譲 → `DatasetBuildResult`。
+`VALIDATION_FAILED`）→ `to_sft_dataset(cases, system=system, tools=tools, parallel_tool_calls=...)`
+へ委譲 → `DatasetBuildResult`。
 `system=` は利用者供給の学習用 system を messages 先頭へ付す（FR-1 経路と同型）。履歴由来の
 system / developer item は正規化で事前除外されるため `system=` と競合しない。`case_transform`
 が input へ system メッセージを注入した場合はこの限りでなく、委譲先 `to_sft_dataset` の競合
 検出が発火する（fail-closed）。ペアリング規則・破棄規則の検討経緯と却下案は
-`docs/adr/0033-session-dataset-pairing.md` を参照。
+`docs/adr/0033-session-dataset-pairing.md`、ツール往復の変換保持と DPO 2 モード・記入
+ワークフローの検討経緯と却下案は `docs/adr/0034-session-tool-roundtrip-and-dpo-draft.md` を参照。
 
 エラー方針: `session` が None は `FineTuneError(CONFIG_MISSING)`。履歴が空 / 正規化後に採用ターン
 0 件 / assistant ターン 0 件（いずれも filter 適用前の抽出段階）は `FineTuneError(VALIDATION_FAILED)`
@@ -2023,15 +2030,120 @@ system / developer item は正規化で事前除外されるため `system=` と
 （records 空・`skipped` = 全件）の正常返却とする（利用者供給の明示的な除外であり失敗ではない）。
 
 FR-1 経路（`to_sft_dataset` 直呼び）と異なり、本経路は content（parts 配列含む）をテキスト str へ
-吸収する（Responses parts 形式は FT の vision parts 形式と別物のため透過しない）。同様に
-role キーを持たない item（function_call / function_call_output / reasoning 等）は破棄されるため、
-ツール往復は学習データに現れない（tools 入り学習データは持ち込み JSONL / `to_sft_dataset` 直呼び
-経路の責務）。
+吸収する（Responses parts 形式は FT の vision parts 形式と別物のため透過しない）。
+
+**ツール定義の透過**: `dataset_from_session` / `dpo_dataset_from_session` / `finalize_dpo_draft` は
+keyword-only の省略可引数 `tools=` / `parallel_tool_calls=` を持ち、内容を解釈せず委譲先
+（`to_sft_dataset` / `to_dpo_dataset`）の同名引数へ渡す。写像（`FunctionTool` 相当 → FT の tools
+定義形式）・不正要素の `VALIDATION_FAILED`・`None` 指定時のキー非出力はすべて委譲先に一元化され、
+上位層は `_map_tools` を呼ばない。透過先の階層は形式で異なり、SFT はレコード直下（`record["tools"]`）、
+DPO は input 内（`record["input"]["tools"]`）である。会話ログからツール定義を**復元**することは
+しない（`Session` に定義が記録されないため）。採用ケースが 0 件になる経路（`case_filter` の全除外・
+pair_builder の全件 `None`・全件未記入）でも委譲を省略しないため、不正な `tools=` は空結果でも
+`VALIDATION_FAILED` として表面化する（返却値自体は空 `DatasetBuildResult` の正常返却）。判断の詳細と
+却下案は `docs/adr/0035-session-dataset-tools-passthrough.md` を参照。
+
+#### 正規化規則（SFT / DPO 共通）
+
+正規化は生 item 列を 3 形のターン dict の列（`{"role", "content"}` / tool_calls 付き assistant /
+role `"tool"`）へ写す。確定した規則文言の SoT は `docs/requirements/finetune-extra.md`
+（FR-4 / FR-11）で、本節は実装挙動の要約に留める。
+
+- **ツール往復の変換保持**: `function_call` item は `{"role": "assistant", "tool_calls":
+  [{"id": <call_id>, "type": "function", "function": {"name": ..., "arguments": ...}}]}` へ、
+  `function_call_output` item は `{"role": "tool", "tool_call_id": <call_id>, "content": <output を
+  文字列へ写した値>}` へ 1:1 の決定的写像で変換し、文脈に保持する。`arguments` は解釈・改変せず
+  透過する。`output` は中身を解釈・要約しないまま content の型要求へ写す（str はそのまま、
+  キー無し / None は空文字、非 str は `json.dumps(..., ensure_ascii=False, default=str)` の JSON
+  文字列。JSON に対応しない値のみ文字列化して外側の JSON 構造を保ち、循環参照・非 primitive な
+  dict キーで直列化できない場合は `call_id` を含む `VALIDATION_FAILED`）。role `"tool"` の
+  content は文字列必須のため、この文字列化により変換後メッセージは `validate_dataset` の合法集合
+  （tool_calls 付き assistant・role `"tool"`）に収まる。
+- **併合**: 破棄対象 item を取り除いた列（射影列）の上で連続する `function_call` を 1 つの
+  assistant メッセージの `tool_calls` 配列へ併合する（並列呼び出しの表現。出力ターンを 1 件も
+  生まない item は透明として跨ぐ）。射影列上で間に出力ターンを生む item（`function_call_output`・
+  user / assistant テキスト item）が挟まれば併合せず独立の assistant メッセージとする。
+  `function_call_output` は常にそれぞれ独立の role `"tool"` メッセージになる。
+- **孤児の破棄**: `call_id` の対応相手が履歴に無い `function_call` / `function_call_output` は
+  当該 item のみ破棄する（ケースはエラー・除外にしない）。
+- **その他の破棄**: 非 function 系のツール・補助 item（web_search_call / file_search_call /
+  reasoning / compaction 等）と、生の role を持つ user / assistant 以外の item（system /
+  developer / tool 等）は破棄する（無言破棄・`skipped` に数えない）。破棄対象は履歴側の生 role
+  item であり、変換で生成される role `"tool"` メッセージとは区別する。
+- **ケース化の対象**: 吸収後 content が非空の assistant ターン（テキスト応答）のみが
+  `expected_output` / `response` の対象で、変換済みツールメッセージは文脈（input）にのみ現れる。
 
 利用者向け制約: compaction 済み履歴では畳まれたターンが学習ケースにならない（compaction は
 Session ストアの履歴自体を置換する不可逆操作で、compaction item は role なしのため正規化で
 除外される）。全ターンを学習データに使いたい Session では compaction を有効化しない、または
-発火前に生成する。
+発火前に生成する。ツール出力（`output` 文字列）は変換保持により学習文脈・雛形ファイルへ含まれる
+ため、その中の機密・個人情報の除去は利用者責務（SFT は `case_filter` / `case_transform`、DPO は
+pair_builder の `input` 差し替え・記入時編集）である。
+
+#### DPO preference 生成の 2 モード（dpo_dataset_from_session）
+
+`dpo_dataset_from_session(session, *, pair_builder=None, tools=None, parallel_tool_calls=None)` は
+上記と同一の正規化・累積ペアリングで
+ケース素材 `{"input": <累積文脈 messages>, "response": <実応答文字列>}` を組み立て、preferred /
+non_preferred の充足を利用者へ委ねる（lib は品質判定・応答生成を内蔵しない）。SFT 版の `system` /
+`case_filter` / `case_transform` は持たない（文脈の差し替え・マスキングは pair_builder の `input`
+差し替えが担う）。エラー方針（`session=None` は `CONFIG_MISSING`、履歴空 / 採用ターン 0 件 /
+テキスト応答の assistant ターン 0 件は `VALIDATION_FAILED`）は `dataset_from_session` と同一。
+
+- **callable モード**（`pair_builder` 指定時）: 各ケース素材へ pair_builder を適用し、
+  `preferred_output` / `non_preferred_output` を持つ dict を採用、`None` はケースを生成せず
+  `skipped` へ計上する（全件 skip は空 `DatasetBuildResult` の正常返却）。戻り値 dict が任意キー
+  `input` を含む場合はそれをレコードの input として採用する。戻り値が `None` でも dict でもない /
+  両キーのいずれかを欠く場合は元ケース位置つきの `VALIDATION_FAILED`。値の型規則は
+  `to_dpo_dataset`（`skip_missing=False` で委譲）の検証へ一元化する（委譲先エラーの index は
+  skip を含まない委譲リスト上の位置）。
+- **雛形モード**（`pair_builder` 省略時）: `{"input": ..., "preferred_output": "",
+  "non_preferred_output": "", "response": ...}` の記入用ケース列を `DatasetBuildResult.records`
+  として返す。この `records` は最終 preference レコードではなく記入用ケースであり、最終化は
+  `finalize_dpo_draft` が行う。記入用ケースはツール定義を持ち回らない（キーは上記 4 つのみ）。
+- **ツール定義の透過先**: callable モードでは `tools=` / `parallel_tool_calls=` を
+  `to_dpo_dataset` へ渡し `record["input"]` 内へ透過する。雛形モードは委譲先を持たないため
+  透過先が存在せず、両引数のいずれかが指定された場合は履歴読み取り（`fetch_session_items`）より
+  前に `FineTuneError(CONFIG_MISSING)` で拒否する（fail-closed。silent に無視しない）。エラー
+  メッセージは供給先が `finalize_dpo_draft` であることを示す。`parallel_tool_calls=False` の
+  単独指定も有意な指定として拒否対象に含む。
+
+#### 雛形の記入ワークフロー（save_dpo_draft / finalize_dpo_draft）
+
+配置は `runtime/finetune/dpo_draft.py`（Session 非接触・純データ + ローカルファイル I/O。標準
+`csv` / `json` のみを使い外部依存を増やさない）。公開窓口から `save_dpo_draft` /
+`finalize_dpo_draft` として参照する。
+
+- `save_dpo_draft(source, path)` は雛形モードの `DatasetBuildResult` または記入用ケース列を
+  拡張子で切り替えて書き出す（`.csv` / `.jsonl`。他は `CONFIG_MISSING`）。CSV の列は記入列
+  （`preferred_output` / `non_preferred_output`）・参照列（`case_index` / `context` / `response`・
+  読み取り専用）・機械用列（`input_json`・累積文脈 messages の JSON 文字列で復元源）。必須キー
+  （`input` / `preferred_output` / `non_preferred_output` / `response`）を欠く要素・dict 列でない
+  source は書き出し前に全件検証して `VALIDATION_FAILED`（要素位置と欠落キー名つき）とし、部分的に
+  書かれたファイルを残さない。`.jsonl` は `DatasetBuildResult.save()` と同内容（1 行 1 ケース・
+  `ensure_ascii=False`）。CSV では各セルが書き出し時点の `csv.field_size_limit()` に収まるかも
+  書き出し前に検査し、超える場合はケース位置と列名を含む `VALIDATION_FAILED` としてファイルを作らない
+  （書き出しは無制限・読み取りは上限ありという非対称のため、無検査だと読めない雛形へ人手記入させる。
+  上限はプロセスグローバルのため lib は変更せず、引き上げ（`csv.field_size_limit`）または `.jsonl` の
+  利用を案内する）。
+- `finalize_dpo_draft(source, *, tools=None, parallel_tool_calls=None)` は記入済み CSV / JSONL の
+  パスまたはメモリ上のケース列を読み、記入済みケースを `to_dpo_dataset`（`skip_missing=False`）へ
+  委譲して最終レコード列を返す。`tools=` / `parallel_tool_calls=` は委譲先へ透過し
+  `record["input"]` 内へ載る。雛形ファイルはツール定義を保持しない（CSV は 6 列のまま）ため、
+  雛形ワークフローにおけるツール定義の供給は本引数へ一本化する。CSV の
+  読み取りは列名ベースで列順に依存せず、`input_json` と記入 2 列のみを読む（参照列は無視）。必須列の
+  欠落は欠落列名つき `VALIDATION_FAILED`、`input_json` の JSON 不正はケース位置つき
+  `VALIDATION_FAILED`、ファイルを読めない場合は読み取りエラーを伝播する（fail-closed）。必須 3 列
+  （`input_json` / 記入 2 列）がすべて空の行はパースを試みず未記入 skip 経路へ合流し、`input_json` の
+  みが空で記入欄に値がある行は「JSON 不正」ではなく文脈復元列が空である旨のケース位置つき
+  `VALIDATION_FAILED` とする（記入内容の silent 喪失を防ぐ）。
+- **記入欄の判定**: 「空」= strip 後に空（空文字・空白のみ）。両欄空はケースを生成せず `skipped` へ
+  計上し（全件未記入は空 `DatasetBuildResult` の正常返却）、片欄のみ記入はケース位置つき
+  `VALIDATION_FAILED`。strip は判定にのみ使い、採用する値は非改変で委譲する。戻り値の `skipped` は
+  「finalize が未記入として skip した件数 + 委譲先が報告した skipped」で、雛形生成時の `skipped` は
+  合算しない。
+- **CSV のエンコーディング**: 書き込み・読み取りとも `utf-8-sig`（日本語環境の Excel で文字化けせず
+  開け、BOM なし UTF-8 の取り込みも壊れない）。セル内改行・引用符は標準 `csv` のクオート規則に依拠する。
 
 ## 内容ガードレール（ローカル品質ゲート支援）
 

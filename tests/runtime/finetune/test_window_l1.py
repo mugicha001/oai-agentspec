@@ -33,6 +33,10 @@ _WINDOW_SYMBOLS = {
     "wait_job",
     # 会話ログからのデータセット生成エントリ
     "dataset_from_session",
+    "dpo_dataset_from_session",
+    # DPO 雛形の記入ワークフロー
+    "save_dpo_draft",
+    "finalize_dpo_draft",
     # ケース型 / 結果型 / 検証レポート型
     "DpoCase",
     "DatasetBuildResult",
@@ -54,7 +58,7 @@ _WINDOW_SYMBOLS = {
 
 
 def test_window_all_member_set_is_pinned() -> None:
-    """窓口 `__all__` は 16 件のシンボル集合で固定する（FR-9）。
+    """窓口 `__all__` は 19 件のシンボル集合で固定する（FR-9）。
 
     `==` の集合比較により、意図しない公開追加（過大側）と公開喪失（過小側）の双方を
     検知する。

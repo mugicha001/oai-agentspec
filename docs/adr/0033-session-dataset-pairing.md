@@ -1,6 +1,7 @@
 # 0033: 会話ログ（Session）からの SFT データセット生成は累積ペアリング + 正規化破棄規則で行う
 
-- Status: accepted
+- Status: accepted (partially superseded by 0034: Decision 2 のうち function_call /
+  function_call_output の破棄のみ)
 - Date: 2026-08-26
 
 ## Context

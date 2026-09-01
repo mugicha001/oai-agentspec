@@ -27,7 +27,8 @@ pip install 'oai-agentspec[finetune]'
 | `06_submit_job_live.py` | 実 API へ SFT ジョブを投入し状態を照会する（**課金あり**） | `submit_job` + `get_job` |
 | `07_submit_dpo_job_live.py` | 実 API へ DPO ジョブを投入し状態を照会する（**課金あり**） | `to_dpo_dataset` + `submit_job(method="dpo")` |
 | `08_submit_tools_job_live.py` | ツール定義つきの学習データを実 API へ投入する（SFT / DPO 切替・**課金あり**） | `ToolRegistry` + `tools=` + `submit_job` |
-| `09_dataset_from_session.py` | 会話履歴（SDK Session）から SFT データセットを生成する（filter / マスキング付き） | `dataset_from_session` + `SQLiteSession` |
+| `09_dataset_from_session.py` | 会話履歴（SDK Session）から SFT データセットを生成する（ツール往復の文脈保持・filter / マスキング・`tools=` 付与付き） | `dataset_from_session` + `SQLiteSession` |
+| `10_dpo_draft_workflow.py` | 会話履歴から DPO 雛形を CSV へ書き出し、記入して最終データセットへ取り込む（callable モードも併記・`finalize_dpo_draft(tools=...)` によるツール定義の付与を含む） | `dpo_dataset_from_session` + `save_dpo_draft` + `finalize_dpo_draft` |
 
 実行（API キー不要）:
 
@@ -38,6 +39,7 @@ uv run python examples/finetune/03_tools_from_registry.py
 uv run python examples/finetune/04_validate_byo_jsonl.py
 uv run python examples/finetune/05_job_body_preview.py
 uv run python examples/finetune/09_dataset_from_session.py
+uv run python examples/finetune/10_dpo_draft_workflow.py
 ```
 
 実行（接続情報が必要・**従量課金が発生する**）:
@@ -197,6 +199,6 @@ RFT は Azure でも利用できる（`o4-mini` は GA、`gpt-5` は招待制）
 
 デプロイ / ホスティング（Azure の control plane 操作）は含まない。完成モデルは `model_ref`
 （モデル id の文字列）を返すところまでで、`AgentSpec` の model への流し込みは利用者が行う。
-会話ログ（SDK `Session`）からのデータセット生成も本 examples 群の範囲外。データ分割は
+データ分割は
 `oai_agentspec.runtime.lightning.train_val_split` がレコード列にもそのまま使える
 （finetune 側に分割 API は持たない）。
