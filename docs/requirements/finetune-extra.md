@@ -2,7 +2,7 @@
 
 ## 1. 概要
 
-oai-agentspec に、OpenAI / Azure OpenAI のマネージド fine-tuning API（SFT / DPO）を利用者の宣言エージェント運用へ各操作を単一の公開関数呼び出しで組み込める Fine-Tuning 統合機能を、公開 optional extra（`oai-agentspec[finetune]`・`runtime/finetune`）として追加する。機能は (1) データセット整形（既存 dataset 資産 `EvalCase` / `OptimizeCase` / `DpoCase` や plain dict からの SFT chat 形式 / DPO preference 形式への純データ変換・持ち込み JSONL の検証・会話ログ（SDK `Session`）からの SFT データセット生成・DPO preference データセット生成（pair_builder 供給 / 雛形整形 + CSV / JSONL 記入ワークフロー）・ツール往復の文脈保持）、(2) ジョブ管理（学習ファイルのアップロード + ジョブ作成の submit・ジョブ作成時の設定（base model / customization method / training type / データ / suffix / seed / hyperparameters）の通し道・ステータス単発照会・完成 `model_ref` 取得・opt-in のタイムアウト必須待機）の 2 系統からなる。学習の実行エンジンは OpenAI / Azure プラットフォーム側にあり、lib は単発 API 呼び出しの薄い結線に徹する（build-don't-run 維持。唯一のポーリングループは opt-in の待機関数 1 つに隔離し ADR で正当化する。前例: ADR 0004 `fit_ml_estimator` / ADR 0012 `failsafe_call`）。
+oai-agentspec に、OpenAI / Azure OpenAI のマネージド fine-tuning API（SFT / DPO）を利用者の宣言エージェント運用へ各操作を単一の公開関数呼び出しで組み込める Fine-Tuning 統合機能を、公開 optional extra（`oai-agentspec[finetune]`・`runtime/finetune`）として追加する。機能は (1) データセット整形（既存 dataset 資産 `EvalCase` / `OptimizeCase` / `DpoCase` や plain dict からの SFT chat 形式 / DPO preference 形式への純データ変換・持ち込み JSONL の検証・ツール往復の並びの submit 前スクリーニングと投入前の仕分け・会話ログ（SDK `Session`）からの SFT データセット生成・DPO preference データセット生成（pair_builder 供給 / 雛形整形 + CSV / JSONL 記入ワークフロー）・ツール往復の文脈保持）、(2) ジョブ管理（学習ファイルのアップロード + ジョブ作成の submit・ジョブ作成時の設定（base model / customization method / training type / データ / suffix / seed / hyperparameters）の通し道・ステータス単発照会・完成 `model_ref` 取得・opt-in のタイムアウト必須待機）の 2 系統からなる。学習の実行エンジンは OpenAI / Azure プラットフォーム側にあり、lib は単発 API 呼び出しの薄い結線に徹する（build-don't-run 維持。唯一のポーリングループは opt-in の待機関数 1 つに隔離し ADR で正当化する。前例: ADR 0004 `fit_ml_estimator` / ADR 0012 `failsafe_call`）。
 
 データセット整形は単一ターン（文字列 input）と複数ターン（messages 形式リスト input）の二形を受理し、ツール呼び出し（function calling）・assistant `weight`（loss masking）・content parts（vision）入りの学習例を非改変で透過する。`tools=` にはコア `ToolRegistry` 由来の `FunctionTool` 相当オブジェクトを直接渡せ、学習データと推論時のツール定義の一致を構造的に担保できる。
 
@@ -17,7 +17,7 @@ oai-agentspec に、OpenAI / Azure OpenAI のマネージド fine-tuning API（S
 | 段階 1 | データ整形・検証（FR-1 / FR-2 / FR-3） | 実装済み |
 | 段階 2 | 学習ジョブ管理 + ジョブ設定の通し道（FR-5 / FR-6 / FR-7） | 実装済み |
 | 段階 3 | 会話ログ由来のデータセット生成（FR-4） | 実装済み |
-| 段階 4 | 会話ログ由来の DPO preference データセット生成 + 記入ワークフロー + ツール往復の文脈保持（FR-11 / FR-12・FR-4 改訂） | 実装済み |
+| 段階 4 | 会話ログ由来の DPO preference データセット生成 + 記入ワークフロー + ツール往復の文脈保持 + submit 前スクリーニングと仕分け（FR-11 / FR-12 / FR-13 / FR-14・FR-4 改訂） | 実装済み |
 
 FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階へ横断的に適用する（段階 1 の範囲で成立する項目は `[x]`、ジョブ管理を要する項目は段階 2 で満たす）。
 
@@ -70,7 +70,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
   - [x] WHEN messages の `content` が文字列または parts 配列である THEN 合法とし、parts の内部構造は検証しない。IF `content` が文字列でもリストでもない型である、または空リスト `[]` である THEN 違反とする。content の型規則は DPO の `input.messages`・出力配列にも同一に適用する。
   - [x] WHEN メッセージに既知キー（`role` / `content` / `tool_calls` / `tool_call_id` / `weight`）以外の未知キーが含まれる THEN 違反にしない（非解釈で許容する）。レコードレベルの未知フィールドも同規則で許容する。
   - [x] WHEN `method="dpo"` で検証する THEN `preferred_output` / `non_preferred_output` が assistant メッセージの配列であることを検証する（配列内に assistant 以外の role があれば違反）。
-  - [x] WHEN 利用者が `raise_on_invalid=True` を明示指定して検証する THEN 不合格時に FR-10 の構造化エラー（種別: `VALIDATION_FAILED`・検証結果を保持）を送出する。省略時（既定）は例外を送出せず検証結果の返却のみとする。FR-10 の「検証失敗」種別の発生経路は、本オプションおよび FR-1 / FR-2 / FR-4 / FR-11 / FR-12 のデータ不備エラーに限る。
+  - [x] WHEN 利用者が `raise_on_invalid=True` を明示指定して検証する THEN 不合格時に FR-10 の構造化エラー（種別: `VALIDATION_FAILED`・検証結果を保持）を送出する。省略時（既定）は例外を送出せず検証結果の返却のみとする。FR-10 の「検証失敗」種別の発生経路は、本オプション、FR-13 の同名オプション、および FR-1 / FR-2 / FR-4 / FR-11 / FR-12 のデータ不備エラーに限る。
   - [x] WHEN `submit_job`（FR-5）を呼ぶ THEN submit は暗黙の事前検証を行わず、検証は本ヘルパの明示呼び出しに限る（検証仕様の二重管理を避け、最終判定はプラットフォームに委ねる）。
   - [x] WHEN 検証を実行する THEN 純データ操作 + ローカルファイル読み取りに徹し、ネットワークに触れない。
 
@@ -83,7 +83,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
   - [x] WHEN `Session` へアクセスする THEN 読み取りのみとし、履歴の書込・削除・改変を行わない。
   - [x] WHEN 利用者が `system=` を指定する THEN 利用者供給の system 文字列を生成レコードの messages 先頭へ付す（FR-1 の `system=` と同型・`to_sft_dataset` へ委譲）。履歴内の system / developer item は生成対象外（破棄）のため本引数と競合しない。
   - [x] WHEN 履歴 items を正規化する THEN FR-11 の共通正規化規則（ツール往復の chat 形式への決定的変換と文脈保持・射影列上で連続する function_call の併合・`output` の content 型への写像・孤児 item の破棄・非 function 系ツール item と生 role の system / developer / tool item の破棄。規則本体の SoT は FR-11）を適用する。ケース化の対象はテキスト応答の assistant ターンのみで不変であり、変換されたツールメッセージは文脈（input）にのみ現れる。本規則の適用によりツール往復を含む履歴では生成ケースの input に変換済みツールメッセージが追加される（ツール往復を含まない履歴では出力不変）。フラグ・オプションによる従来挙動の並存は設けない。
-  - [x] WHEN 累積文脈を切り出す THEN FR-11 の切り出し規則を適用する（生成せず `skipped` に計上する対象は空文脈ケース・吸収後 content が空の応答ケース・文脈がツール往復の途中で切れたケースの 3 種。規則本体の SoT は FR-11 で、切り出しの実装は両経路で共通である）。
+  - [x] WHEN 累積文脈を切り出す THEN FR-11 の切り出し規則を適用する（生成せず `skipped` に計上する対象は空文脈ケース・吸収後 content が空の応答ケースの 2 種。ツール往復の並びを理由とする除外は行わず、順序制約は FR-13 の submit 前ゲートが担う。規則本体の SoT は FR-11 で、切り出しの実装は両経路で共通である）。
   - [x] WHEN `case_filter` / `case_transform` を適用する THEN それらが受けるケースの `input` には変換済みツールメッセージが含まれ得る。tool 出力（content へ写した文字列）に含まれる機密・個人情報の除去は本経路の利用者責務とする（NFR-5）。
   - [x] WHEN 利用者が `tools=` / `parallel_tool_calls=` を指定する THEN 両引数を keyword-only の省略可引数として受け、内容を解釈せず委譲先 `to_sft_dataset` の同名引数へ渡す（レコード直下の `"tools"` / `"parallel_tool_calls"` へ透過される）。省略時（既定 `None`）はレコードへ当該キーを出力しない。写像・混在受理・不正要素のエラーは FR-1 と同一規則を委譲先で適用する。`case_filter` が全ケースを除外した場合も委譲を省略せず、不正な `tools=` は `VALIDATION_FAILED` として表面化する（返却値は空 `DatasetBuildResult` の正常返却のまま）。
   - [x] WHEN 生成対象の形式を定める THEN `dataset_from_session` は SFT 形式のみを対象とする（会話ログからの DPO preference 生成は FR-11 / FR-12 が担い、ペアは機械的に決定せず pair_builder 供給または雛形記入とする）。
@@ -144,7 +144,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
 
 ### FR-10: 失敗時の graceful degradation
 - ユーザーストーリー: lib 利用者として、FT 操作の失敗時にプロセスが未捕捉例外で落ちないようにしたい。なぜなら extra 不在・設定不在・検証失敗・API エラー・タイムアウトを判別可能なエラーとして受け取り、運用を継続したいから。
-- 失敗種別は `FineTuneFailureKind`（StrEnum）で判別する。メンバは `VALIDATION_FAILED`（検証失敗・FR-1/2/4/11/12 のデータ不備と FR-3 の raise opt-in）/ `EXTRA_MISSING`（extra 不在）/ `CONFIG_MISSING`（必須設定の不在および設定の不整合。FR-5 の重複指定による衝突を含む）/ `API_ERROR`（プラットフォーム API エラー）/ `TIMEOUT`（待機タイムアウト）の 5 種とする。
+- 失敗種別は `FineTuneFailureKind`（StrEnum）で判別する。メンバは `VALIDATION_FAILED`（検証失敗・FR-1/2/4/11/12 のデータ不備と FR-3 / FR-13 の raise opt-in）/ `EXTRA_MISSING`（extra 不在）/ `CONFIG_MISSING`（必須設定の不在および設定の不整合。FR-5 の重複指定による衝突を含む）/ `API_ERROR`（プラットフォーム API エラー）/ `TIMEOUT`（待機タイムアウト）の 5 種とする。
   - 判断根拠: ジョブ設定の通し道を広げても新たに生じる失敗は「必須設定の不在・重複指定の衝突」と「プラットフォームが返す設定エラー」の 2 系統で、それぞれ `CONFIG_MISSING` / `API_ERROR` に収まる。種別は利用者の復旧行動を分ける単位であり（引数を直して呼び直す / プラットフォーム側の条件を見直す）、これ以上の細分は分岐価値を生まないため増やさない。プラットフォーム側の詳細（エラーコード・理由文言）は種別ではなくエラーの保全情報として持つ。`CONFIG_MISSING` という命名は段階 1 からの互換のため据え置き、意味は「設定の解決不能（不在・衝突の双方）」と読む。
 - 受け入れ基準:
   - [ ] IF finetune extra が不在の状態で FT 機能を要求する THEN 必要 extra の導入を促す明確なエラー（`EXTRA_MISSING`）を返し、未捕捉例外でプロセスを停止しない（FR-9 と整合）。
@@ -156,7 +156,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
 - ユーザーストーリー: lib 利用者として、運用中の会話履歴（SDK `Session`）から DPO 用 preference データセットを生成したい。なぜなら実運用の対話文脈（ツール往復を含む）を再利用しつつ、preferred / non_preferred の判断・調達（人手ラベル・別モデル出力の持ち込み・後からの記入）は自分の責任とペースで行いたいから。
 - 受け入れ基準（共通）:
   - [x] WHEN ケース素材を切り出す THEN 両モード共通で FR-4 と同一の切り出し規則を適用する: 累積ペアリング（正規化後の各「テキスト応答の assistant ターン」ごとに 1 ケース・先行全採用ターンを文脈とする）・後述の正規化規則（ツール往復の変換保持を含む）・content parts 配列のテキスト str への吸収・空文脈ケース（input が空になるケース）と吸収後 content が空の assistant 応答のケースは生成せず `skipped` に計上する（skipped 意味論は FR-4 と同一）。
-  - [x] WHEN 累積文脈を切り出す THEN 文脈プレフィックス内に「対応する role `"tool"` メッセージが後続しない `tool_calls` の id」を含むケースは生成せず `skipped` に計上する（`function_call` と対応する `function_call_output` の間に assistant テキストが入る履歴（HITL 承認で中断されたラン等）では、スライス境界が往復の途中を切り、推論時 API が拒否する dangling tool_call の並びになるため）。判定は切り出した文脈プレフィックス内で完結し（`tool_calls` の id 集合 − role `"tool"` メッセージの `tool_call_id` 集合が空でなければ skip）、正規化・併合規則には影響しない。skipped 意味論は空文脈・空応答の skip と同一で、往復が閉じた文脈のケースは skip しない。
+  - [x] WHEN 累積文脈を切り出す THEN ツール往復の並びを理由にケースを除外しない（履歴を忠実に変換する。スライス境界が往復の途中を切る履歴（`function_call` と対応する `function_call_output` の間に assistant テキストが入る HITL 承認の中断ラン等）でも生成し `skipped` に計上しない）。メッセージ間の順序制約の判定は FR-13 の submit 前ゲートが担う。
   - [x] WHEN 履歴 items を正規化する THEN 次の規則を適用する（FR-4 と共通の正規化規則）:
     - `{"type": "function_call", "name": N, "arguments": A, "call_id": C}` item は `{"role": "assistant", "tool_calls": [{"id": C, "type": "function", "function": {"name": N, "arguments": A}}]}` へ、`{"type": "function_call_output", "call_id": C, "output": O}` item は `{"role": "tool", "tool_call_id": C, "content": <O を後述の写像規則で文字列へ写した値>}` へ、1:1 の決定的写像で変換して文脈に保持する（破棄しない）。変換後メッセージの合法性は FR-1 / FR-3 の既存規則（tool_calls 付き assistant・role `"tool"` の受理）に依拠し、新しい検証規則を発明しない。
     - WHEN 破棄対象 item を取り除いた列（以下「射影列」）の上で function_call item が連続する THEN 1 つの assistant メッセージの `tool_calls` 配列へ、生 item 列の出現順で併合する（Responses API の並列ツール呼び出しの表現）。IF 射影列上で 2 つの function_call の間に function_call_output・user / assistant テキスト item のいずれか（= 出力ターンを生む item）が存在する THEN 併合せず、それぞれ独立の assistant メッセージとする（逐次呼び出しの忠実表現）。function_call_output はいずれの場合もそれぞれ独立の role `"tool"` メッセージとする。
@@ -168,7 +168,7 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
     - WHEN function_call_output を変換する THEN `output` を role `"tool"` メッセージの `content`（chat 形式が文字列を要求する欄）へ次の規則で写す: 文字列 THEN そのまま / 未指定または `None` THEN 空文字 / それ以外 THEN `json.dumps(..., ensure_ascii=False, default=str)` による JSON 文字列（JSON に対応しない値は当該値のみ文字列化し、外側の JSON 構造は保つ）。
     - IF `output` が JSON へ直列化できない（循環参照・文字列化できない dict キー等） THEN 劣化した文字列を silent に載せず、`call_id` と原因を含む明確なエラー（`VALIDATION_FAILED`）を送出する（当該経路は SDK が書いた履歴では発生せず、利用者が構築した値でのみ到達するため fail-closed とする）。
     - WHEN 本規則を「非改変透過」との関係で解釈する THEN 本写像規則および併合規則は FR-4 / FR-11 の履歴正規化にのみ適用され、FR-1 / FR-2 の利用者供給データ（`input` / `expected_output` / `preferred_output`）の非改変透過は不変である（型写像も行わない）。非改変透過とは「値の内容を解釈・要約・省略・再解釈しない」保証であり、chat 形式が要求する型への 1:1・決定的・可逆な写像は改変にあたらない。`name` / `arguments` は文字列欄のため写像を要さず従来どおり非改変で透過する。
-    - WHEN 本規則の目的を確認する THEN 変換後の全メッセージが `validate_dataset`（FR-3）の合法集合に収まることを保証し、生成関数が成功したままプラットフォームが拒否するレコードを産まない。
+    - WHEN 本規則の目的を確認する THEN 変換後の全メッセージが `validate_dataset`（FR-3）の合法集合に収まることを保証する（各メッセージの合法性は FR-3 が、メッセージ間の順序制約は FR-13 が担う。両者は判定対象が異なり、片方の合格は他方の合格を含意しない）。
   - [x] WHEN ケース化の対象を定める THEN 従来どおりテキスト応答の assistant ターンのみを `expected_output` / `response` の対象とし、変換されたツール往復メッセージ（tool_calls 付き assistant・role `"tool"`）は文脈（input）にのみ現れる（本規則の目的はツール文脈の欠落の解消であり、ツール呼び出し判断そのものの学習ケース化はスコープ外・将来拡張とする）。これにより DPO の `response` = 文字列の前提・累積ペアリングの骨格は両モードとも不変である。
   - [x] WHEN ツール定義（スキーマ）を扱う THEN 会話ログからのツール定義の**復元**は行わない（`Session` にはツール定義が記録されず、会話ログから得られるのはツール往復のみであるため）。一方、利用者が明示指定したツール定義の**透過**は行い、lib は内容を解釈せず委譲先の同名引数へ渡す。
   - [x] WHEN 利用者が `dpo_dataset_from_session(session, pair_builder=..., tools=..., parallel_tool_calls=...)` を呼ぶ THEN 両引数を keyword-only の省略可引数として受け、委譲先 `to_dpo_dataset` の同名引数へ渡す（レコードの `input` 内へ透過される）。省略時（既定 `None`）はレコードへ当該キーを出力しない。写像・混在受理・不正要素のエラーは FR-1 / FR-2 と同一規則を委譲先で適用する（規則を本 FR で二重に定義しない）。
@@ -213,6 +213,34 @@ FR-8 / FR-9 / FR-10 および NFR-1〜NFR-7 は特定段階に閉じず全段階
   - [x] WHEN 利用者が `tools=` / `parallel_tool_calls=` を指定する THEN 両引数を keyword-only の省略可引数として受け、委譲先 `to_dpo_dataset` の同名引数へ渡す（レコードの `input` 内へ透過される。省略時はレコードへ当該キーを出力せず、写像・不正要素のエラーは FR-1 / FR-2 と同一規則を委譲先で適用する）。雛形ファイル（CSV / JSONL）はツール定義を保持せず CSV の 6 列構成も不変であり、雛形ワークフローにおけるツール定義の供給は本引数へ一本化する。
   - [x] WHEN 全ケースが未記入である THEN 委譲を省略せず、不正な `tools=` が `VALIDATION_FAILED` として表面化する（返却値は `DatasetBuildResult(records=(), skipped=全件)` の正常返却のまま）。
   - [x] WHEN 取り込みを実行する THEN `Session`・ネットワークに触れない（純データ + ローカルファイル読み取りのみ）。finalize は新しい検証規則を発明せず、「両欄空 = skip / 片欄のみ = エラー」という自関数の入力契約のみを持つ（レコードの形式検証は FR-2 委譲と FR-3 の明示呼び出しに委ねる）。
+
+### FR-13: ツール往復のスクリーニング（submit 前の順序制約ゲート）
+- ユーザーストーリー: lib 利用者として、学習データのツール往復の並びが推論時 API の要求を満たすかを submit の前に検査したい。なぜならメッセージ 1 件ずつが合法でも、並べたときに「応答のない `tool_calls`」になっている学習データは、推論時 API が拒否する並びを学習させることになるから。
+- 準拠先と不確実性: 本 FR の判定の準拠先は**推論時 API の順序要求**である。FT のファイル検証が同じ並びを拒否するかは公式ドキュメントに明文がなく**未確定**（ADR 0036 の Context を参照）。ただし仮にファイル検証が通したとしても、応答のない `tool_calls` を含む文脈を学習させること自体が学習データの誤りであり、本 FR の価値はファイル検証の挙動に依存しない。
+- 位置づけ: 生成（FR-4 / FR-11）は履歴を忠実に変換し並びを理由にケースを捨てない。形式の判定は本 FR の明示ゲートへ集約する（生成と精査の責務分離）。判定対象は FR-3 と排他であり、FR-3 は各メッセージの合法性を、本 FR はメッセージ間の順序制約を担う。
+- 受け入れ基準:
+  - [x] WHEN 利用者が `screen_tool_roundtrips(source, method=..., raise_on_invalid=...)` を呼ぶ THEN FR-3 の `validate_dataset` と同型の契約で検査結果を返す: source は JSONL ファイルパスまたはレコードの列（単一 dict は明示エラー）、`method` は `"sft"` / `"dpo"` のみ（他はエラー）、返却は検証レポート（`ok` / `checked` / 違反列）、`DatasetViolation.line` はファイルなら 1 始まりの物理行番号・列なら 1 始まりの要素位置とする。違反ゼロのときのみ `ok=True`（fail-closed）。
+  - [x] WHEN 検査対象の messages を定める THEN `method="sft"` は `messages`、`method="dpo"` は `input.messages` を対象とする（DPO の `preferred_output` / `non_preferred_output` は対象外）。
+  - [x] WHEN 違反理由を組み立てる THEN 対象メッセージの位置を `messages[N]:` 形式（DPO は `input.messages[N]:`）で理由文の先頭へ前置する（FR-3 の位置表記と同書式）。群の一致に関する違反は、当該群を開いた `tool_calls` 付き assistant の位置へ紐づける。
+  - [x] WHEN 順序制約を判定する THEN 次の 2 規則を適用する:
+    - 規則 (1): `tool_calls` を持つ assistant メッセージの直後に連続する role `"tool"` メッセージ群について、その `tool_call_id` の集合が当該 assistant の `tool_calls` の id 集合と一致すること（過不足なし）。群内の順序は問わない（並列ツール呼び出しの対応は id ベースであり順序に意味を持たないため）。IF 群を開いた assistant が対象 messages の**末尾**である THEN 本規則を適用しない（末尾の `tool_calls` は「ツール呼び出しそのものを学習させる」SFT の学習ターゲット本体であり、応答が続かないのが正常である。適用すると `to_sft_dataset` が生成する正当なレコードを不合格にする）。
+    - 規則 (2): いずれの群にも属さない role `"tool"` メッセージが存在しないこと（先行する `tool_calls` 群を持たない tool）。
+  - [x] IF assistant メッセージの `tool_calls` がリストでない THEN ツール呼び出しの対応を検証できないため違反として報告する（`validate_dataset` はキーの存在しか見ず内部構造を解釈しないため、ここで素通しすると不正なレコードが両ゲートを通過する）。
+  - [x] WHEN 群の集合を組む THEN 集合へ入れるのは文字列の id のみとする。IF `tool_calls` の要素が文字列 `id` を欠く（キー欠落・非文字列） THEN 往復の対応を検証できないため、当該件数を添えた違反として報告する（要求集合から黙って落とすと、後続の role `"tool"` が無い構成では空集合同士が一致して合格し、`validate_dataset` も `tool_calls` の内部構造を解釈しないため、どのゲートも捕らえない fail-open になる）。role `"tool"` 側の非文字列・キー欠落の `tool_call_id` は集合へ入らず、群の不一致として規則 (1) の違反に現れる。群内に同じ `tool_call_id` が重複しても判定に影響しない（重複そのものの是非はメッセージ単位の問題であり本 FR の対象外）。
+  - [x] IF レコードが JSON オブジェクトでない / 対象の messages が欠落している / 非リストである / 要素が dict でない THEN 違反を報告せず素通しする（構造違反は FR-3 の責務であり、二重報告しない）。非 dict 要素の位置で群の連続性は途切れる扱いとする。
+  - [x] WHEN 利用者が `raise_on_invalid=True` を明示指定する THEN 不合格時に FR-10 の構造化エラー（種別: `VALIDATION_FAILED`・検査結果を保持）を送出する。省略時（既定）は例外を送出せず検査結果の返却のみとする。
+  - [x] WHEN `submit_job`（FR-5）を呼ぶ THEN submit は暗黙の事前スクリーニングを行わず、検査は本ヘルパの明示呼び出しに限る（FR-3 と同じ方針。最終判定はプラットフォームに委ねる）。
+  - [x] WHEN スクリーニングを実行する THEN 純データ操作 + ローカルファイル読み取りに徹し、ネットワークに触れない。
+
+### FR-14: 投入前の仕分け（partition_dataset）
+- ユーザーストーリー: lib 利用者として、学習データを「投入できるもの」と「できないもの」へ仕分けたい。なぜなら不合格レコードを除いた分をすぐ投入しつつ、除いた分は理由つきで手元に残して直したいから。
+- 位置づけ: FR-3（メッセージ単位の合法性）と FR-13（メッセージ間の順序制約）の両ゲートを合成する薄いヘルパであり、新しい判定規則を持たない。判定規則の SoT は各 FR にある。
+- 受け入れ基準:
+  - [x] WHEN 利用者が `partition_dataset(source, method=...)` を呼ぶ THEN 各レコードへ FR-3 と FR-13 の両判定を適用し、どちらにも違反しないレコードを合格側へ、いずれかに違反したレコードを理由つきで不合格側へ仕分けた結果を返す。source の二形（JSONL ファイルパス / レコードの列。単一 dict は明示エラー）と `method` の語彙（`"sft"` / `"dpo"` のみ）は FR-3 / FR-13 と同一とする。
+  - [x] WHEN 合格側を返す THEN `DatasetBuildResult` として返し、`submit_job`（FR-5）の `train=` と `save(path)` へ詰め替えなしで渡せるようにする。`skipped` には不合格件数を計上する。
+  - [x] WHEN 不合格側を返す THEN 1 件ごとに「元データ内の位置（1 始まり。ファイルなら行番号）」「元レコード」「違反理由の列（両ゲートの理由を検出順に含む）」を保持した要素の列として返す（レポートと元データを位置で突き合わせる作業を利用者へ課さない）。
+  - [x] IF source の行が JSON として解析できない THEN 当該行を不合格として扱い、解析エラーを理由に載せる（合格側へ混ぜない・元レコードは持てないため空とする）。
+  - [x] WHEN 仕分けを実行する THEN 不合格があっても例外を送出せず返却値で表す（fail-closed の raise は FR-3 / FR-13 の `raise_on_invalid` が担い、本 FR では二重化しない）。純データ操作 + ローカルファイル読み取りに徹し、ネットワークに触れない。
 
 ## 3. 非機能要件
 

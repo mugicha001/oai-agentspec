@@ -1840,7 +1840,7 @@ openai を明示宣言する）であり、公開窓口・extra 未導入契約�
 `name` / `params_json_schema` 属性のダックタイピングで判別するため、import 依存辺は増えない）。
 
 公開窓口は `oai_agentspec.runtime.finetune` の `__init__.py` に集約し、変換ヘルパ（`to_sft_dataset` /
-`to_dpo_dataset`）・検証ヘルパ（`validate_dataset`）・ケース型（`DpoCase`・frozen dataclass）・結果型
+`to_dpo_dataset`）・検証ヘルパ（`validate_dataset`）・スクリーニングヘルパ（`screen_tool_roundtrips`）・仕分けヘルパ（`partition_dataset`）・ケース型（`DpoCase`・frozen dataclass）・結果型
 （`DatasetBuildResult` / `DatasetValidationReport` / `DatasetViolation`）・エラー型（`FineTuneError` /
 `FineTuneFailureKind`）はここから参照する。コア `__all__` には載せない。`DatasetBuildResult` は既定で plain な
 レコード列 + `skipped` 件数を返すのみで、JSONL 書き出しは `result.save(path)` の明示呼び出しに限る
@@ -1944,6 +1944,54 @@ OpenAI 公式の SFT / DPO データ形式を準拠先として検証し、違�
   non_preferred として学習するが、ヘルパ・`validate_dataset` は出力配列長 1 超を違反にせず形式検証に徹する。
   ツール入りレコード・DPO 複数ターン input・未知キーを含め、受理可否の最終判定はプラットフォームが行う。
 
+### screen_tool_roundtrips（ツール往復の順序制約ゲート）
+
+`screen_tool_roundtrips(source, method=..., raise_on_invalid=False)` は `validate_dataset` と**同型の契約**で
+（source の二形・`DatasetViolation.line` の意味・`method` の `"sft"` / `"dpo"` 切り替え・引数検証・
+`raise_on_invalid`・fail-closed の `ok`）、判定対象だけが異なる。`validate_dataset` がメッセージ**単位**の
+合法性を見るのに対し、本関数はメッセージ**間**の順序制約（ツール往復の並び）を見る。両者は準拠先も異なり
+（公式データ形式 対 推論時 API の順序要求）、非隣接な往復を含むレコードは `validate_dataset` を合格で通る
+ため、submit 前は 2 つを並べて呼ぶ（ADR 0037）。準拠先は推論時 API の順序要求であり、**FT のファイル検証が
+同じ並びを拒否するかは未確定**（ADR 0036 の Context）。ただし応答のない `tool_calls` を含む文脈を学習させる
+こと自体が学習データの誤りであるため、本ゲートの価値はファイル検証の挙動に依存しない。
+
+- **規則 (1)**: `tool_calls` を持つ assistant の**直後に連続する** role `"tool"` 群の `tool_call_id` 集合が、
+  当該 assistant の `tool_calls` の id 集合と一致すること（過不足なし）。群内の順序は問わない（並列ツール
+  呼び出しの対応は id ベースで順序に意味を持たないため）。**末尾の群には適用しない**（末尾の `tool_calls`
+  付き assistant は「ツール呼び出しそのものを学習させる」SFT の学習ターゲット本体で、応答が続かないのが
+  正常。適用すると `to_sft_dataset` の正当な生成物を不合格にする）。`tool_calls` がリストでない場合は
+  対応を検証できないため違反とする。集合へ入れるのは str の id のみ。`tool_calls` の
+  要素が文字列 `id` を欠く場合は集合比較の対象にできない（後続 tool が無ければ空集合同士で一致してしまい、
+  `validate_dataset` も `tool_calls` の内部構造を解釈しないため両ゲートを通る fail-open になる）ため、
+  件数付きの違反として報告する。role `"tool"` 側の非 str・キー欠落は集合へ入らず群の不一致として現れる。
+  群内の同一 id の重複は判定に影響しない。
+- **規則 (2)**: いずれの群にも属さない role `"tool"` メッセージが存在しないこと。
+- **走査範囲**: `method="sft"` は `messages`、`method="dpo"` は `input.messages`（DPO の
+  `preferred_output` / `non_preferred_output` は対象外）。
+- **構造違反は報告しない**: レコードが非 dict / 対象 messages が欠落・非リスト / 要素が非 dict の場合は
+  素通しする（`validate_dataset` の責務との二重報告を避ける）。非 dict 要素の位置で群の連続性は途切れる。
+- **生成との責務分離**: 生成（`dataset_from_session` / `dpo_dataset_from_session`）は並びを理由にケースを
+  捨てない。会話ログ由来か持ち込み JSONL かを問わず、形式の判定は本ゲートへ集約する。
+- **違反理由の位置表記**: 理由文の先頭へ `messages[N]:`（DPO は `input.messages[N]:`）を前置する
+  （`validate_dataset` と同書式）。群の一致に関する違反は、当該群を開いた `tool_calls` 付き assistant の
+  位置へ紐づける。
+
+### partition_dataset（投入前の仕分け）
+
+`partition_dataset(source, method=...)` は `validate_dataset` と `screen_tool_roundtrips` の両方を各レコードへ
+適用し、どちらにも違反しないレコードだけを合格側へ入れる薄い合成ヘルパである（ADR 0038）。判定規則は
+両関数へ委譲し、本関数は新しい規則を持たない。
+
+- **合格側は `DatasetBuildResult`**: `submit_job(train=...)` と `save(path)` の既存の受け口へ詰め替え
+  なしで渡せる。`skipped` には不合格件数が載る。
+- **不合格側は `DatasetRejection` の列**: `line`（元データ内の位置）/ `record`（元レコード）/ `reasons`
+  （両ゲートの理由を検出順に）を 1 件へまとめる。レポートと元データを位置で突き合わせる作業を利用者へ
+  課さず、直して再投入する動線も切らない。
+- **例外を送出しない**: 不合格があっても返却値で表す（fail-closed の raise は両ゲートの
+  `raise_on_invalid` が担う。仕分けは「不合格があっても続ける」ことが目的のため二重化しない）。
+- **解析不能行**: JSON として解析できない行は不合格として扱い、解析エラーを理由に載せる（`record` は
+  持てないため空）。
+
 train / val 分割はジェネリックな `runtime.lightning.train_val_split` が finetune のレコード列にもそのまま適用
 できる（finetune 側に分割 API は持たない）。
 
@@ -2009,11 +2057,10 @@ build-don't-run 例外リストへの追加は不要）。
 （各テキスト応答の assistant ターンを `expected_output`、それ以前の全採用ターン（変換済みツール
 メッセージを含む）を input とするケースを 1 件生成。input が空になるケースと、吸収後の content が空になる
 assistant 応答（text フィールドを持たない parts のみ = refusal 等）のケースは生成せず `skipped` に
-計上する。空の `expected_output` を学習させるレコードを silent に混入させない。加えて、切り出した文脈
-プレフィックスが「対応する role `"tool"` メッセージを欠く `tool_calls`」を含むケース（`function_call` と
-`function_call_output` の間に assistant テキストが挟まる履歴で、スライス境界が往復の途中を切る場合）も
-推論時 API が拒否する dangling tool_call の並びになるため生成せず `skipped` に計上する。判定は文脈
-プレフィックス内で完結し正規化・併合規則には影響しない）→
+計上する。空の `expected_output` を学習させるレコードを silent に混入させない。一方、ツール往復の
+**並び**を理由にケースを捨てることはしない（スライス境界が往復の途中を切る履歴でも生成する）。
+順序制約の判定は submit 前ゲート `screen_tool_roundtrips` の責務であり、生成は履歴を忠実に変換することへ
+徹する（責務分離。ADR 0037））→
 `case_filter`（False で除外 + `skipped` 計上）→ `case_transform`（戻り dict を採用・dict 以外は
 `VALIDATION_FAILED`）→ `to_sft_dataset(cases, system=system, tools=tools, parallel_tool_calls=...)`
 へ委譲 → `DatasetBuildResult`。
