@@ -3096,7 +3096,8 @@ Model 呼び出しの一時失敗リトライ・run 全体の予算超過制御�
 （`ModelSettings.retry` / `Runner.run(hooks=...)`）へコンパイルする、または SDK に依存しない純粋な
 着地関数（Failsafe）を提供するのみで、lib 独自の実行ループ・再試行・`Runner` 参照を持たない
 （build-don't-run）。`failsafe_call` は利用者が渡す thunk を 1 回 await する薄い結線であり、
-build-don't-run の逸脱として `./CLAUDE.md` に明記された 4 例のうちの 1 つである。例外は SDK の
+build-don't-run の逸脱の 1 つとして `./CLAUDE.md`「設計の核」の build-don't-run 項目と本ドキュメントの
+逸脱一覧に登録する（件数は当該一覧を正とし、本節では繰り返さない）。例外は SDK の
 伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]`
 extra で opt-in 導入し、extra は追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア
 `__all__`・`AgentSpec` のフィールド集合は不変。設計判断の検討経緯は
