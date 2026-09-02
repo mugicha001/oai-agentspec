@@ -294,12 +294,16 @@ def test_fit_encodes_y_with_label_encoding_before_calling_fit() -> None:
 
 
 def test_fit_raises_when_label_encoding_is_not_injective() -> None:
-    """非単射な label_encoding（複数キーが同一値へ衝突）は構築時に ValueError で拒否される。"""
+    """非単射な label_encoding（複数キーが同一値へ衝突）は構築時に ValueError で拒否される。
+
+    メッセージは末尾の "(duplicate encoded values)" が正規表現の括弧として解釈される
+    ため、括弧を含まない部分文字列で pin する。
+    """
     from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
 
     est = FakeFittableEstimator(classes=(0, 1), proba_rows=[[0.6, 0.4]])
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="label_encoding must be injective"):
         fit_ml_estimator(
             est,
             x_train=[[0.0], [1.0], [0.0]],
@@ -307,6 +311,84 @@ def test_fit_raises_when_label_encoding_is_not_injective() -> None:
             policy=_policy(),
             label_encoding={"refund": 0, "cancel": 0, "other": 1},
         )
+
+
+def test_fit_raises_when_label_encoding_does_not_cover_y_train() -> None:
+    """`label_encoding` が y のラベルを被覆しないと ValueError で拒否される。
+
+    メッセージは件数のみを含み、ラベル値そのものは載せない（ラベルが利用者の実データ
+    由来のとき、トレースやログへ実データが流入するのを避けるため）。末尾の
+    "(1 unmapped)" は正規表現の括弧として解釈されるため、`match=` には括弧を含まない
+    部分文字列を渡し、件数とラベル値の非露出は文字列比較で pin する。
+    """
+    from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
+
+    est = FakeFittableEstimator(classes=(0, 1), proba_rows=[[0.6, 0.4]])
+
+    with pytest.raises(ValueError, match="does not cover all labels in y_train") as excinfo:
+        fit_ml_estimator(
+            est,
+            x_train=[[0.0], [1.0]],
+            y_train=["refund", "secret_label"],
+            policy=_policy(),
+            label_encoding={"refund": 0, "cancel": 1},
+        )
+
+    message = str(excinfo.value)
+    assert "(1 unmapped)" in message
+    # ラベル値そのものはメッセージへ載せない（この修正の主目的）。
+    assert "secret_label" not in message
+    # 被覆性検査は fit 前検査であり、学習は駆動されない。
+    assert est.fit_calls == []
+
+
+def test_fit_unmapped_label_count_is_distinct_not_occurrences() -> None:
+    """未被覆ラベルの件数は distinct 件数（同一ラベルが複数回出ても 1 と数える）。"""
+    from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
+
+    est = FakeFittableEstimator(classes=(0, 1), proba_rows=[[0.6, 0.4]])
+
+    with pytest.raises(ValueError) as excinfo:
+        fit_ml_estimator(
+            est,
+            x_train=[[0.0], [1.0], [0.0], [1.0], [0.0]],
+            y_train=["refund", "alpha", "beta", "alpha", "beta"],
+            policy=_policy(),
+            label_encoding={"refund": 0},
+        )
+
+    message = str(excinfo.value)
+    # 未被覆は alpha / beta の 2 種（出現は計 4 回）。
+    assert "(2 unmapped)" in message
+    assert "alpha" not in message
+    assert "beta" not in message
+
+
+def test_fit_encodes_single_pass_iterable_y_train() -> None:
+    """1 回限りの iterable（generator）の y でも正しくエンコードされて fit へ届く。
+
+    被覆性検査を「事前の別パス」として足すと generator が 1 回目の走査で消費され、
+    空のラベル列で fit してしまう。本テストはその silent な退行を検知する pin であり、
+    検査と変換が同一ループであること（`y_train` の走査が 1 回だけであること）を要求する。
+    """
+    from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
+
+    est = FakeFittableEstimator(classes=(0, 1), proba_rows=[[0.6, 0.4]])
+    x_train = [[0.0], [1.0], [0.0]]
+    y_train = (label for label in ["refund", "cancel", "refund"])
+
+    fit_ml_estimator(
+        est,
+        x_train=x_train,
+        y_train=y_train,
+        policy=_policy(),
+        label_encoding={"refund": 0, "cancel": 1},
+    )
+
+    assert len(est.fit_calls) == 1
+    called_x, called_y = est.fit_calls[0]
+    assert called_x is x_train
+    assert list(called_y) == [0, 1, 0]
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +467,7 @@ def test_fit_inference_without_encoding_is_identity() -> None:
 
 
 def test_fit_raises_when_estimator_has_no_fit() -> None:
-    """`fit` を持たない estimator は構築時に TypeError/AttributeError で拒否される。"""
+    """`fit` を持たない estimator は TypeError/AttributeError で拒否される（メッセージ pin）。"""
     from oai_agentspec.runtime.intent._ml_training import fit_ml_estimator
 
     class NoFitEst:
@@ -394,7 +476,7 @@ def test_fit_raises_when_estimator_has_no_fit() -> None:
         def predict_proba(self, X: Any) -> list[list[float]]:
             return [[0.5, 0.5]]
 
-    with pytest.raises((TypeError, AttributeError)):
+    with pytest.raises((TypeError, AttributeError), match="estimator must provide a 'fit' method"):
         fit_ml_estimator(
             NoFitEst(),
             x_train=[[0.0]],

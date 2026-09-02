@@ -6,7 +6,8 @@ Protocol（`IntentClassifier` / `ContextBuilder` / `CandidateGenerator`）、
 デフォルト実装（`DefaultIntentClassifier` / `LLMCandidateGenerator`）、ML 系実装
 （`confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
 `MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` /
-`make_trained_estimator` / `ml_inference_from_estimator` / `fit_ml_estimator`）、
+`make_trained_estimator` / `ml_inference_from_estimator` / `fit_ml_estimator` /
+`TunedIntentEstimator` / `tune_ml_estimator`）、
 1 行ヘルパ（`intent_classifier_from_model` / `intent_classifier_from_generator` /
 `intent_classifier_from_ml_inference`）、アクション宣言（`ActionSpec` / `ActionCatalog` /
 `ActionPlanner` / `ParameterSpec` / `param` / `PARAM_UNSET`）、スロットと計画（`Slot` /
@@ -48,6 +49,8 @@ __all__ = [
     "make_trained_estimator",
     "ml_inference_from_estimator",
     "fit_ml_estimator",
+    "TunedIntentEstimator",
+    "tune_ml_estimator",
     "intent_classifier_from_model",
     "intent_classifier_from_generator",
     "intent_classifier_from_ml_inference",
@@ -106,6 +109,8 @@ _ML_TRAINING_SYMBOLS = frozenset(
         "make_trained_estimator",
         "ml_inference_from_estimator",
         "fit_ml_estimator",
+        "TunedIntentEstimator",
+        "tune_ml_estimator",
     }
 )
 _FACTORY_SYMBOLS = frozenset(
