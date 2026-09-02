@@ -90,8 +90,13 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=5",
     "pre-commit>=3.8",
+    # 実 sklearn を用いた intent チューニング支援の e2e 検証（tests/runtime/intent/
+    # test_ml_tuning_sklearn_l2.py）で使う。lib 本体と配布物の依存には含めない。
+    "scikit-learn>=1.4",
 ]
 examples = [
+    # examples 実行用。テスト用の宣言は dev グループ側に別途ある（意図が異なるため
+    # 重複ではない。片方を削除しない）。
     "scikit-learn>=1.4",
 ]
 
