@@ -3,8 +3,9 @@
 運用中の会話履歴を学習データとして再利用する入口が `dataset_from_session` である。
 `Session` の履歴を読み取り（読み取り専用・書込しない）、各 assistant 応答を正解、
 それ以前の全ターンを文脈とするケースを累積ペアリングで生成し、`to_sft_dataset` と
-同じ `DatasetBuildResult` を返す。結果はそのまま `submit_job(train=result)` /
-`result.save(path)` へ渡せる。
+同じ `DatasetBuildResult` を返す。結果は `result.save(path)` で書き出せ、`submit_job(train=...)`
+へも渡せる。ただし**投入の前にゲートを通すこと**（下記のとおり生成はツール往復の並びを理由に
+ケースを捨てないため、履歴によっては推論時 API が拒否する並びを含みうる）。
 
 本 example は SQLite の一時 Session に会話を書き込んでから生成するため、実 API 接続を
 伴わない。生成規則の設計判断（累積ペアリング・破棄規則）は
@@ -26,10 +27,12 @@
   学習用の system は履歴からではなく `system=` で明示指定する（履歴内 system と競合しない）。
 - **ケースになるのはテキスト応答の assistant ターンだけ**。変換で生まれた `tool_calls`
   つき assistant は文脈にのみ現れ、それ自体は学習ケースを生まない。
-- **ツール往復の途中で切れるケースは生成されない**。`function_call` と対応する
+- **ツール往復の並びを理由にケースを捨てない**。`function_call` と対応する
   `function_call_output` の間に assistant テキストが入る履歴（承認待ちの通知を書き込む等）
-  では、その assistant のケースの文脈が「応答のない `tool_calls`」で終わる。この並びは
-  推論時の API が拒否するため生成せず `skipped` に載せる。
+  では、累積ペアリングのスライス境界が往復の途中を切り、文脈が「応答のない `tool_calls`」で
+  終わるケースが生じる。生成は履歴を忠実に変換してこれも出力し `skipped` に載せない。
+  この並びは推論時の API が拒否するため、submit の前に `screen_tool_roundtrips` で検査する
+  （生成と精査の責務分離。`11_screen_and_partition.py` を参照）。
 - **filter / transform は利用者供給**。品質選別・個人情報マスキングは lib が内蔵しない。
   filter で除外した件数は `skipped` に載る（全件除外でもエラーにならず空の結果が返る）。
 - **transform は新しい dict を返すこと**。ケース間で turn dict が共有参照のため、
@@ -146,8 +149,9 @@ async def main() -> None:
     print("tools =", result.records[0]["tools"])
 
     print()
-    print("この結果はそのまま投入できる:")
-    print("    job = await submit_job(client, train=result, model=..., method='sft')")
+    print("投入の前にゲートを通す（生成は並びを理由にケースを捨てないため）:")
+    print("    part = partition_dataset(result.records, method='sft')")
+    print("    job = await submit_job(client, train=part.passed, model=..., method='sft')")
 
 
 if __name__ == "__main__":

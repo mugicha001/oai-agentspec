@@ -29,6 +29,7 @@ pip install 'oai-agentspec[finetune]'
 | `08_submit_tools_job_live.py` | ツール定義つきの学習データを実 API へ投入する（SFT / DPO 切替・**課金あり**） | `ToolRegistry` + `tools=` + `submit_job` |
 | `09_dataset_from_session.py` | 会話履歴（SDK Session）から SFT データセットを生成する（ツール往復の文脈保持・filter / マスキング・`tools=` 付与付き） | `dataset_from_session` + `SQLiteSession` |
 | `10_dpo_draft_workflow.py` | 会話履歴から DPO 雛形を CSV へ書き出し、記入して最終データセットへ取り込む（callable モードも併記・`finalize_dpo_draft(tools=...)` によるツール定義の付与を含む） | `dpo_dataset_from_session` + `save_dpo_draft` + `finalize_dpo_draft` |
+| `11_screen_and_partition.py` | ツール往復の並びを submit 前に検査し、投入できる分とできない分へ仕分ける（持ち込みレコード / JSONL ファイル / 会話ログ生成物の 3 経路・`validate_dataset` との判定対象の違い） | `screen_tool_roundtrips` + `validate_dataset` + `partition_dataset` |
 
 実行（API キー不要）:
 
@@ -40,6 +41,7 @@ uv run python examples/finetune/04_validate_byo_jsonl.py
 uv run python examples/finetune/05_job_body_preview.py
 uv run python examples/finetune/09_dataset_from_session.py
 uv run python examples/finetune/10_dpo_draft_workflow.py
+uv run python examples/finetune/11_screen_and_partition.py
 ```
 
 実行（接続情報が必要・**従量課金が発生する**）:
@@ -118,6 +120,11 @@ api-version の既定を推論用から分けているのは、`trainingType` �
 - **検証は fail-closed**: `validate_dataset(source, method="sft"|"dpo")` は違反ゼロのときのみ
   `ok=True`。`raise_on_invalid=True` を明示したときのみ `FineTuneError` を送出する
   （既定は `DatasetValidationReport` を返すのみ）。
+- **投入前のゲートは 2 つある**: `validate_dataset` はメッセージ**単位**の合法性、
+  `screen_tool_roundtrips` はメッセージ**間**の順序制約（ツール往復の並び）を見る。判定対象が
+  違うため片方の合格はもう片方の合格を含意せず、1 件ずつ合法でも並びが不正な学習データは
+  `validate_dataset` を通ってしまう。submit 前は 2 つを並べて呼ぶか、両方を適用して合格・
+  不合格へ仕分ける `partition_dataset` を使う（`11_screen_and_partition.py`）。
 - **`skip_missing`**: `to_sft_dataset` / `to_dpo_dataset` に渡すと、必須フィールド欠落等の
   ケースを既定エラーにせず除外し、`DatasetBuildResult.skipped` に件数報告する。
 
