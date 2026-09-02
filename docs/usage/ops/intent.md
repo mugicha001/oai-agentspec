@@ -74,7 +74,7 @@ clf = intent_classifier_from_ml_inference(
 pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 ```
 
-- extras: `scikit-learn` は lib 本体・`[intent]` extra には含まれない（`[dependency-groups].examples` のみ）。利用側で個別インストールする
+- extras: `scikit-learn` は lib 本体・`[intent]` extra には含まれない（`[dependency-groups]` の `examples`（例の実行）と `dev`（end-to-end テスト）のみ）。利用側で個別インストールする
 - 具体例: `examples/intent/08_ml_sklearn_pipeline.py`（生テキスト経路）/ `09_ml_pretrained_features.py`（事前ベクトル化）/ `10_ml_custom_trainer.py`（学習手段非依存の最小契約）/ `11_ml_persist_reload.py`（pickle 永続化・再接続）
 
 ## パラメータ一覧
@@ -116,7 +116,7 @@ pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 
 | パラメータ | 型 | 既定 | 説明 |
 |---|---|---|---|
-| `inference` | `Callable \| TrainedIntentEstimator` | 必須 | ML 推論 callable、または `fit_ml_estimator` 等の成果物 |
+| `inference` | `Callable \| TrainedIntentEstimator` | 必須 | ML 推論 callable、または `fit_ml_estimator` 等の成果物（サブクラスの `TunedIntentEstimator` も渡せる） |
 | `policy` | `IntentPolicy \| None` | `None` | 省略時は成果物が保持する policy から自動解決（明示指定が優先・両方なしは `ValueError`） |
 | `mapper` / `thresholds` | 排他 | `None` | スコア→`ConfidenceLevel` の変換（`thresholds` は5段階名のdict） |
 | `history_limit` | `int` | `20` | 上と同じ |
@@ -125,7 +125,24 @@ pred = await clf.classify(IntentQuery(utterance="請求書ください"))
 
 sklearn 互換 estimator（`fit` 欠如は `AttributeError`）の `fit()` を 1 回駆動し `TrainedIntentEstimator`
 を返す。`transform` 既定は `[ctx.utterance]`（単一サンプル列）。`label_encoding` は非単射（値の重複）
-だと `ValueError`。
+だと `ValueError`。`y_train` のラベルを被覆しない場合も `ValueError`（メッセージはラベル値を載せず
+未被覆ラベルの件数のみ）。いずれも fit の駆動前に落ちる。
+
+### `tune_ml_estimator(search, *, x_train, y_train, policy, transform=None, label_encoding=None)`
+
+sklearn 互換の CV 探索器（`fit` 欠如は `AttributeError`）の `fit()` を 1 回駆動し、fit 後の
+`best_estimator_` から推論 callable を組んで `TunedIntentEstimator`（`TrainedIntentEstimator` の
+サブクラス・`best_params` / `best_score` / `cv_results` を保持）を返す。そのまま
+`intent_classifier_from_ml_inference` へ渡せる（policy は成果物から自動解決）。`GridSearchCV` /
+`RandomizedSearchCV` / `HalvingGridSearchCV` / 自作探索器のいずれも同じ入口で扱える（探索の設定は
+探索器側に閉じる）。fit 後に `best_estimator_` / `best_params_` が無ければ `AttributeError`（再学習を
+無効にした探索器は使用できない）、`best_score_` / `cv_results_` が無い場合は当該フィールドが `None`。
+`transform` / `label_encoding` の扱いは `fit_ml_estimator` と同じ。
+
+**評価指標（`scoring`）・分割数（`cv`）・探索空間（`param_grid` 等）は探索器インスタンスへ渡す**。
+本関数のシグネチャには現れない。`best_score` / `cv_results` の値が何の指標かは探索器の `scoring` が
+決め、lib は解釈も変換もせずそのまま成果物へ載せる（複数指標を指定すると `cv_results` のキー名も
+`mean_test_<指標名>` へ変わる）。指標の意味を知りたい場合は探索器側（sklearn なら `scorer_`）を見る。
 
 ### `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`
 
@@ -153,7 +170,7 @@ callable を組み立てる。
 - `IntentPolicy.render_prompt()` の固定文（タスク指示・出力形式）は lib 側 parser との出力契約の serialize。`include_policy_in_system=False` で全無効化可能
 - 窓口は PEP 562 遅延 import。extra 未導入時は属性アクセスで `ImportError`
 - `IntentPolicy.categories` は tuple（`list` を渡してもよいが frozen として保持される）
-- `fit_ml_estimator` は build-don't-run 不変条件からの唯一の逸脱（`estimator.fit()` を lib が駆動）。scikit-learn は lib 本体・`[intent]` extra に含まれず利用側で個別インストールが必要
+- `fit_ml_estimator` / `tune_ml_estimator` は build-don't-run 不変条件からの逸脱（利用者が渡した学習器の `fit()` を lib が駆動）で、2 入口が private ヘルパ `_fit_once` 1 箇所を共有する。scikit-learn は lib 本体・`[intent]` extra に含まれず（`[dependency-groups]` の `examples` / `dev` のみ）利用側で個別インストールが必要
 
 ## 参照
 

@@ -832,9 +832,9 @@ sentinel（`_ACTION_DIRECT_SOURCE`・NUL 制御文字で挟んだ非公開定数
 
 記録の追記とゲートの参照は SDK が呼ぶ公式 callback の内側で行う読み書きのみであり、`await` も `Runner` 参照も
 独自の実行ループも持たない（hooks 合成と同種の薄い結線）。このため build-don't-run の逸脱には当たらず、
-逸脱として列挙する 4 例（`runtime/intent` の `fit_ml_estimator` / `runtime/resilience` の
+逸脱として列挙する 5 例（`runtime/intent` の `fit_ml_estimator`・`tune_ml_estimator` / `runtime/resilience` の
 `failsafe_call` / `runtime/observability` の `enable_agent365_tracing`・`enable_otel_logging` /
-`runtime/intent` の `ActionPlanner.plan()` 内のパラメータ予測）の一覧には追加しない。
+`runtime/intent` の `ActionPlanner.plan()` 内のパラメータ予測 / `runtime/finetune` の `wait_job`）の一覧には追加しない。
 この一覧は `./CLAUDE.md`「設計の核」の build-don't-run 項目と対で維持する。
 
 ### 防御的読み取りと制限
@@ -2711,10 +2711,11 @@ adapter は `Agent(name="intent-classifier", instructions=system or None, model=
 `DefaultIntentClassifier` / `LLMCandidateGenerator` / `intent_classifier_from_model` /
 `intent_classifier_from_generator` / `confidence_mapper_from_thresholds` / `prediction_from_scored_labels` /
 `MLCandidateGenerator` / `IntentTrainer` / `TrainedIntentEstimator` / `make_trained_estimator` /
-`fit_ml_estimator` / `ml_inference_from_estimator` / `intent_classifier_from_ml_inference` /
+`fit_ml_estimator` / `TunedIntentEstimator` / `tune_ml_estimator` / `ml_inference_from_estimator` /
+`intent_classifier_from_ml_inference` /
 `ActionSpec` / `ActionCatalog` / `ActionPlanner` / `ParameterSpec` / `param` / `PARAM_UNSET` /
 `Slot` / `SlotState` / `Origin` / `SlotSuggestion` / `ActionPlan` / `PlanResult` / `ParamUsage` /
-`CandidateSource` / `LLMFiller` / `ExecutableIntent` / `ExecutableSuggestion`（計 41 件）。
+`CandidateSource` / `LLMFiller` / `ExecutableIntent` / `ExecutableSuggestion`（計 43 件）。
 
 アクション実行後の次ターン開始エージェント解決（`action_next_turn_agent`）は本窓口ではなく
 コア `__all__` に載る（`agents` 非依存の宣言層の関心事であり intent 固有型を扱わないため。
@@ -2729,8 +2730,9 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
 節が SoT で本節では再掲しない。
 
 ファイル構成は推論側 `_ml.py` と学習側 `_ml_training.py` の 2 分割。学習側に build-don't-run の
-逸脱 1 例目（`fit_ml_estimator` が `estimator.fit()` を駆動する）を物理隔離する。検討経緯は
-`docs/adr/0004-intent-ml-fit-deviation.md` を参照する。
+逸脱 1 例目（`fit_ml_estimator` / `tune_ml_estimator` が private ヘルパ `_fit_once` 1 箇所で利用者の
+学習器を 1 回 fit する）を物理隔離する。検討経緯は `docs/adr/0004-intent-ml-fit-deviation.md` および
+`docs/adr/0039-intent-ml-tuning-fit-deviation.md` を参照する。
 
 - **推論側（`_ml.py`）**:
   - `confidence_mapper_from_thresholds(*, certain, high, medium, low, speculative, on_out_of_range="error")`:
@@ -2748,7 +2750,8 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
 - **学習側（`_ml_training.py`）**:
   - `TrainedIntentEstimator`（frozen dataclass）: `inference`（推論 callable）・`estimator`（学習済み
     estimator を利用者が再利用・保存できるよう保持。既定 `None`）・`decoder`（ラベル逆写像。既定
-    `None` = 恒等）を持つ学習成果物。`IntentTrainer` は
+    `None` = 恒等）・`policy`（意図ポリシー。既定 `None`。`intent_classifier_from_ml_inference` の
+    policy 省略時に自動解決される）を持つ学習成果物。`IntentTrainer` は
     `Callable[..., TrainedIntentEstimator]` の型エイリアスで、lib は trainer を呼び出さず戻り値型のみを
     契約とする。`make_trained_estimator` は利用者自作 trainer の成果物を束ねる builder。
   - `ml_inference_from_estimator(estimator, *, transform=None, decoder=None)`: 学習済み
@@ -2759,7 +2762,32 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
     `ml_inference_from_estimator` を内部再利用して `TrainedIntentEstimator` を返す。
     `label_encoding: Mapping[str, Any] | None` はラベル文字列→内部表現の写像（`None` は素通し）で、
     逆写像は本写像から lib が構築し推論 callable に組み込む。
-- **結線（`factories.py`）**: `intent_classifier_from_ml_inference(inference, *, policy, mapper=None,
+  - `TunedIntentEstimator`（frozen dataclass・`TrainedIntentEstimator` のサブクラス）: 親の 4 フィールドに
+    加えチューニング副産物 `best_params`（必須）・`best_score`（既定 `None`）・`cv_results`（既定 `None`）を
+    保持する。追加 3 フィールドはいずれも keyword-only かつ同一性比較の対象外であり、同一性・ハッシュは
+    親と同じフィールド集合で決まる（`best_params` は unhashable な `dict`、`cv_results` は `ndarray` を
+    含みうるため、対象に含めると親で成立する `hash()` / `==` が子で例外になる。`repr` には副産物が残る）。
+    `isinstance` 判定を通るため `intent_classifier_from_ml_inference` へそのまま渡せる。副産物の値は
+    探索器が返したものを解釈も変換もせず保持する。`best_score` / `cv_results` が何の指標かは探索器の
+    評価指標設定が決め（複数指標を指定すると `cv_results` のキー名も指標名を含む形へ変わる）、
+    そのため `cv_results` は値型を固定しない `Mapping[str, Any]` として持つ。
+  - `tune_ml_estimator(search, *, x_train, y_train, policy, transform=None, label_encoding=None)`:
+    sklearn 互換の CV 探索器（`fit` 属性を要求。欠如は `AttributeError`）の `search.fit()` を 1 回駆動し、
+    fit 後の `best_estimator_` から `ml_inference_from_estimator` で推論 callable を組んで
+    `TunedIntentEstimator` を返す。推論 callable も成果物の `estimator` も探索器そのものではなく
+    `best_estimator_` に束縛されるため、探索器が `predict_proba` を委譲するかどうかに依存しない。
+    探索器そのものは成果物に保持しない（利用者が引数として参照を持っているため）。lib は探索
+    アルゴリズムを識別する分岐を持たず、`GridSearchCV` / `RandomizedSearchCV` /
+    `HalvingGridSearchCV` / 自作探索器のいずれも同じ入口で扱える。副産物の抽出は
+    `best_estimator_`（欠落または `None` は `AttributeError`。再学習を無効にした探索器は本経路では
+    扱えない）→ `best_params_`（同じく必須）→ `best_score_` / `cv_results_`（`getattr(..., None)` で
+    欠落を許容し `None` 既定）の順で、必須属性の欠落をすべて落としてから推論 callable を組む。
+  - `fit_ml_estimator` / `tune_ml_estimator` の `label_encoding` は `y_train` に現れるラベルを被覆する
+    必要があり、被覆しない場合は fit の駆動前に `ValueError` で落ちる。メッセージにはラベル値そのものを
+    載せず、被覆されていない相異なるラベルの件数のみを含む（利用者の実データが例外文字列やログへ
+    流入しないため）。非単射（値の重複）も同じく fit 前に `ValueError` となり、両関数のメッセージは
+    共有 private ヘルパにより完全に同一である。
+- **結線（`factories.py`）**: `intent_classifier_from_ml_inference(inference, *, policy=None, mapper=None,
   thresholds=None, history_limit=20)` は `MLCandidateGenerator` を組み立てて既存
   `intent_classifier_from_generator` に結線し `DefaultIntentClassifier` を返す（LLM 版
   `intent_classifier_from_model` と対称の 1 回呼び出しファクトリ）。`mapper` と `thresholds`
@@ -2767,8 +2795,9 @@ ML 推論 → `IntentPrediction`」を推論から学習まで一貫した型・
   排他で、両方指定・どちらも未指定は `ValueError`。`inference` に `TrainedIntentEstimator` を直渡しした
   場合は内部で `.inference` を取り出す。
 
-依存はライブラリ本体に一切追加しない（sklearn は examples 実行時のみ `[dependency-groups]` の `examples`
-グループで導入する）。
+依存はライブラリ本体にも extra にも一切追加しない（sklearn は `[dependency-groups]` の `examples`
+グループ（例の実行）と `dev` グループ（end-to-end テストの実行）でのみ導入する。PEP 735 の依存
+グループは配布物メタデータに載らず、利用者のインストール面・依存グラフを変えない）。
 
 ### 実行可能意図の宣言と決定的スロット確定
 
@@ -3583,7 +3612,7 @@ intent 層（`runtime/intent`）も同じ 2 層で検証する。L1 は型（fro
 耐性・prompt callable 契約（呼び出しと `user_content` / `history_items` / `context` の forward）を
 検証し、adapter（`_adapters/intent.py`）は 3 ケース（単一発話 / 履歴付き / RunContext 付き）+
 空入力（utterance と history の両方が空）の fail-fast を `FakeModel` で検証する。加えて公開窓口の
-PEP 562 遅延再エクスポートと `__all__` 41 件の pin、履歴のみモード（`utterance=""` + history）の
+PEP 562 遅延再エクスポートと `__all__` 43 件の pin、履歴のみモード（`utterance=""` + history）の
 end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
 
 実行可能意図の宣言と決定的スロット確定も同じ 2 層で検証する。L1 は宣言型の frozen と名前検証・
@@ -3607,7 +3636,11 @@ end-to-end 動作と空入力時の `ValueError` 伝播を検証する。
 ML ベース分類器支援は同じ 2 層で検証する。L2 の `test_ml_l2.py` / `test_ml_training_l2.py` は
 `predict_proba` / `classes_` / `fit` を持つ duck-typed fake estimator（sklearn 非依存）で
 mapper・dedup・allowlist・sort・truncate・同期/非同期ブリッジ・fit 駆動・ラベルエンコード/復号を
-検証する。sklearn 自体はテストスイートで一切使用せず、examples 実行時のみの依存に留める。
+検証する。チューニング支援（`tune_ml_estimator`）は、duck-typed fake 探索器による契約検証（副産物の
+透過・エンコード経路・必須属性の fail-fast・任意属性の `None` 既定）に加えて、実 `scikit-learn` の
+`GridSearchCV` で「探索 -> `best_estimator_` からの推論器組立 -> `DefaultIntentClassifier` での分類」まで
+通す end-to-end 検証を 1 本持つ。`scikit-learn` は開発・CI 環境の依存（`[dependency-groups]` の `dev`
+グループ）としてのみ導入し、ライブラリ本体の依存・配布物の extra には含めない。
 
 エージェント名定数簿（`agent_names`）は L1 で検証する。docstring 付きクラスと基底クラス自身の生成が
 通ること、未宣言名アクセスの一覧つき `AttributeError` と `_` 始まりの素通し、到達不能名 4 分岐・非 str /
