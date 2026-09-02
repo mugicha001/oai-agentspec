@@ -5,6 +5,12 @@
 `raise_on_invalid=True` の挙動、変換側 `skip_missing=True` によるケース除外 + `skipped` 件数の
 報告も示す。
 
+**`validate_dataset` だけでは投入可否を判定できない**。本関数が見るのはメッセージ**単位**の
+合法性で、メッセージ**間**の順序制約（ツール往復の並び）は `screen_tool_roundtrips` の責務で
+ある。両方を通さないと、1 件ずつは合法なのに並びが不正な学習データが素通りする。両ゲートを
+まとめて適用し合格・不合格へ仕分けるなら `partition_dataset` を使う
+（`11_screen_and_partition.py` を参照）。
+
 実行:
     uv run python examples/finetune/04_validate_byo_jsonl.py
 
