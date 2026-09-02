@@ -368,6 +368,32 @@ def test_jsonl_round_trip_produces_preference_records(tmp_path: Path) -> None:
     assert result.skipped == 0
 
 
+def test_jsonl_round_trip_survives_unicode_line_separators(tmp_path: Path) -> None:
+    """U+2028 / U+2029 / U+0085 を含む値でも JSONL 往復が壊れない（行分割は改行のみ）。
+
+    `json.dumps(ensure_ascii=False)` はこれらを素通しするため 1 行として書けるが、読み取りを
+    `str.splitlines()` で行うと Unicode 行境界でも分割され、1 件が 2 断片になって
+    `VALIDATION_FAILED` になる（書けたのに読めない非対称。CSV 経路は往復できる）。
+    web や文書からのコピーで混入しやすい文字である。
+    """
+    marks = "\u2028\u2029\u0085"
+    case = {
+        "input": [{"role": "user", "content": f"質問{marks}続き"}],
+        "preferred_output": f"よい{marks}応答",
+        "non_preferred_output": "わるい応答",
+        "response": f"実応答{marks}続き",
+    }
+    target = tmp_path / "draft.jsonl"
+    save_dpo_draft([case], target)
+
+    result = finalize_dpo_draft(target)
+
+    assert result.skipped == 0
+    assert result.records == _expected_records(
+        ([{"role": "user", "content": f"質問{marks}続き"}], f"よい{marks}応答", "わるい応答")
+    )
+
+
 def test_finalize_reads_csv_by_column_name_regardless_of_order(tmp_path: Path) -> None:
     """列を並べ替えて再保存した CSV でも列名ベースで正しく読み取る（列順非依存）。"""
     target = tmp_path / "draft.csv"
@@ -401,6 +427,27 @@ def test_finalize_reads_csv_without_bom(tmp_path: Path) -> None:
     result = finalize_dpo_draft(target)
 
     assert result.records == _expected_records((_CONTEXT_1, "よい応答", "わるい応答"))
+
+
+def test_finalize_rejects_cp932_saved_csv_as_validation_failed(tmp_path: Path) -> None:
+    """cp932 等で保存し直された CSV は生の `UnicodeDecodeError` を漏らさず案内つきで失敗する。
+
+    `test_finalize_reads_csv_without_bom`（受理範囲）と対の pin で、デコード失敗を
+    `VALIDATION_FAILED` へ変換する経路を落とす変異が RED になる（lib は文字化けの silent な
+    取り込みを避けるため自動判定しない契約）。
+    """
+    target = tmp_path / "draft.csv"
+    save_dpo_draft(_DRAFT_CASES[:1], target)
+    target.write_bytes(target.read_text(encoding="utf-8-sig").encode("cp932"))
+
+    with pytest.raises(FineTuneError) as exc_info:
+        finalize_dpo_draft(target)
+
+    assert exc_info.value.kind == FineTuneFailureKind.VALIDATION_FAILED
+    assert "utf-8-sig" in exc_info.value.message
+    assert "cp932" in exc_info.value.message
+    assert "保存し直" in exc_info.value.message
+    assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)
 
 
 def test_finalize_ignores_reference_columns(tmp_path: Path) -> None:
@@ -872,6 +919,28 @@ def test_blank_input_json_with_filled_columns_reports_empty_column(tmp_path: Pat
     assert "input_json" in exc_info.value.message
     assert "空" in exc_info.value.message
     assert "JSON として不正" not in exc_info.value.message
+
+
+def test_separator_only_row_is_skipped_without_failing_the_whole_import(tmp_path: Path) -> None:
+    """必須 3 列がすべて空の行（区切り文字だけの行）は取り込み全体を失敗させず skip する。
+
+    表計算ソフトが末尾へ出力する空行を想定した pin。`input_json` のパースより前に判定する
+    経路を落とす変異が RED になる（退行時は `input_json` 列が空です で全体が失敗する）。
+    過大側（記入欄に値がある行まで skip する変異）は
+    `test_blank_input_json_with_filled_columns_reports_empty_column` と対で測る。
+    """
+    target = tmp_path / "draft.csv"
+    save_dpo_draft(_DRAFT_CASES[:1], target)
+    _fill_csv(target, [("よい応答", "わるい応答")])
+    baseline = finalize_dpo_draft(target)
+
+    with target.open("a", encoding="utf-8-sig", newline="") as fp:
+        fp.write("," * (len(_CSV_COLUMNS) - 1) + "\r\n")
+    result = finalize_dpo_draft(target)
+
+    assert result.records == baseline.records
+    assert result.records == _expected_records((_CONTEXT_1, "よい応答", "わるい応答"))
+    assert result.skipped == baseline.skipped + 1
 
 
 def test_save_jsonl_rejects_unserializable_case_without_writing_file(tmp_path: Path) -> None:
