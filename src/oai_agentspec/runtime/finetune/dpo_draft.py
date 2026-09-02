@@ -398,6 +398,11 @@ def _cases_from_csv(path: Path) -> list[dict[str, Any]]:
 def _cases_from_jsonl(path: Path) -> list[dict[str, Any]]:
     """記入済み JSONL を読み、ケース列へ復元する。
 
+    行の分割はファイルオブジェクトの反復に委ねる（`dataset.py` の `_iter_source` と同一方針）。
+    `str.splitlines()` は U+2028 / U+2029 / U+0085 のような Unicode 行境界でも分割するため、
+    `json.dumps(..., ensure_ascii=False)` がそれらを素通しして書いた 1 行を 2 断片として
+    読み、書けたのに読めない非対称を生む（CSV 経路は往復できるため形式間でも非対称になる）。
+
     Args:
         path: 記入済み JSONL のパス。
 
@@ -408,7 +413,8 @@ def _cases_from_jsonl(path: Path) -> list[dict[str, Any]]:
         FineTuneError: いずれかの行が JSON として不正な場合（`VALIDATION_FAILED`）。
         OSError: ファイルを読めない場合（呼び出し側へ伝播）。
     """
-    lines = [line for line in path.read_text(encoding=_CSV_ENCODING).splitlines() if line.strip()]
+    with path.open(encoding=_CSV_ENCODING) as fp:
+        lines = [line for line in fp if line.strip()]
     cases: list[dict[str, Any]] = []
     for index, line in enumerate(lines, start=1):
         try:
