@@ -53,7 +53,7 @@ lightning = [
     # agentlightning の private 属性 (`_history_best_score` 等) と APO instance method
     # (`compute_textual_gradient` / `textual_gradient_and_apply_edit`) に依存しているため、
     # patch リリース (0.3.x) を含めて固定する。次の 0.3.x が出たら回帰確認の上で pin を上げる。
-    "agentlightning[apo]>=0.3,<0.3.1",
+    "agentlightning[apo]>=0.3,<1.0.2",
 ]
 finetune = [
     # openai-agents の推移依存として既に入っているが、runtime/finetune/ 配下（段階的に
