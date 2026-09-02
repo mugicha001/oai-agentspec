@@ -40,6 +40,8 @@ _EXPECTED_ALL = {
     "make_trained_estimator",
     "ml_inference_from_estimator",
     "fit_ml_estimator",
+    "TunedIntentEstimator",
+    "tune_ml_estimator",
     "intent_classifier_from_model",
     "intent_classifier_from_generator",
     "intent_classifier_from_ml_inference",
@@ -103,11 +105,11 @@ def _assert_lazy_submodule_resolution(symbol: str, submodule: str) -> None:
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 41 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 43 件で設計仕様通りのメンバ集合と一致する。"""
     import oai_agentspec.runtime.intent as intent_mod
 
     assert set(intent_mod.__all__) == _EXPECTED_ALL
-    assert len(intent_mod.__all__) == 41
+    assert len(intent_mod.__all__) == 43
 
 
 def test_all_does_not_include_confidence_level_description() -> None:
