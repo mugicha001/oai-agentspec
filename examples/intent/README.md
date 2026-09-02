@@ -24,10 +24,12 @@ uv run python examples/intent/01_basic_classification.py
 ```
 
 各例は分類実行時に LLM へ流れる合成プロンプトを `[SYSTEM]` / `[USER]` として stdout に表示する。
-例外は 07・08・09・10・11・12 で、LLM を使わないため環境変数なしでオフライン実行できる。
+例外は 07・08・09・10・11・12・14 で、LLM を使わないため環境変数なしでオフライン実行できる。
 
 08〜11 は ML 分類器支援（LLM 不使用）の例で、sklearn は `[dependency-groups]` の `examples`
-グループでのみ導入する（`[intent]` extra には含まれない）。API キーは不要:
+グループ（例の実行用）と `dev` グループ（テストスイートの実 sklearn 検証用）で導入する。
+ライブラリ本体の依存・配布物の extra には含まれない（`[intent]` extra にも含まれない）。
+API キーは不要:
 
 ```bash
 uv run --group examples python examples/intent/08_ml_sklearn_pipeline.py
@@ -50,6 +52,7 @@ uv run --group examples python examples/intent/08_ml_sklearn_pipeline.py
 | 11 | `11_ml_persist_reload.py` | `fit_ml_estimator` で学習した estimator を pickle で永続化し、別プロセス想定で復元して `ml_inference_from_estimator` に再接続する例。pickle のセキュリティ注意と保存対象（`.estimator` のみ）を明示。`--group examples` 実行・API キー不要 |
 | 12 | `12_executable_actions.py` | 実行可能アクションの宣言から押下までを LLM なしで通す例。`ActionCatalog` / `ActionSpec` / `param` で宣言し、`planner = catalog.bind(...)` で結線済み `ActionPlanner` を取得、`planner.validate(...)` で起動時検証、`await planner.plan(query, predict=False)` で決定的なスロット確定、`plan.apply(answers)` -> `plan.input_json` まで。`llm_filler` を渡さないため穴埋め経路が存在せず、環境変数なしでオフライン実行できる |
 | 13 | `13_action_param_prediction.py` | 不足パラメータの予測（`LLMFiller`）と実行後の会話継続の例。`await planner.plan(query)` が不足のある候補に対して `Runner.run` を 1 回だけ駆動し、`confirm=True` のスロットが `NEEDS_CONFIRMATION` として提示される。押下後は `Runner.run(registry.get(plan.action_agent), input=plan.input_json)` で実行し、`action_next_turn_agent` で窓口エージェントへ戻す。`detail=True` で `PlanResult.usage` を観測する。予測段へ会話を届ける経路は `IntentContext.history_items` だけであり（`IntentQuery.utterance` は system 指示部へ連結しない）、`IntentQuery(history=...)` を渡さないと予測エージェントは発話の内容を知れない |
+| 14 | `14_ml_tuning_gridsearch.py` | 08 のゼロコード fit との違い: 単一 estimator ではなく `GridSearchCV`（`Pipeline` を `param_grid` 付きで包む CV 探索器）を `tune_ml_estimator` へ渡し、探索・交差検証・`best_estimator_` の決定まで 1 呼び出しで完結させる。返る `TunedIntentEstimator` からチューニング副産物（`best_params` / `best_score` / `cv_results`）を読み、推論器は探索器ではなく `best_estimator_` に束縛されることを示す。`TrainedIntentEstimator` のサブクラスのため `intent_classifier_from_ml_inference`（FR-5）へそのまま渡せる（policy 自動解決）。`--group examples` 実行・API キー不要 |
 
 ## ルーティングの使い分け
 
