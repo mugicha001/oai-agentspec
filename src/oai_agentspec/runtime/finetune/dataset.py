@@ -2,7 +2,9 @@
 
 `to_sft_dataset` / `to_dpo_dataset` は EvalCase / OptimizeCase / `DpoCase` / plain dict の列を
 OpenAI 公式 SFT / DPO（preference）形式のレコード列へ変換し、`validate_dataset` は持ち込み
-JSONL（またはレコード列）を同形式に照らして検証する。`agents` / `openai` を import せず、
+JSONL（またはレコード列）を同形式に照らして検証する。`screen_tool_roundtrips` は submit 前の形式
+ゲートとして、メッセージ間の順序制約（ツール往復の並び）だけを検査する。
+`agents` / `openai` を import せず、
 ネットワークにも触れない（ローカルファイルの読み書きのみ）。
 
 非改変透過の実装形: 入力 messages リストの各要素 dict は **copy せず参照のまま** 出力レコードへ
@@ -27,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 
 from .types import (
     DatasetBuildResult,
+    DatasetPartition,
+    DatasetRejection,
     DatasetValidationReport,
     DatasetViolation,
     FineTuneError,
@@ -492,8 +496,10 @@ def _validate_dpo_record(record: Any) -> list[str]:
     return reasons
 
 
-def _iter_source(source: str | Path | Iterable[Any]) -> Iterator[tuple[int, Any, str | None]]:
-    """検証対象を `(line, record, parse_error)` のジェネレータへ正規化する。
+def _iter_source(
+    source: str | Path | Iterable[Any],
+) -> Iterator[tuple[int, Any, str | None, str | None]]:
+    """検証対象を `(line, record, parse_error, raw)` のジェネレータへ正規化する。
 
     ファイル source は全量を読み込まず行単位で逐次 yield する（BOM は `utf-8-sig` で
     除去する・空行はスキップし行番号は原文の 1 始まりを保つ）。データセット全量を
@@ -504,7 +510,9 @@ def _iter_source(source: str | Path | Iterable[Any]) -> Iterator[tuple[int, Any,
         source: JSONL ファイルパス（str / Path）またはレコード（dict）の列。
 
     Yields:
-        `(line, record, parse_error)`。`parse_error` が非 None のとき `record` は None。
+        `(line, record, parse_error, raw)`。`parse_error` が非 None のとき `record` は None で、
+        `raw` が当該行の原文（改行を除く）を持つ。解析できた行とレコード列の要素では `raw` は
+        None（`record` があれば原文は不要であり、両方を持つとメモリ使用量が二重になる）。
 
     Raises:
         OSError: ファイルを読めない場合（fail-closed・呼び出し側へ伝播）。
@@ -512,7 +520,7 @@ def _iter_source(source: str | Path | Iterable[Any]) -> Iterator[tuple[int, Any,
     """
     if not isinstance(source, (str, Path)):
         for position, record in enumerate(source, start=1):
-            yield (position, record, None)
+            yield (position, record, None, None)
         return
 
     with Path(source).open(encoding="utf-8-sig") as fp:
@@ -522,9 +530,14 @@ def _iter_source(source: str | Path | Iterable[Any]) -> Iterator[tuple[int, Any,
             try:
                 parsed = json.loads(line)
             except (json.JSONDecodeError, RecursionError):
-                yield (line_number, None, "JSON として解析できない（入れ子が深すぎる等）")
+                yield (
+                    line_number,
+                    None,
+                    "JSON として解析できない（入れ子が深すぎる等）",
+                    line.rstrip("\n"),
+                )
                 continue
-            yield (line_number, parsed, None)
+            yield (line_number, parsed, None, None)
 
 
 def validate_dataset(
@@ -539,6 +552,9 @@ def validate_dataset(
     規則を適用し、未知キー・レコードレベルの未知フィールドは違反にしない。ツール定義や
     content parts の内部構造は解釈しない。`weight` の role / 値制約は `method="sft"` のみ
     適用する。違反ゼロのときのみ `ok=True`（fail-closed）。
+
+    本関数だけでは投入可否を判定できない（メッセージ間の順序制約は `screen_tool_roundtrips` の
+    責務）。両方をまとめて適用し合格・不合格へ仕分けるなら `partition_dataset` を使う。
 
     Args:
         source: JSONL ファイルパス（str / Path）またはレコード（dict）の列。単一の dict を
@@ -569,7 +585,7 @@ def validate_dataset(
     validate_record = _validate_dpo_record if method == "dpo" else _validate_sft_record
     violations: list[DatasetViolation] = []
     checked = 0
-    for line, record, parse_error in _iter_source(source):
+    for line, record, parse_error, _raw in _iter_source(source):
         checked += 1
         if parse_error is not None:
             violations.append(DatasetViolation(line=line, reason=parse_error))
@@ -588,3 +604,281 @@ def validate_dataset(
             report=report,
         )
     return report
+
+
+def _tool_group_reasons(requested: set[str], answered: set[str], label: str) -> list[str]:
+    """tool_calls 群と直後の role `"tool"` 群の集合比較から違反理由の列を返す。
+
+    Args:
+        requested: assistant の `tool_calls` が持つ id の集合。
+        answered: 直後に連続する role `"tool"` メッセージの `tool_call_id` の集合。
+        label: 違反理由の先頭へ付す位置表記（群を開いた assistant の位置）。
+
+    Returns:
+        違反理由の列（過不足が無ければ空）。
+    """
+    if requested == answered:
+        return []
+    details: list[str] = []
+    missing = sorted(requested - answered)
+    extra = sorted(answered - requested)
+    if missing:
+        details.append(f"応答が無い call id: {', '.join(missing)}")
+    if extra:
+        details.append(f"呼び出しに無い call id: {', '.join(extra)}")
+    return [
+        f"{label}: tool_calls 付き assistant の直後に続く role 'tool' 群が tool_calls の"
+        f" id 集合と一致しない（{' / '.join(details)}）"
+    ]
+
+
+def _screen_messages(messages: Any, label: str) -> list[str]:
+    """messages のツール往復の順序制約を検査して違反理由の列を返す。
+
+    メッセージ単位の合法性（role / content / 必須キー等）は `validate_dataset` の責務のため
+    判定しない。`messages` が非リストの場合や非 dict 要素は違反にせず素通しする（構造違反の
+    二重報告を避ける）。非 dict 要素の位置で群の連続性は途切れる扱いにする。
+
+    判定は id の集合比較で行うため、群内に同じ `tool_call_id` が重複しても判定に影響しない
+    （重複そのものの是非はメッセージ単位の問題であり本関数の責務外）。集合へ入れるのは str の
+    id のみで、`tool_calls` の要素が文字列 `id` を欠く場合は集合比較の対象にできない（後続
+    tool が無ければ空集合同士で一致してしまう）ため、その時点で件数付きの違反として報告する。
+    `tool_calls` 自体がリストでない場合も対応を検証できないため違反として報告する。
+    role `"tool"` 側の非 str・キー欠落の `tool_call_id` は集合へ入らず、群の不一致として現れる。
+
+    末尾に開いたままの群は違反にしない。対象 messages の末尾にある `tool_calls` 付き assistant は
+    「ツール呼び出しそのものを学習させる」SFT レコードの学習ターゲット本体であり、応答が続かない
+    のが正常だからである（この区別を欠くと `to_sft_dataset` の正当な生成物を不合格にする）。
+
+    違反理由には `messages[N]:` 形式で messages 内の位置を前置する（`validate_dataset` と
+    同書式）。群の不一致は、群を開いた `tool_calls` 付き assistant の位置に紐づける。
+
+    Args:
+        messages: 検査対象の messages（非リストなら判定しない）。
+        label: 位置表記の見出し（`"messages"` / `"input.messages"`）。
+
+    Returns:
+        違反理由の列（違反が無ければ空）。
+    """
+    if not isinstance(messages, list):
+        return []
+    reasons: list[str] = []
+    pending: tuple[set[str], set[str], str] | None = None
+    for position, message in enumerate(messages):
+        at = f"{label}[{position}]"
+        if isinstance(message, dict) and message.get("role") == "tool":
+            if pending is None:
+                call_id = message.get("tool_call_id")
+                reasons.append(
+                    f"{at}: role 'tool' メッセージが直前の tool_calls 群に属さない"
+                    f"（tool_call_id: {call_id!r}）"
+                )
+                continue
+            tool_call_id = message.get("tool_call_id")
+            if isinstance(tool_call_id, str):
+                pending[1].add(tool_call_id)
+            continue
+        if pending is not None:
+            reasons.extend(_tool_group_reasons(*pending))
+            pending = None
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        if "tool_calls" not in message:
+            continue
+        tool_calls = message["tool_calls"]
+        if not isinstance(tool_calls, list):
+            # `validate_dataset` はキーの存在しか見ない（FR-3 は内部構造を解釈しない）ため、
+            # ここで素通しすると不正なレコードが両ゲートを通過する。
+            reasons.append(
+                f"{at}: tool_calls がリストでない: {type(tool_calls).__name__}"
+                "（ツール呼び出しの対応を検証できない）"
+            )
+            continue
+        identified = [
+            call
+            for call in tool_calls
+            if isinstance(call, dict) and isinstance(call.get("id"), str)
+        ]
+        requested = {call["id"] for call in identified}
+        # 重複 id は判定に影響しないため、集合の要素数ではなく要素の件数差で数える。
+        unidentified = len(tool_calls) - len(identified)
+        if unidentified > 0:
+            # id を欠く（または非 str の）呼び出しは要求集合へ入らないため、集合比較だけ
+            # では「応答が無い」ことすら判定できない（後続 tool が無ければ空集合同士で
+            # 一致して合格する）。往復の対応を検証できない時点で違反として報告する。
+            reasons.append(
+                f"{at}: tool_calls に文字列 'id' を持たない呼び出しがある"
+                f"（{unidentified} 件・対応する role 'tool' メッセージを特定できない）"
+            )
+        pending = (requested, set(), at)
+    # 末尾に開いたままの群は学習ターゲット本体（ツール呼び出しそのものを学習させる形）であり、
+    # 応答が続かないのが正常なため違反にしない。文脈途中の未応答だけが規則 (1) の対象である。
+    return reasons
+
+
+def _screen_record(record: Any, *, method: str) -> list[str]:
+    """レコード 1 件のツール往復を検査して違反理由の列を返す。
+
+    Args:
+        record: 検査対象のレコード（非 dict なら判定しない）。
+        method: 検査する形式（`"sft"` は `messages`、`"dpo"` は `input.messages` を見る）。
+
+    Returns:
+        違反理由の列。
+    """
+    if not isinstance(record, dict):
+        return []
+    if method == "dpo":
+        record_input = record.get("input")
+        if not isinstance(record_input, dict):
+            return []
+        return _screen_messages(record_input.get("messages"), "input.messages")
+    return _screen_messages(record.get("messages"), "messages")
+
+
+def screen_tool_roundtrips(
+    source: str | Path | Iterable[Any],
+    *,
+    method: str = "sft",
+    raise_on_invalid: bool = False,
+) -> DatasetValidationReport:
+    """データセットのツール往復の並びを検査する（submit 前の形式ゲート・ローカル読み取りのみ）。
+
+    判定対象は「メッセージ間の順序制約」のみで、メッセージ単位の合法性は
+    `validate_dataset` の責務として二重報告しない。規則は 2 つある。
+
+    - `tool_calls` を持つ assistant メッセージの直後に連続する role `"tool"` メッセージ群の
+      `tool_call_id` 集合が、当該 assistant の `tool_calls` の id 集合と一致すること
+      （過不足なし・群内の順序は問わない）。ただし**末尾**の `tool_calls` 付き assistant には
+      適用しない（ツール呼び出しそのものを学習させる SFT の学習ターゲット本体であり、応答が
+      続かないのが正常なため）
+    - いずれの群にも属さない role `"tool"` メッセージが存在しないこと
+
+    `messages` が取り出せない / 非リストなど構造が壊れたレコードは違反を報告せず素通しする
+    （構造違反は `validate_dataset` が報告する）。違反ゼロのときのみ `ok=True`（fail-closed）。
+
+    判定の準拠先は推論時 API の順序要求であり、FT のファイル検証が同じ並びを拒否するかは
+    未確定である（ADR 0036 の Context）。ただし応答のない `tool_calls` を含む文脈を学習させる
+    こと自体が学習データの誤りのため、本関数の価値はファイル検証の挙動に依存しない。
+
+    本関数だけでは投入可否を判定できない（メッセージ単位の合法性は `validate_dataset` の
+    責務）。両方をまとめて適用し合格・不合格へ仕分けるなら `partition_dataset` を使う。
+
+    Args:
+        source: JSONL ファイルパス（str / Path）またはレコード（dict）の列。単一の dict を
+            渡すことはできない（キー文字列の列として誤読しないよう明示エラーにする）。
+        method: 検査する形式（`"sft"` は `messages`、`"dpo"` は `input.messages` を対象に
+            する。DPO の `preferred_output` / `non_preferred_output` は対象外）。他の値は
+            エラーにする。
+        raise_on_invalid: True のとき不合格で `FineTuneError` を送出する（既定は返却のみ）。
+
+    Returns:
+        検査レポート。`DatasetViolation.line` は source がファイルパスなら 1 始まりの行番号、
+        dict 列なら 1 始まりの要素位置を表す。
+
+    Raises:
+        FineTuneError: `method` が `"sft"` / `"dpo"` 以外の場合、`source` が単一の dict の
+            場合、`raise_on_invalid=True` かつ不合格の場合（最後のみ `report` を載せる）。
+        OSError: ファイル source を読めない場合。
+        UnicodeDecodeError: ファイル source が UTF-8 として解釈できない場合。
+    """
+    if method not in ("sft", "dpo"):
+        raise FineTuneError(
+            FineTuneFailureKind.VALIDATION_FAILED,
+            f"method が不正: {method!r}（'sft' / 'dpo' のみ）",
+        )
+    if isinstance(source, dict):
+        raise FineTuneError(
+            FineTuneFailureKind.VALIDATION_FAILED,
+            "source が単一の dict である（レコードの列またはファイルパスを渡す）",
+        )
+    violations: list[DatasetViolation] = []
+    checked = 0
+    for line, record, parse_error, _raw in _iter_source(source):
+        checked += 1
+        if parse_error is not None:
+            violations.append(DatasetViolation(line=line, reason=parse_error))
+            continue
+        violations.extend(
+            DatasetViolation(line=line, reason=reason)
+            for reason in _screen_record(record, method=method)
+        )
+    report = DatasetValidationReport(
+        ok=not violations, checked=checked, violations=tuple(violations)
+    )
+    if raise_on_invalid and not report.ok:
+        raise FineTuneError(
+            FineTuneFailureKind.VALIDATION_FAILED,
+            f"ツール往復のスクリーニングに失敗しました（違反 {len(report.violations)} 件 / "
+            f"検査 {report.checked} 件）",
+            report=report,
+        )
+    return report
+
+
+def partition_dataset(
+    source: str | Path | Iterable[Any],
+    *,
+    method: str = "sft",
+) -> DatasetPartition:
+    """投入できるレコードとできないレコードへ仕分ける（submit 前の仕分けヘルパ）。
+
+    各レコードへ `validate_dataset`（メッセージ単位の合法性）と `screen_tool_roundtrips`
+    （メッセージ間の順序制約）の両方を適用し、どちらにも違反しないレコードだけを `passed` へ
+    入れる。判定規則は両関数へ委譲するため本関数は新しい規則を持たない。JSON として解析できない
+    行も不合格として扱う（合格側へ混ぜない）。
+
+    `passed` は `DatasetBuildResult` で返すため、`submit_job(train=...)` と `save(path)` へ
+    詰め替えなしで渡せる。不合格側は元レコードと理由を `DatasetRejection` にまとめて返すので、
+    レポートと元データを位置で突き合わせる必要がない。
+
+    仕分けの性質上、合格・不合格の双方をメモリへ保持する（`_iter_source` の逐次読みの利点は
+    本関数では活きない）。逐次処理が必要な規模では、レコードを保持せず違反だけを溜める
+    `validate_dataset` / `screen_tool_roundtrips` を直接使うこと。
+
+    Args:
+        source: JSONL ファイルパス（str / Path）またはレコード（dict）の列。単一の dict を
+            渡すことはできない（キー文字列の列として誤読しないよう明示エラーにする）。
+        method: 仕分ける形式（`"sft"` または `"dpo"`）。他の値はエラーにする。
+
+    Returns:
+        仕分け結果。`DatasetRejection.line` は source がファイルパスなら 1 始まりの行番号、
+        レコード列なら 1 始まりの要素位置を表す。
+
+    Raises:
+        FineTuneError: `method` が `"sft"` / `"dpo"` 以外の場合、`source` が単一の dict の
+            場合（`VALIDATION_FAILED`）。仕分け自体は例外を送出せず、不合格は返却値で表す。
+        OSError: ファイル source を読めない場合。
+        UnicodeDecodeError: ファイル source が UTF-8 として解釈できない場合。
+    """
+    if method not in ("sft", "dpo"):
+        raise FineTuneError(
+            FineTuneFailureKind.VALIDATION_FAILED,
+            f"method が不正: {method!r}（'sft' / 'dpo' のみ）",
+        )
+    if isinstance(source, dict):
+        raise FineTuneError(
+            FineTuneFailureKind.VALIDATION_FAILED,
+            "source が単一の dict である（レコードの列またはファイルパスを渡す）",
+        )
+    validate_record = _validate_dpo_record if method == "dpo" else _validate_sft_record
+    passed: list[dict[str, Any]] = []
+    rejected: list[DatasetRejection] = []
+    checked = 0
+    for line, record, parse_error, raw in _iter_source(source):
+        checked += 1
+        if parse_error is not None:
+            rejected.append(
+                DatasetRejection(line=line, record=None, reasons=(parse_error,), raw=raw)
+            )
+            continue
+        reasons = [*validate_record(record), *_screen_record(record, method=method)]
+        if reasons:
+            rejected.append(DatasetRejection(line=line, record=record, reasons=tuple(reasons)))
+            continue
+        passed.append(record)
+    return DatasetPartition(
+        passed=DatasetBuildResult(records=tuple(passed), skipped=len(rejected)),
+        rejected=tuple(rejected),
+        checked=checked,
+    )

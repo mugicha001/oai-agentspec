@@ -27,6 +27,8 @@ _WINDOW_SYMBOLS = {
     "to_sft_dataset",
     "to_dpo_dataset",
     "validate_dataset",
+    "screen_tool_roundtrips",
+    "partition_dataset",
     # ジョブ管理エントリ
     "submit_job",
     "get_job",
@@ -42,6 +44,8 @@ _WINDOW_SYMBOLS = {
     "DatasetBuildResult",
     "DatasetValidationReport",
     "DatasetViolation",
+    "DatasetPartition",
+    "DatasetRejection",
     # ジョブ参照 / 結果型
     "JobRef",
     "JobResult",
@@ -58,7 +62,7 @@ _WINDOW_SYMBOLS = {
 
 
 def test_window_all_member_set_is_pinned() -> None:
-    """窓口 `__all__` は 19 件のシンボル集合で固定する（FR-9）。
+    """窓口 `__all__` は 23 件のシンボル集合で固定する（FR-9）。
 
     `==` の集合比較により、意図しない公開追加（過大側）と公開喪失（過小側）の双方を
     検知する。

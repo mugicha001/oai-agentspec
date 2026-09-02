@@ -173,6 +173,31 @@ async def test_pair_builder_input_key_replaces_generated_context() -> None:
     }
 
 
+async def test_pair_builder_empty_input_key_replaces_context_and_fails_closed() -> None:
+    """`input` は「キーの有無」で差し替える（空リストも指定として尊重し fail-closed）。
+
+    `test_pair_builder_input_key_replaces_generated_context` と対の pin で、truthy 判定
+    （`built.get("input") or context`）へ倒す変異が RED になる。退行すると、利用者が
+    マスキング目的で明示的に置いた空文脈が silent に破棄され、マスキング前の生ログが
+    そのまま学習データへ載る。
+    """
+    session = FakeSession(_SAMPLE_ITEMS)
+
+    def builder(_material: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "input": [],
+            "preferred_output": "よい応答",
+            "non_preferred_output": "わるい応答",
+        }
+
+    with pytest.raises(FineTuneError) as exc_info:
+        await dpo_dataset_from_session(session, pair_builder=builder)
+
+    assert exc_info.value.kind == FineTuneFailureKind.VALIDATION_FAILED
+    assert "ケース 1" in exc_info.value.message
+    assert "input が空リストである" in exc_info.value.message
+
+
 async def test_pair_builder_returning_none_skips_case() -> None:
     """pair_builder が None を返したケースは生成せず skipped に計上する。"""
     session = FakeSession(_SAMPLE_ITEMS)
@@ -553,10 +578,10 @@ async def test_draft_mode_cases_keep_exactly_four_keys() -> None:
         assert set(record) == {"input", "preferred_output", "non_preferred_output", "response"}
 
 
-async def test_context_with_dangling_tool_call_is_skipped() -> None:
-    """DPO 側でも、対応する tool メッセージを欠く tool_calls を含む文脈のケースは skip される。
+async def test_context_with_dangling_tool_call_is_generated_not_skipped() -> None:
+    """DPO 側でも、ツール往復の並びを理由にケースを捨てない（形式判定は screening の責務）。
 
-    素材の切り出しは SFT と共通のため、SFT だけに判定を入れる変異が RED になる。
+    素材の切り出しは SFT と共通のため、DPO だけに判定を戻す変異も RED になる。
     """
     session = FakeSession(
         [
@@ -570,9 +595,9 @@ async def test_context_with_dangling_tool_call_is_skipped() -> None:
 
     result = await dpo_dataset_from_session(session)
 
-    assert result.skipped == 1
-    assert len(result.records) == 1
-    assert result.records[0]["response"] == "結果はこうです"
+    assert result.skipped == 0
+    assert len(result.records) == 2
+    assert result.records[-1]["response"] == "結果はこうです"
 
 
 async def test_closed_tool_roundtrip_context_is_not_skipped_in_dpo() -> None:

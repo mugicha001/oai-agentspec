@@ -47,6 +47,7 @@ from oai_agentspec.runtime.finetune import (
     FineTuneError,
     FineTuneFailureKind,
     dataset_from_session,
+    screen_tool_roundtrips,
     validate_dataset,
 )
 
@@ -1039,7 +1040,7 @@ async def test_history_with_only_tool_roundtrip_raises_validation_failed() -> No
 
 
 # ----------------------------------------------------------------------
-# ツール往復の途中で切れる文脈の skip（dangling tool_calls の抑止）
+# ツール往復の途中で切れる文脈（生成は捨てず screening が検出する責務分離）
 # ----------------------------------------------------------------------
 
 # function_call と function_call_output の間へ assistant テキストが挟まる履歴
@@ -1053,34 +1054,50 @@ _DANGLING_ITEMS: list[dict[str, Any]] = [
 ]
 
 
-async def test_context_with_dangling_tool_call_is_skipped() -> None:
-    """対応する tool メッセージを欠く tool_calls を含む文脈のケースは skip される。
+async def test_context_with_dangling_tool_call_is_generated_not_skipped() -> None:
+    """ツール往復の並びを理由にケースを捨てない（形式判定は screening の責務）。
 
-    推論時 API が拒否する並び（tool_calls に応答が無い）を silent に産む fail-open の pin。
-    判定を削除する変異が RED になる。
+    生成は履歴を忠実に変換する。往復の途中で切れる文脈も `skipped` に載せず生成し、
+    submit 前ゲートの `screen_tool_roundtrips` が検出する（責務分離の pin）。生成側へ並び判定を
+    戻す変異は `skipped == 0` が RED になる。
     """
     session = FakeSession(_DANGLING_ITEMS)
 
     result = await dataset_from_session(session)
 
-    assert result.skipped == 1
-    assert len(result.records) == 1
-    # 残るのは往復が閉じた文脈のケース（最後の assistant を expected_output とするもの）。
-    assert result.records[0]["messages"][-1] == {
+    assert result.skipped == 0
+    assert len(result.records) == 2
+    assert result.records[-1]["messages"][-1] == {
         "role": "assistant",
         "content": "結果はこうです",
     }
-    assert any(message.get("role") == "tool" for message in result.records[0]["messages"])
+    assert any(message.get("role") == "tool" for message in result.records[-1]["messages"])
 
 
-async def test_closed_tool_roundtrip_context_is_not_skipped() -> None:
-    """往復が閉じている履歴では skip が起きない（何でも skip する変異の過大側を検知）。"""
+async def test_generated_dangling_context_is_flagged_by_screening() -> None:
+    """生成された非隣接の往復は `screen_tool_roundtrips` が違反として検出する（後段ゲートの pin）。
+
+    生成側で捨てない代わりに screening が必ず捕らえることを、生成結果そのもので固定する。
+    """
+    session = FakeSession(_DANGLING_ITEMS)
+
+    result = await dataset_from_session(session)
+    report = screen_tool_roundtrips(result.records, method="sft")
+
+    assert report.ok is False
+    assert report.checked == 2
+    assert "c1" in " / ".join(violation.reason for violation in report.violations)
+
+
+async def test_closed_tool_roundtrip_passes_screening() -> None:
+    """往復が閉じている履歴の生成結果は screening を通る（過大側の誤検知を出さない）。"""
     session = FakeSession(_SAMPLE_ITEMS)
 
     result = await dataset_from_session(session)
 
     assert result.skipped == 0
     assert len(result.records) == 2
+    assert screen_tool_roundtrips(result.records, method="sft").ok is True
 
 
 # ----------------------------------------------------------------------

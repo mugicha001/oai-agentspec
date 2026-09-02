@@ -135,7 +135,9 @@ class DatasetBuildResult:
         skipped: 除外したケース件数。`to_sft_dataset` / `to_dpo_dataset` では
             `skip_missing=True` による除外、`dataset_from_session` では空 input ケース・
             空応答ケース（吸収後の content が空になる assistant ターン）・`case_filter` に
-            よる除外がここへ計上される。
+            よる除外、`partition_dataset` の合格側では仕分けで不合格になったレコード件数が
+            ここへ計上される。値は当該呼び出しにおける除外件数のみを表し、前段の
+            `skipped`（生成時の除外等）とは合算しない。
     """
 
     records: tuple[dict[str, Any], ...]
@@ -159,6 +161,56 @@ class DatasetBuildResult:
         """
         body = "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in self.records)
         Path(path).write_text(body, encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class DatasetRejection:
+    """投入前の仕分けで不合格になったレコード 1 件と、その理由。
+
+    レポートと元データを `line` で突き合わせる手間を無くすため、レコード本体と理由を 1 件に
+    まとめて持つ（直して再投入する動線を切らない）。
+
+    Attributes:
+        line: 元データ内の位置（1 始まり）。source がファイルパスの場合は行番号、レコード列の
+            場合は要素位置を表す。
+        record: 元レコード（複製せず参照をそのまま載せる）。JSON として解析できなかった行では
+            None になり、代わりに `raw` が原文を持つ。
+        reasons: 違反理由（検出順）。メッセージ単位の検証と順序制約の検査の双方を含む。
+        raw: JSON として解析できなかった行の原文（改行を除く）。解析できたレコードでは
+            None（`record` があれば原文は不要であり、両方を抱えるとメモリ使用量が二重になる）。
+    """
+
+    line: int
+    record: Any
+    reasons: tuple[str, ...]
+    raw: str | None = None
+
+
+@dataclass(frozen=True)
+class DatasetPartition:
+    """投入できるデータとできないデータの仕分け結果。
+
+    `passed` を `DatasetBuildResult` で返すため、`submit_job(train=...)` と `save(path)` の
+    既存の受け口へ詰め替えなしで渡せる。
+
+    Attributes:
+        passed: 全ゲートに違反しなかったレコード。`skipped` には不合格件数が載る。
+        rejected: 不合格レコード（元レコードと理由つき・元データの順）。
+        checked: 仕分けたレコード件数（`passed` と `rejected` の合計）。
+    """
+
+    passed: DatasetBuildResult
+    rejected: tuple[DatasetRejection, ...]
+    checked: int
+
+    @property
+    def ok(self) -> bool:
+        """不合格が 1 件も無いときのみ True（fail-closed）。
+
+        Returns:
+            `rejected` が空なら True。
+        """
+        return not self.rejected
 
 
 class JobStatus(StrEnum):

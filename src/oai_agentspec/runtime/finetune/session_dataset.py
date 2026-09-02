@@ -224,37 +224,6 @@ def _is_text_assistant(turn: dict[str, Any]) -> bool:
     return turn["role"] == "assistant" and "tool_calls" not in turn
 
 
-def _has_dangling_tool_call(context: list[dict[str, Any]]) -> bool:
-    """文脈プレフィックス内に、対応する tool メッセージを欠く tool_calls があるかを判定する。
-
-    累積ペアリングはツール往復の途中（function_call と function_call_output の間に assistant
-    テキストが挟まる履歴など）でも切り出しうるため、切り出した文脈だけを見ると `tool_calls`
-    に対応する role `"tool"` メッセージが含まれないことがある。この並びは推論時 API が拒否
-    するため、当該ケースは生成せず skip する（判定は文脈プレフィックス内で完結させ、併合
-    ロジックには手を入れない）。
-
-    Args:
-        context: `_normalize_turns` が生成したターン列のプレフィックス（切り出した文脈）。
-
-    Returns:
-        対応する tool メッセージが文脈内に無い `tool_calls` の id が 1 つでもあれば True。
-    """
-    requested: set[str] = set()
-    answered: set[str] = set()
-    for turn in context:
-        tool_calls = turn.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for call in tool_calls:
-                if isinstance(call, dict) and isinstance(call.get("id"), str):
-                    requested.add(call["id"])
-            continue
-        if turn.get("role") == "tool":
-            tool_call_id = turn.get("tool_call_id")
-            if isinstance(tool_call_id, str):
-                answered.add(tool_call_id)
-    return bool(requested - answered)
-
-
 def _validation_error(message: str) -> FineTuneError:
     """`VALIDATION_FAILED` の構造化エラーを組み立てる。
 
@@ -276,8 +245,8 @@ def _collect_case_materials(
     （変換済みツールメッセージを含む）を文脈とする（ADR 0034 Decision 4）。文脈が空になる
     ケース（正規化後の履歴先頭が assistant）と、吸収後の応答が空になるケース（text
     フィールドを持たない parts のみ = refusal 等）は生成せず `skipped` に計上する。文脈が
-    ツール往復の途中で切れるケース（対応する tool メッセージを欠く `tool_calls` を含む）も
-    同じ skip 経路へ合流させる。
+    ツール往復の途中で切れるケース（対応する tool メッセージを欠く `tool_calls` を含む）は
+    捨てず生成する（並びの検査は submit 前ゲートの `screen_tool_roundtrips` の責務）。
 
     Args:
         items: `Session.get_items()` が返した履歴 items。
@@ -314,13 +283,7 @@ def _collect_case_materials(
             # （空 expected_output のレコードは「空出力を教える」silent 汚染になる）。
             skipped += 1
             continue
-        context = turns[:position]
-        if _has_dangling_tool_call(context):
-            # ツール往復の途中で切れた文脈（対応する tool メッセージを欠く tool_calls を含む）
-            # は推論時 API が拒否する並びのため、空文脈 / 空応答と同じ skip 経路へ合流させる。
-            skipped += 1
-            continue
-        materials.append((context, turn["content"]))
+        materials.append((turns[:position], turn["content"]))
     return materials, skipped
 
 
@@ -343,7 +306,8 @@ async def dataset_from_session(
     計上する（空の expected_output を学習させるレコードを silent に混入させない）。文脈が
     ツール往復の途中で切れるケース（`tool_calls` に対応する role `"tool"` メッセージが文脈に
     含まれない = function_call と function_call_output の間に assistant テキストが挟まる履歴
-    等）も、推論時 API が拒否する並びのため生成せず `skipped` に計上する。
+    等）は捨てず生成する（生成は履歴を忠実に変換し、並びの検査は submit 前に
+    `screen_tool_roundtrips` で行う）。
 
     `case_filter` で除外されたケースも `skipped` に計上する。filter が全ケースを除外した
     場合はエラーにせず `DatasetBuildResult(records=(), skipped=全件)` を正常返却する
@@ -385,7 +349,7 @@ async def dataset_from_session(
 
     Returns:
         変換結果（`records` / `skipped`）。`skipped` は空 input ケース数 + 空応答ケース数 +
-        ツール往復の途中で切れた文脈のケース数 + filter 除外数。
+        filter 除外数。
 
     Raises:
         FineTuneError: `session` が None の場合（`CONFIG_MISSING`）。履歴が空・抽出可能な
@@ -440,8 +404,9 @@ async def dpo_dataset_from_session(
     """会話履歴（SDK `Session`）から DPO（preference）データセットを生成する（読み取り専用）。
 
     ケース素材の切り出しは `dataset_from_session` と同一（`session.get_items()` を 1 回だけ
-    呼び、累積ペアリング・ツール往復の変換保持・空文脈 / 空応答 / ツール往復の途中で切れた
-    文脈のケースの skip を行う）で、
+    呼び、累積ペアリング・ツール往復の変換保持・空文脈 / 空応答のケースの skip を行う。
+    ツール往復の途中で切れた文脈のケースは捨てず生成し、並びの検査は submit 前に
+    `screen_tool_roundtrips` で行う）で、
     素材は `{"input": <累積文脈>, "response": <ログ上の実応答>}` の 2 キーの plain dict で
     ある。どちらの応答を preferred / non-preferred とするかは品質判定であり lib は内蔵
     しないため、次の 2 モードのいずれかで利用者が決める（ADR 0034 Decision 5）。
@@ -483,8 +448,8 @@ async def dpo_dataset_from_session(
 
     Returns:
         変換結果（`records` / `skipped`）。雛形モードの `records` は記入用ケース列であり
-        最終レコードではない。`skipped` は空文脈ケース + 空応答ケース + ツール往復の途中で
-        切れた文脈のケース + `pair_builder` が `None` を返したケースの合計。
+        最終レコードではない。`skipped` は空文脈ケース + 空応答ケース +
+        `pair_builder` が `None` を返したケースの合計。
 
     Raises:
         FineTuneError: `session` が None の場合、および雛形モード（`pair_builder` 省略）で
