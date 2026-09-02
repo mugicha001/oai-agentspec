@@ -3078,11 +3078,11 @@ wheels = [
 
 [[package]]
 name = "restrictedpython"
-version = "8.2"
+version = "8.3a1.dev0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/97/04/7314639eab9edd57b5c8f6e158a558f5a5a65453c37a51fb8f9ecc1d112e/restrictedpython-8.2.tar.gz", hash = "sha256:b835c2ff87d71b76f6d8b129096cc5a1e893bf01839ab802ba47a4129f1bdfe4", size = 449323, upload-time = "2026-05-29T06:27:57.285Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/31/525f819e0aec67f4319b2fa1ec16a479bfd0b34d34ec753d6a49b1fc0f62/restrictedpython-8.3a1.dev0.tar.gz", hash = "sha256:4180b848a35ff6e1b9e4e614f99da60076d7de37ddfc0711d306945a0a544369", size = 449430, upload-time = "2026-05-29T06:35:34.715Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/35/59/b2778bfafcc37fdfd87c02702bbfc5753c58c28c7eb82999b7b49ec6e0e7/restrictedpython-8.2-py3-none-any.whl", hash = "sha256:6ff69e2fe06674bfe88943f17f2ce8353a9bc743ee37ea7bec38ff8b4851afd1", size = 27176, upload-time = "2026-05-29T06:27:55.651Z" },
+    { url = "https://files.pythonhosted.org/packages/09/a5/fdb895fb8b14e4e2bbbc80b7a3ca813d33ff06d02358add2ed67498514ce/restrictedpython-8.3a1.dev0-py3-none-any.whl", hash = "sha256:060029a7ab4b1daf2c7a0a41e6df0a91a8ba1b932282d360f3e5af6a30cc1255", size = 27301, upload-time = "2026-05-29T06:35:33.28Z" },
 ]
 
 [[package]]
