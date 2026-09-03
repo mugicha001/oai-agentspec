@@ -48,6 +48,7 @@ lockdown(Path("src"))
 | in-memory のオブジェクト改竄 | （スコープ外） | 既に import 済み code object に対する `ctypes` / `gc.get_referents` 経由の改竄 |
 | install / リリース時の供給網 | （スコープ外） | `uv.lock` / `pip install --require-hashes` / PEP 740 attestation / 署名発行（`docs/security-scanning.md` 側の責務） |
 | 継続監視 | 利用者がヘルスチェック等から `lockdown` を再発火することで擬似構成可能（freeze は冪等 no-op・verify は毎回再実行） | OS / FIM レベルの自動継続監視 |
+| データ源（取得系）の改竄 | 取得を `function_tool` として宣言した静的資産（ドキュメント本文 / スナップショット / 確定済みメモリ）を、内容ガードレール層（`Boundary.TOOL_OUTPUT`）でベースライン照合すること（本ドキュメント「データ源インテグリティ」節） | ライブレスポンス（呼び出しごとに値が変わる API / DB 応答。比較対象のベースラインが原理的に存在しない）・ツールとして宣言しない取得経路 |
 
 **アプリ全体の防御は原理的に不可能**である。Python の言語特性（`ctypes` / monkey-patch / private
 属性直書き）により、上記「守れない」列は本機能の保証範囲外となる。本機能は「ディスク上の事後改竄」と
@@ -391,6 +392,184 @@ logging.getLogger("oai_agentspec.integrity").setLevel(logging.DEBUG)
 
 検証系（verify / detect / checks）は毎回再実行・状態遷移系（freeze）は冪等という使い分けにより、
 擬似継続監視（ヘルスチェック再発火）が自然に成立する。
+
+## データ源インテグリティ（RAG / メモリ / ツール出力）
+
+エージェントが判断材料として読む取得系データ（RAG 検索結果・会話メモリ・静的資産を返すツール
+出力）が、取得時点から改変されていないことを検知するパターンを扱う。検査は内容ガードレール層
+（`oai-agentspec[guardrails]`）のツール出力 guardrail で行い、検知ロジック（ベースライン照合）は
+利用者が注入する。`lockdown` とは対象も発火タイミングも異なる別機構であり、両者は併存する
+（「lockdown との関係（併存）」節）。
+
+### 適用境界と基本パターン
+
+取得（RAG 検索 / メモリ読み出し / 静的資産の読み出し）を `function_tool` として宣言すると、
+検査点は「ツールが値を返した直後・モデルが読む前」に一意に定まる。この位置が
+`Boundary.TOOL_OUTPUT`（`runtime/guardrails/types.py` の `Boundary` メンバ）であり、ここへ
+ベースライン照合の detector を装着するのが基本パターンである。agent 境界（`Boundary.INPUT` /
+`Boundary.OUTPUT`）は会話の入出力を対象とするため、取得結果がモデルへ渡る瞬間を捉えられない。
+
+基本パターンは「1 回のツール呼び出しが単一資産（1 ドキュメント / 1 メモリレコード）を返す形」を
+指す。この形では返却テキスト全体のハッシュと資産単位のベースラインが 1 対 1 で照合できるため、
+detector は「返却テキストの sha256 が既知ダイジェスト集合に含まれるか」の membership 判定で足りる。
+ただしこの判定は識別子と本文の対応までは検証しないため、別の正当な資産へのすり替えは検知できない。
+識別子と本文の対応まで検証したい場合は経路 (b) を使う
+（集合は起動時に 1 回作る）。detector が受け取るのはテキストのみでツール引数（`doc_id` 等）は
+渡らないため、識別子と本文の対応までは検証しない。資産が複数ある構成は「複数チャンク連結の
+扱い」節の経路を使う。
+
+### 装着経路
+
+ツール定義時に宣言する場合は、`function_tool(_func, tool_output_guardrails=[tool_guardrail(detector,
+on="output", on_trip="raise")])` のようにツール定義の引数へ渡す。`as_tool` 等 `function_tool` で
+定義し直せない既存ツールへ後付けする場合は `guard_tool(tool, output_detector=detector,
+on_trip="raise")` で包み、ガード版のみを `tools` へ入れる。
+
+名前で一覧・照会したい場合は登録簿を併用する。登録は登録簿インスタンス経由の facade
+`registry.tool_guardrail(detector, on="output", on_trip="raise", name=<登録名>,
+severity=Severity.CRITICAL)` で行い、境界は `on` から導出される（`on="output"` で
+`Boundary.TOOL_OUTPUT`）。装着は `registry.get(<登録名>)` で実体を取り出し、上記の
+`function_tool(..., tool_output_guardrails=[...])` へ渡す。登録名を `AgentSpec.guardrails` へ
+渡すことはできず、専用フィールド `input_guardrails` / `output_guardrails` は agent 境界専用で
+ツール出力には効かない（`output_guardrails` は名称から誤解されやすい）。根拠は
+`docs/architecture.md` の内容ガードレール節を参照する。
+
+### detector の実装パターン
+
+ベースラインと返却テキストのハッシュを突き合わせる述語を `predicate_detector` で包み、
+`tool_guardrail` でツール出力 guardrail へ接着する。
+
+```python
+import hashlib
+
+from oai_agentspec import function_tool
+from oai_agentspec.runtime.guardrails import predicate_detector, tool_guardrail
+
+# 取得時点の正解（doc_id -> sha256 hex）。取得時点に生成し読み取り専用配置へ保管する。
+BASELINE: dict[str, str] = {"DOC-1042": "9f2c1e5b...", "MEM-42": "1b7e33c9..."}
+KNOWN_DIGESTS = frozenset(BASELINE.values())
+
+
+def _mismatches_baseline(text: str) -> bool:
+    """返却テキスト全体の sha256 がベースラインに無ければ改竄とみなす（True で trip）。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() not in KNOWN_DIGESTS
+
+
+integrity_detector = predicate_detector(
+    _mismatches_baseline, reason="retrieved content does not match the acquisition-time baseline"
+)
+
+# _fetch_document は利用者の取得関数（RAG 検索 / メモリ読み出し / 静的資産の読み出し）。
+fetch_document = function_tool(
+    _fetch_document,
+    name_override="fetch_document",
+    tool_output_guardrails=[tool_guardrail(integrity_detector, on="output", on_trip="raise")],
+)
+```
+
+`predicate_detector` は述語が True のとき trip するため、述語は「不一致 = True」で書く。向きを
+反転させると不一致のときに trip せず、検知が素通りする。検知コストはテキスト長 n に対する
+ハッシュ計算 1 回とベースライン照会 1 回に留まり、ネットワーク往復・モデル呼び出しを含めない。
+
+### 複数チャンク連結の扱い
+
+RAG 検索が複数ヒットを 1 つのテキストへ連結して返す形では、detector が受け取るのは連結後の
+テキスト全体であり、資産単位のベースラインをそのまま突き合わせられない。この形では次の経路の
+いずれかを使う。
+
+**経路 (a) 連結後テキストに対するベースライン**。連結後テキストそのもののダイジェストを
+ベースラインとして持つ。適用できるのは定型問い合わせ（クエリ集合が有限かつ事前に確定している
+構成）に限る。固定 FAQ の定型クエリ集合に対する検索のように、複数ヒットの連結が前提でクエリが
+確定している構成が該当する。成立には次が同時に必要となる。
+
+- クエリ集合の事前確定: ベースラインは事前に用意するものであり、自由文入力の RAG はクエリ空間が
+  非有界で原理的に用意できない
+- 検索インデックスの不変: 文書の追加・削除・再インデックスは同一クエリでもヒット集合を変え、
+  改竄でないのに全ベースラインを一斉に失効させる。`on_trip="raise"` と組み合わさると正常系が
+  停止するため、ベースラインの失効と更新のコストと同じ論点として扱う
+- 取得順序の決定性: 近似最近傍探索・スコア同点時のタイブレーク・シャード分割の並列取得は順序を
+  揺らす
+- 連結形式の決定性: 区切り文字・件数上限・付随メタ（スコア値・取得時刻・件数ヘッダ等）が呼び出し
+  ごとに変わらないこと。可変要素が本文へ混ざると毎回ダイジェストが変わり、`on_trip="raise"` の
+  下で正常系が停止する
+
+**経路 (b) doc_id とダイジェストを含む構造化出力**。ツールが資産単位の識別子と本文を含む JSON を
+返し、detector がそれをパースして資産単位で照合する。
+
+```json
+{
+  "query": "退職金の計算方法",
+  "chunks": [
+    {"doc_id": "DOC-1042", "digest": "9f2c1e5b...", "text": "退職金は基本給に..."},
+    {"doc_id": "DOC-2087", "digest": "4a8d0c72...", "text": "勤続年数の算定は..."}
+  ]
+}
+```
+
+成立条件として、ツール本体は `json.dumps(...)` 済みの `str` を返す。`dict` を返すと detector には
+Python の repr（シングルクォート）が渡り `json.loads` が失敗する。照合手順は次の通り。
+
+1. detector が JSON をパースし `chunks` を走査する。パース不能・`chunks` 欠落・要素のスキーマ不一致は
+   いずれも trip 扱い（述語 True）として返し、述語内から例外を送出しない（ツール実行が失敗した場合は
+   SDK のエラーメッセージ文字列が渡るため、必ずパースに失敗する）
+2. 各 `doc_id` で利用者側のベースラインを引き、`text` を再ハッシュして突き合わせる。出力中の
+   `digest` はツールが自称する値であり信頼の根拠にしない（再計算値と食い違えば trip 扱い）
+3. ベースラインに存在しない `doc_id` が含まれていれば trip する（未知資産の混入）
+
+経路 (b) は経路 (a) の条件を必要としないため、自由文クエリ・可変インデックスを扱う RAG の通常形
+ではこちらを推奨形とする。chunk の走査は資産ごとのハッシュ計算 1 回と照会 1 回に留まる。
+
+### 検知時の既定挙動（fail-closed）
+
+改竄検知では `on_trip="raise"`（中断）を既定として使う。ファクトリ（`tool_guardrail` /
+`guard_tool` / 登録簿の facade）の既定値は `"reject"`（注釈付き返却で続行）であるため、改竄検知
+用途では明示指定が必要である。`"raise"` を指定すると trip 時に `ToolOutputGuardrailTripwireTriggered`
+が送出され、当該ツール出力はモデルへ渡らないまま実行が中断する。
+
+`"reject"` は当該出力を注釈メッセージへ差し替えたうえで実行を続行する（モデルは元データを読まないが、
+エージェントは検知後も回答を作り続け、同じツールを再呼び出ししうる）。`"allow"` は出力をそのまま通すため、
+検知後もモデルが当該データを読む。いずれも中断しないため fail-closed ではない。
+これらは fail-closed ではなく、監査ログ収集など検知結果を続行前提で扱う用途に限る。
+
+登録簿経由で宣言する場合の推奨深刻度は `Severity.CRITICAL` である。
+
+### lockdown との関係（併存）
+
+| 機構 | 守る対象 | 発火タイミング |
+|---|---|---|
+| `lockdown` | ディスク上の静的資産と宣言グラフ（内訳は「守れる範囲・守れない範囲」節を参照） | 起動時 / 明示の再発火（検証段）。freeze 後の書換遮断は以降継続 |
+| ツール出力 guardrail（`Boundary.TOOL_OUTPUT`） | 1 ターンごとのツール出力テキスト | ツール実行のたび |
+
+両者を統合せず併存とするのは層が異なるためである。`lockdown` はコア層、内容ガードレールは
+opt-in extra の実行寄り層にある。統合するとコアから実行寄り層への依存辺ができ、単方向依存と
+コア `__all__` の分離契約に反する。
+
+`lockdown` の `checks` へ寄せる形も採らない。`checks` が受け取る `IntegrityCheck` は
+`Callable[[], None]` で引数を取らずツール出力テキストを受け取れず、発火も `lockdown` の呼び出し時に
+限られるため 1 ターンごとのツール出力に届かない（層の違いとは別の根拠）。
+
+### 責務分界と適用条件
+
+lib 側の責務は次に限る。
+
+- 宣言面（境界 enum・ファクトリ・登録簿）の提供
+- 本パターンと検知時の既定挙動の明文化
+- example の提供
+
+ベースラインの生成・保管・鍵管理・失効は利用者責務である。lib はベースラインの保存機構も署名
+機構も持たない。
+
+適用条件は次の通り。
+
+- 取得時点のベースラインを保持しない場合、照合対象が存在しないため本パターンは適用できない
+- RAG / メモリ取得をツールとして宣言しない構成（SDK 組み込みの検索機構をエージェントが直接使う
+  等）では、検査点が定まらず本経路が成立しない
+- ベースラインと対象データを双方同時に書き換えられる環境では検知保証が失効する（manifest 信頼
+  境界の節と同じ前提）
+
+実行できる最小例は
+[examples/guardrails/09_data_integrity_detector.py](../examples/guardrails/09_data_integrity_detector.py)
+を参照する。
 
 ## Out of Scope
 
