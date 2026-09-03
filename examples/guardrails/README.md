@@ -109,6 +109,7 @@ guardrail を名前で参照したい場合（UI からの有効 / 無効切り�
 | `06_tool_output_guardrail.py` | LLM02/05 | tool 出力 / `tool_guardrail` + `function_tool`（後付けは `guard_tool`） | C（regex）他 DI 可 | なし |
 | `07_guardrail_registry.py` | LLM01/02/07 | `Boundary` 4 値すべて / `GuardrailRegistry`（facade 9 + register 経路 + 名前参照 + run 単位） | A（DI 検知器）/ B（判定 LLM）/ C（6 種）+ 自作 | なし |
 | `08_canary_run_scoped.py` | LLM07 | output / `canary_guardrail`（resolver）+ `AgentSpec.instructions_append` | C（カナリア） | なし |
+| `09_data_integrity_detector.py` | -（内容検査ではなく改竄検知） | tool 出力 / `tool_guardrail` + `predicate_detector`（後付けは `guard_tool`） | C（決定的・ベースライン照合） | なし |
 
 `07` は登録簿（`GuardrailRegistry`）で「名前の強制・適用境界の宣言・分類メタデータの宣言・名前
 参照」を 1 本で通す例で、`oai_agentspec.runtime.guardrails` の公開シンボル 27 件・facade 9 件・
