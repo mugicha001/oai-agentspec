@@ -1227,8 +1227,6 @@ async def test_path_c_run_streamed_propagates_context() -> None:
 
 def test_path_c_spec_hooks_is_library_hook() -> None:
     """`as_agent_spec` の戻り値 `hooks` は lib 所有 `AgentHooksBase` 実装で spec ごとに別物。"""
-    from agents.lifecycle import AgentHooksBase
-
     wf = _wf_wrap()
     spec = wf.as_agent_spec("hooked")
     other = wf.as_agent_spec("hooked_other")

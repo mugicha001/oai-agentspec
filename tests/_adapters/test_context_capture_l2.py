@@ -107,6 +107,24 @@ def test_resolve_without_current_span_returns_none() -> None:
     assert capture.resolve() is None
 
 
+async def test_on_start_without_current_span_is_noop() -> None:
+    """現在 span が無ければ `on_start` は例外なく戻る（ガードの有無を pin する）。
+
+    `Runner.run` を経ない直接呼び出し相当（current span 無し）で `on_start` を呼ぶ。
+    `WeakKeyDictionary` は None を weakref 化できず `TypeError` になるため、`if span is not None`
+    のガードを外すとこの await の行で落ちる。後段の `custom_span` ブロックは「以降に開いた span
+    からは何も見えない」の補助確認で、None キー非登録の根拠ではない。
+    """
+    capture = context_capture.RunContextCapture()
+    wrapper = RunContextWrapper(context=_AppCtx(token="tk_no_span"))
+    assert get_current_span() is None
+
+    await capture.hooks.on_start(wrapper, _agent())
+
+    with custom_span("turn"):
+        assert capture.resolve() is None
+
+
 @pytest.mark.usefixtures("_tracing_enabled")
 async def test_resolve_for_unregistered_span_returns_none() -> None:
     """別 span で登録した wrapper は、未登録の現在 span からは解決されない（span 単位の分離）。"""

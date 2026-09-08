@@ -52,16 +52,25 @@ async def test_path_c_records_workflow_and_node_spans(
     tracing_enabled: Any,
 ) -> None:
     """経路C: WorkflowModel を据えた Agent を Runner.run で実行すると workflow / node span が
-    外側 trace 配下に記録される（AC-1/AC-2）。"""
+    外側 trace 配下に記録される（AC-1/AC-2）。tracing 有効（SpanImpl）でも外側 context が
+    FUNCTION ノードへ届くことも併せて確認する。"""
+    seen: dict[str, Any] = {}
     reg = AgentRegistry()
     wf = WorkflowGraph(name="trace_c")
-    wf.add_function_node("step", fn=lambda msg, ctx: f"<{msg}>")
+
+    def step(msg: object, ctx: Any) -> str:
+        seen["ctx"] = ctx
+        return f"<{msg}>"
+
+    wf.add_function_node("step", fn=step)
     wf.add_edge(START, "step")
     wf.add_edge("step", END)
     agent = build_agent(wf.as_agent_spec("trace_c_agent", registry=reg))
 
-    result = await Runner.run(agent, input="hi")
+    obj = object()
+    result = await Runner.run(agent, input="hi", context=obj)
     assert result.final_output == "<hi>"
+    assert seen["ctx"].context is obj
 
     # workflow span が記録されている（`workflow.run.trace_c`）。
     wf_spans = _workflow_spans(tracing_enabled, "trace_c")
