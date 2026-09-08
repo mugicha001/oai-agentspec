@@ -435,3 +435,46 @@ def test_sandbox_callable_base_instructions_is_unaffected_by_append() -> None:
     )
     agent = build_agent(spec)
     assert agent.base_instructions is base
+
+
+# ---------------------------------------------------------------------------
+# 経路C（as_agent_spec）経由で外側 context が instructions_append へ届く（FR-1）
+# ---------------------------------------------------------------------------
+async def test_path_c_instructions_append_reads_outer_context() -> None:
+    """経路C を `Runner.run(context=obj)` で実行すると内側 AGENT の追記関数へ obj が届く。
+
+    追記関数が受け取る `context.context is obj` を `is` で照合する。
+
+    合成された system prompt（`静的本文\\n\\n断片`）が内側 FakeModel へ渡ることも確認する。
+    """
+    from oai_agentspec.workflow import END, START, WorkflowGraph
+
+    seen: dict[str, Any] = {}
+
+    def fragment(context: Any, agent: Any) -> str:
+        seen["context"] = context.context
+        return f"token={context.context.token}"
+
+    inner_model = FakeModel().queue_text("inner-out")
+    reg = AgentRegistry()
+    reg.register(
+        AgentSpec(
+            name="inner",
+            instructions="STATIC",
+            model=inner_model,
+            instructions_append=[fragment],
+        )
+    )
+    wf = WorkflowGraph("append_ctx")
+    wf.add_agent_node("work", agent="inner")
+    wf.add_edge(START, "work")
+    wf.add_edge("work", END)
+    agent = build_agent(wf.as_agent_spec("append_ctx_agent", registry=reg))
+    obj = Ctx(token="outer-token")
+
+    result = await Runner.run(agent, input="q", context=obj)
+
+    assert seen["context"] is obj
+    assert len(inner_model.calls) == 1
+    assert inner_model.calls[0].system_instructions == "STATIC\n\ntoken=outer-token"
+    assert result.final_output == "inner-out"

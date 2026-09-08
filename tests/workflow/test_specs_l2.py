@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 from agents import MaxTurnsExceeded, Runner
+from agents.lifecycle import AgentHooksBase
 
 from oai_agentspec import AgentRegistry, AgentSpec
 from oai_agentspec._adapters import build_agent
@@ -913,3 +914,510 @@ def test_deterministic_model_coerces_non_string_input() -> None:
     resp = asyncio.run(model.get_response("sys", no_user, object(), [], None))
     parsed = json.loads(resp.output[0].arguments)
     assert isinstance(parsed["input"], str)
+
+
+# ----------------------------------------------------------------------
+# WorkflowModel(context_resolver=): 解決した context を interpret へ素通し（タスク 3）
+# ----------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_workflow_model_get_response_passes_resolved_context_to_interpret() -> None:
+    """`context_resolver` が返した wrapper が詰め替えなしで `interpret` の `context` へ届く。
+
+    resolver は `get_response` 1 回につき 1 回だけ呼ばれる（run スコープ解決を 1 箇所に集約）。
+    """
+    from oai_agentspec._adapters import WorkflowModel
+    from oai_agentspec.workflow import NodeResults, WorkflowResult
+
+    sentinel = object()
+    resolver_calls: list[None] = []
+    seen: dict[str, Any] = {}
+
+    def resolver() -> Any:
+        resolver_calls.append(None)
+        return sentinel
+
+    async def interpret(input: Any, *, context: Any = None) -> WorkflowResult:
+        seen["context"] = context
+        return WorkflowResult(final_output=f"got:{input}", results=NodeResults())
+
+    model = WorkflowModel(interpret, context_resolver=resolver)
+    resp = await model.get_response("sys", "hello", object(), [], None)
+
+    assert seen["context"] is sentinel
+    assert len(resolver_calls) == 1
+    assert resp.output[0].content[0].text == "got:hello"
+
+
+@pytest.mark.asyncio
+async def test_workflow_model_without_resolver_passes_none_context() -> None:
+    """`context_resolver=None`（既定）なら `interpret` は `context=None` で呼ばれる（FR-4）。"""
+    from oai_agentspec._adapters import WorkflowModel
+    from oai_agentspec.workflow import NodeResults, WorkflowResult
+
+    seen: dict[str, Any] = {}
+
+    async def interpret(input: Any, *, context: Any = None) -> WorkflowResult:
+        seen["context"] = context
+        return WorkflowResult(final_output=input, results=NodeResults())
+
+    model = WorkflowModel(interpret, context_resolver=None)
+    await model.get_response("sys", "q", object(), [], None)
+
+    assert "context" in seen
+    assert seen["context"] is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_model_resolver_returning_none_passes_none_context() -> None:
+    """resolver が None を返す（捕捉不能）と `interpret` は例外なしに `context=None` で呼ばれる。"""
+    from oai_agentspec._adapters import WorkflowModel
+    from oai_agentspec.workflow import NodeResults, WorkflowResult
+
+    seen: dict[str, Any] = {}
+
+    async def interpret(input: Any, *, context: Any = None) -> WorkflowResult:
+        seen["context"] = context
+        return WorkflowResult(final_output=input, results=NodeResults())
+
+    model = WorkflowModel(interpret, context_resolver=lambda: None)
+    resp = await model.get_response("sys", "q", object(), [], None)
+
+    assert "context" in seen
+    assert seen["context"] is None
+    assert resp.output[0].content[0].text == "q"
+
+
+@pytest.mark.asyncio
+async def test_workflow_model_stream_response_uses_resolver() -> None:
+    """`stream_response` は `get_response` 委譲のため resolver の wrapper が同様に届く（FR-2）。"""
+    from openai.types.responses import ResponseCompletedEvent
+
+    from oai_agentspec._adapters import WorkflowModel
+    from oai_agentspec.workflow import NodeResults, WorkflowResult
+
+    sentinel = object()
+    seen: dict[str, Any] = {}
+
+    async def interpret(input: Any, *, context: Any = None) -> WorkflowResult:
+        seen["context"] = context
+        return WorkflowResult(final_output="streamed", results=NodeResults())
+
+    model = WorkflowModel(interpret, context_resolver=lambda: sentinel)
+    events = [e async for e in model.stream_response("sys", "q", object(), [], None)]
+
+    assert seen["context"] is sentinel
+    assert len([e for e in events if isinstance(e, ResponseCompletedEvent)]) == 1
+
+
+# ----------------------------------------------------------------------
+# 経路C: Runner.run(context=...) の伝播（タスク 4・FR-1 / FR-2 / FR-3 / NFR-2 / NFR-5）
+# ----------------------------------------------------------------------
+def _ctx_recording_workflow(seen: dict[str, Any], *, name: str = "ctx_c") -> WorkflowGraph:
+    """先頭 FUNCTION ノードが受け取った `ctx` を `seen["ctx"]` へ記録するワークフロー。"""
+    wf = WorkflowGraph(name)
+
+    def record(msg: object, ctx: Any) -> str:
+        seen["ctx"] = ctx
+        return f"user={getattr(getattr(ctx, 'context', None), 'user_id', None)}|{msg}"
+
+    wf.add_function_node("step", fn=record)
+    wf.add_edge(START, "step")
+    wf.add_edge("step", END)
+    return wf
+
+
+class _RecordingAgentHooks(AgentHooksBase[Any, Any]):
+    """内側 AGENT ノードの `Runner.run` が受け取った context を観測するフック。
+
+    SDK は `Runner.run(context=obj)` の obj を `RunContextWrapper` に包んで `on_start` へ渡す
+    ため、`context.context` が内側 run に渡った生オブジェクトになる。
+    """
+
+    def __init__(self) -> None:
+        self.contexts: list[Any] = []
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        self.contexts.append(context.context)
+
+
+def _reg_with_hooked_agent(name: str, hooks: _RecordingAgentHooks) -> AgentRegistry:
+    """観測フック付き FakeModel AGENT を 1 件登録した registry を返す。"""
+    reg = AgentRegistry()
+    reg.register(
+        AgentSpec(name=name, instructions=name, model=FakeModel().queue_text("inner"), hooks=hooks)
+    )
+    return reg
+
+
+@pytest.mark.asyncio
+async def test_path_c_propagates_context_to_function_node() -> None:
+    """経路C: `Runner.run(context=obj)` の obj が FUNCTION ノードの `ctx.context` へ届く。"""
+    from agents import RunContextWrapper
+
+    seen: dict[str, Any] = {}
+    agent = build_agent(_ctx_recording_workflow(seen).as_agent_spec("c_agent"))
+    obj = _AppCtx(user_id="vip_c")
+
+    result = await Runner.run(agent, input="hello", context=obj)
+
+    assert isinstance(seen["ctx"], RunContextWrapper)
+    assert seen["ctx"].context is obj
+    assert result.final_output == "user=vip_c|hello"
+
+
+@pytest.mark.asyncio
+async def test_path_c_passes_raw_context_to_agent_node() -> None:
+    """経路C: 内側 AGENT ノードの `Runner.run` には wrapper を剥がした生 obj が渡る（FR-1）。"""
+    from agents import RunContextWrapper
+
+    inner_hooks = _RecordingAgentHooks()
+    reg = _reg_with_hooked_agent("worker", inner_hooks)
+    wf = WorkflowGraph("raw_ctx")
+    wf.add_agent_node("work", agent="worker")
+    wf.add_edge(START, "work")
+    wf.add_edge("work", END)
+    agent = build_agent(wf.as_agent_spec("raw_ctx_agent", registry=reg))
+    obj = _AppCtx(user_id="raw")
+
+    await Runner.run(agent, input="go", context=obj)
+
+    assert len(inner_hooks.contexts) == 1
+    assert inner_hooks.contexts[0] is obj
+    # 二重ラップ（RunContextWrapper のまま渡す退行）を検知する。
+    assert not isinstance(inner_hooks.contexts[0], RunContextWrapper)
+
+
+@pytest.mark.asyncio
+async def test_path_c_router_and_node_hooks_receive_wrapper() -> None:
+    """経路C: router / on_node_start / on_node_end / FUNCTION の `ctx` が同一 wrapper（FR-1）。"""
+    from agents import RunContextWrapper
+
+    seen: dict[str, Any] = {}
+    obj = _AppCtx(user_id="route")
+
+    def record(msg: object, ctx: Any) -> str:
+        seen["fn"] = ctx
+        return str(msg)
+
+    def router(msg: object, ctx: Any) -> str:
+        seen["router"] = ctx
+        return END
+
+    wf = WorkflowGraph("route_ctx")
+    wf.add_function_node("step", fn=record)
+    wf.add_edge(START, "step")
+    wf.add_conditional_edges("step", router)
+    spec = wf.as_agent_spec(
+        "route_ctx_agent",
+        on_node_start=lambda name, results, ctx: seen.__setitem__("start", ctx),
+        on_node_end=lambda name, results, ctx: seen.__setitem__("end", ctx),
+    )
+    agent = build_agent(spec)
+
+    await Runner.run(agent, input="x", context=obj)
+
+    wrapper = seen["fn"]
+    assert isinstance(wrapper, RunContextWrapper)
+    assert wrapper.context is obj
+    assert seen["router"] is wrapper
+    assert seen["start"] is wrapper
+    assert seen["end"] is wrapper
+
+
+@pytest.mark.asyncio
+async def test_path_c_context_none_gives_wrapper_with_none() -> None:
+    """経路C: context 未指定でも FUNCTION の `ctx` は wrapper で `.context is None`（FR-1）。
+
+    内側 AGENT ノードの `Runner.run` には `context=None` が渡る（経路 A/D と同形）。
+    """
+    from agents import RunContextWrapper
+
+    seen: dict[str, Any] = {}
+    inner_hooks = _RecordingAgentHooks()
+    reg = _reg_with_hooked_agent("worker", inner_hooks)
+    wf = _ctx_recording_workflow(seen, name="none_ctx")
+    wf.add_agent_node("work", agent="worker")
+    wf.edges["step"] = ["work"]  # step -> work -> END に組み替える
+    wf.add_edge("work", END)
+    agent = build_agent(wf.as_agent_spec("none_ctx_agent", registry=reg))
+
+    await Runner.run(agent, input="x")
+
+    assert isinstance(seen["ctx"], RunContextWrapper)
+    assert seen["ctx"].context is None
+    assert inner_hooks.contexts == [None]
+
+
+@pytest.mark.asyncio
+async def test_path_c_sequential_runs_do_not_leak_context() -> None:
+    """経路C: 同一 Agent を連続 run すると各 run に当該 run の context だけが届く（FR-1）。"""
+    seen: dict[str, Any] = {}
+    agent = build_agent(_ctx_recording_workflow(seen).as_agent_spec("seq_agent"))
+    first = _AppCtx(user_id="first")
+    second = _AppCtx(user_id="second")
+
+    r1 = await Runner.run(agent, input="a", context=first)
+    assert seen["ctx"].context is first
+    assert r1.final_output == "user=first|a"
+
+    r2 = await Runner.run(agent, input="b", context=second)
+    assert seen["ctx"].context is second
+    assert r2.final_output == "user=second|b"
+
+    # 3 回目は未指定: 前 run の second が残らない。
+    r3 = await Runner.run(agent, input="c")
+    assert seen["ctx"].context is None
+    assert r3.final_output == "user=None|c"
+
+
+@pytest.mark.asyncio
+async def test_path_c_exception_in_previous_run_does_not_leak() -> None:
+    """経路C: 前 run が `interpret` 途中の例外で終了しても次 run に前 run の context が残らない。"""
+    seen: dict[str, Any] = {}
+
+    def record_or_boom(msg: object, ctx: Any) -> str:
+        seen["ctx"] = ctx
+        if msg == "boom":
+            raise RuntimeError("boom")
+        return f"ok:{msg}"
+
+    wf = WorkflowGraph("exc_ctx")
+    wf.add_function_node("step", fn=record_or_boom)
+    wf.add_edge(START, "step")
+    wf.add_edge("step", END)
+    agent = build_agent(wf.as_agent_spec("exc_ctx_agent"))
+    failed = _AppCtx(user_id="failed")
+    fresh = _AppCtx(user_id="fresh")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await Runner.run(agent, input="boom", context=failed)
+    assert seen["ctx"].context is failed
+
+    await Runner.run(agent, input="next")
+    assert seen["ctx"].context is None
+
+    await Runner.run(agent, input="again", context=fresh)
+    assert seen["ctx"].context is fresh
+
+
+@pytest.mark.asyncio
+async def test_path_c_run_streamed_propagates_context() -> None:
+    """経路C: `Runner.run_streamed(context=obj)` でも FUNCTION の `ctx.context is obj`（FR-2）。
+
+    最終出力は `ResponseCompletedEvent` として流れる。
+    """
+    from openai.types.responses import ResponseCompletedEvent
+
+    seen: dict[str, Any] = {}
+    agent = build_agent(_ctx_recording_workflow(seen).as_agent_spec("stream_ctx_agent"))
+    obj = _AppCtx(user_id="stream")
+
+    streamed = Runner.run_streamed(agent, input="hi", context=obj)
+    events = [e async for e in streamed.stream_events()]
+
+    assert seen["ctx"].context is obj
+    assert streamed.final_output == "user=stream|hi"
+    completed = [
+        e
+        for e in events
+        if e.type == "raw_response_event" and isinstance(e.data, ResponseCompletedEvent)
+    ]
+    assert len(completed) == 1
+
+
+def test_path_c_spec_hooks_is_library_hook() -> None:
+    """`as_agent_spec` の戻り値 `hooks` は lib 所有 `AgentHooksBase` 実装で spec ごとに別物。"""
+    from agents.lifecycle import AgentHooksBase
+
+    wf = _wf_wrap()
+    spec = wf.as_agent_spec("hooked")
+    other = wf.as_agent_spec("hooked_other")
+
+    assert spec.hooks is not None
+    assert isinstance(spec.hooks, AgentHooksBase)
+    # 1 WorkflowModel につき 1 捕捉テーブル（共有レジストリ不採用）。
+    assert other.hooks is not spec.hooks
+    # build 後の Agent にそのまま載る。
+    assert build_agent(spec).hooks is spec.hooks
+
+
+@pytest.mark.asyncio
+async def test_path_c_chained_user_hooks_coexist() -> None:
+    """`chain_agent_hooks(spec.hooks, own)` 合成後も伝播が成立し own の `on_start` も呼ばれる。"""
+    from oai_agentspec.runtime.hooks import chain_agent_hooks
+
+    seen: dict[str, Any] = {}
+    own = _RecordingAgentHooks()
+    spec = _ctx_recording_workflow(seen).as_agent_spec("chained_agent")
+    spec.hooks = chain_agent_hooks(spec.hooks, own)
+    agent = build_agent(spec)
+    obj = _AppCtx(user_id="chained")
+
+    result = await Runner.run(agent, input="hi", context=obj)
+
+    assert seen["ctx"].context is obj
+    assert result.final_output == "user=chained|hi"
+    assert len(own.contexts) == 1
+    assert own.contexts[0] is obj
+
+
+@pytest.mark.asyncio
+async def test_path_c_hooks_override_falls_back_to_none_context(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`spec.hooks = own` で lib hook を上書きすると例外・警告なしに `context=None` で走る（FR-3）。
+
+    FUNCTION ノードの `ctx is None`・内側 AGENT ノードの `Runner.run` に `context=None` が渡る。
+    """
+    import logging
+
+    seen: dict[str, Any] = {}
+    own = _RecordingAgentHooks()
+    inner_hooks = _RecordingAgentHooks()
+    reg = _reg_with_hooked_agent("worker", inner_hooks)
+    wf = _ctx_recording_workflow(seen, name="override_ctx")
+    wf.add_agent_node("work", agent="worker")
+    wf.edges["step"] = ["work"]  # step -> work -> END に組み替える
+    wf.add_edge("work", END)
+    spec = wf.as_agent_spec("override_agent", registry=reg)
+    spec.hooks = own
+    agent = build_agent(spec)
+    obj = _AppCtx(user_id="lost")
+
+    with caplog.at_level(logging.DEBUG):
+        result = await Runner.run(agent, input="hi", context=obj)
+
+    assert seen["ctx"] is None
+    assert inner_hooks.contexts == [None]
+    assert result.final_output == "inner"
+    # own は通常どおり外側 context を受け取る（上書き自体は成立している）。
+    assert own.contexts == [obj]
+    # lib は警告以上のログを出さない。
+    assert not [
+        r
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name.startswith("oai_agentspec")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_path_c_concurrent_runs_isolate_context() -> None:
+    """経路C: 同一 Agent へ N=3 の run を同時投入しても各 run に自 run の context のみ届く。
+
+    FUNCTION ノード内で `await asyncio.sleep(0)` により他 run へ制御を譲ったうえで観測する。
+    """
+    observed: dict[str, Any] = {}
+
+    async def record(msg: object, ctx: Any) -> str:
+        await asyncio.sleep(0)
+        observed[str(msg)] = ctx.context
+        await asyncio.sleep(0)
+        return f"{ctx.context.user_id}|{msg}"
+
+    wf = WorkflowGraph("concurrent_ctx")
+    wf.add_function_node("step", fn=record)
+    wf.add_edge(START, "step")
+    wf.add_edge("step", END)
+    agent = build_agent(wf.as_agent_spec("concurrent_agent"))
+    objs = [_AppCtx(user_id=f"u{i}") for i in range(3)]
+
+    results = await asyncio.gather(
+        *(Runner.run(agent, input=f"m{i}", context=objs[i]) for i in range(3))
+    )
+
+    for i, obj in enumerate(objs):
+        assert observed[f"m{i}"] is obj
+        assert results[i].final_output == f"u{i}|m{i}"
+    assert len(observed) == 3
+
+
+@pytest.mark.asyncio
+async def test_path_c_capture_fires_once_per_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """経路C: ノード 3 以上のグラフを 1 run しても lib hook の `on_start` 捕捉は 1 回（NFR-5）。"""
+    seen: dict[str, Any] = {}
+    reg = _reg_with_models(worker=FakeModel().queue_text("w"))
+    wf = WorkflowGraph("once_ctx")
+    wf.add_function_node("a", fn=lambda msg, ctx: msg)
+    wf.add_agent_node("work", agent="worker")
+    wf.add_function_node("b", fn=lambda msg, ctx: msg)
+
+    def record(msg: object, ctx: Any) -> str:
+        seen["ctx"] = ctx
+        return str(msg)
+
+    wf.add_function_node("c", fn=record)
+    wf.add_edge(START, "a")
+    wf.add_edge("a", "work")
+    wf.add_edge("work", "b")
+    wf.add_edge("b", "c")
+    wf.add_edge("c", END)
+    spec = wf.as_agent_spec("once_agent", registry=reg)
+
+    original = spec.hooks.on_start
+    calls: list[tuple[Any, Any]] = []
+
+    async def spy(context: Any, agent: Any) -> None:
+        calls.append((context, agent))
+        await original(context, agent)
+
+    monkeypatch.setattr(spec.hooks, "on_start", spy)
+    agent = build_agent(spec)
+    obj = _AppCtx(user_id="once")
+
+    await Runner.run(agent, input="hi", context=obj)
+
+    assert len(calls) == 1
+    assert calls[0][0].context is obj
+    assert calls[0][1] is agent
+    # spy を経由しても捕捉は機能している。
+    assert seen["ctx"].context is obj
+
+
+@pytest.mark.asyncio
+async def test_path_c_resume_from_run_state_propagates_context() -> None:
+    """HITL 再開（`Runner.run(state)`）後に handoff で到達した経路C へ run の context が届く。
+
+    `WorkflowModel` は tool を返さず経路C 単体では中断状態を作れないため、承認要 tool を持つ
+    前段 Agent が中断し、再開後の 2 turn 目で経路C Agent へ handoff する構成で検証する。
+    初回 run で渡した context（`RunState` が保持する wrapper）が handoff 先（経路C）の
+    FUNCTION ノードへ `is` で届く。再開時に `context=` を渡し直すと SDK は wrapper を作り直し
+    承認記録（`_approvals`）ごと失われ再び中断するため、再開では context を渡さない。
+    """
+    from oai_agentspec._adapters import apply_approvals
+    from oai_agentspec.runtime.deterministic import tool_call_response
+
+    from _helpers.approval import QueuedFakeModel, ToolRecorder, make_approval_tool
+
+    seen: dict[str, Any] = {}
+    reg = AgentRegistry()
+    reg.register(_ctx_recording_workflow(seen, name="resume_ctx").as_agent_spec("wf_agent"))
+    recorder = ToolRecorder()
+    front_model = (
+        QueuedFakeModel()
+        .queue(tool_call_response("danger", '{"x": "v"}', call_id="c1"))
+        .queue(tool_call_response("transfer_to_wf_agent", "{}"))
+    )
+    reg.register(
+        AgentSpec(
+            name="front",
+            instructions="front",
+            model=front_model,
+            tools=[make_approval_tool(recorder, name="danger")],
+            handoffs=["wf_agent"],
+        )
+    )
+    front = reg.get("front")
+    initial = _AppCtx(user_id="initial")
+
+    interrupted = await Runner.run(front, "do it", context=initial)
+    assert interrupted.interruptions
+    assert "ctx" not in seen  # 中断時点では経路C は未到達
+    state = interrupted.to_state()
+    apply_approvals(state, [{"call_id": "c1", "decision": "approve"}])
+
+    result = await Runner.run(front, state)
+
+    assert recorder.executed == ["v"]
+    assert result.last_agent.name == "wf_agent"
+    assert seen["ctx"].context is initial
+    assert "user=initial|" in str(result.final_output)
