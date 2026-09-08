@@ -54,7 +54,8 @@ def build_agent_spec(
         on_node_end: ノード実行後フック（任意）。
 
     Returns:
-        model に WorkflowModel を据えた AgentSpec（tools / handoffs なし）。
+        model に WorkflowModel・hooks に lib 所有の context 捕捉フックを据えた AgentSpec
+        （tools / handoffs なし）。
     """
     from .. import _adapters
 
@@ -72,8 +73,15 @@ def build_agent_spec(
             tracer=tracer,
         )
 
-    model = _adapters.WorkflowModel(interpret_input, output_extractor=output_extractor)
-    return AgentSpec(name=name, model=model)
+    # 1 WorkflowModel につき 1 捕捉テーブル。lib 所有 hook（on_start）が run の
+    # RunContextWrapper を現在 span をキーに登録し、model が get_response で解決する。
+    capture = _adapters.RunContextCapture()
+    model = _adapters.WorkflowModel(
+        interpret_input,
+        output_extractor=output_extractor,
+        context_resolver=capture.resolve,
+    )
+    return AgentSpec(name=name, model=model, hooks=capture.hooks)
 
 
 def build_facade_spec(

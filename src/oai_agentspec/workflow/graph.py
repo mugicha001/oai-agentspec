@@ -153,10 +153,13 @@ class WorkflowGraph:
             name: ノード名（一意）。
             fn: `(msg, ctx) -> 出力` の callable（sync / async 両対応）。callable は
                 ノードが直接保持する（registry 参照ではない）。fan-in の合流先では
-                msg は `{source名: 出力}` の dict を受ける（C-4）。`ctx` は経路A/D では
-                `RunContextWrapper`（`ctx.context` で渡した値を取り出す）、経路C では `None`
-                になる（C-11）。両経路で使い回す関数は `getattr(ctx, "context", None)` で
-                防御的に取り出すこと。
+                msg は `{source名: 出力}` の dict を受ける（C-4）。`ctx` は `Runner.run`
+                経由の経路A/C/D で `RunContextWrapper`（実型は SDK のサブクラス。`ctx.context`
+                で渡した値を取り出す）。`Runner.run` を経ない呼び出しや経路C で `hooks` を
+                上書きした場合は `None` になるため、両様で使い回す関数は
+                `getattr(ctx, "context", None)` で防御的に取り出すこと。context を認可判定に
+                使うノードは `getattr(ctx, "context", None) is None` を拒否（fail-closed）として
+                扱うこと。
 
         Returns:
             自身（メソッドチェーン用）。
@@ -668,13 +671,18 @@ class WorkflowGraph:
 
         registry.register すると WorkflowGraph が「本物の Agent」として保持され、handoff の
         直接ターゲットになれる。WorkflowModel が LLM を呼ばずエンジンを回すため決定論的に
-        起動する。外側 run の共有 context はワークフロー内ステップへ伝播しない（C-11）。
-        加えて先頭ノードへ渡るのは入力中の **末尾 user テキスト 1 件のみ**で、会話履歴や
-        system_instructions は伝播しない（マルチターンで過去履歴を内部参照したい用途には
-        不向き）。context や履歴が必要な場合は `as_facade_spec`（経路A/D）を使う。決定論を
-        保ったまま context 透過したい場合は `as_facade_spec(mode=FacadeMode.DETERMINISTIC)`
-        （経路D・実 LLM 0 回）。経路C 固有の利点は「外から 1 Agent・handoff 直接ターゲット・
-        tool 往復を挟まない」点。
+        起動する。`Runner.run(context=...)` の外側 context は、戻り値の `hooks` に載る lib 所有
+        フックが run 開始時に捕捉しワークフロー内ステップ（AGENT / FUNCTION / router / ノード
+        前後フック）へ伝播する（経路A/D と同形）。`hooks` を上書きすると捕捉が失われ
+        `context=None` で無言実行されるため、独自フックの併用は
+        `chain_agent_hooks(spec.hooks, own)` で合成する（伝播条件の詳細は
+        `docs/architecture.md` の経路C 説明を参照）。先頭ノードへ渡るのは入力中の
+        **末尾 user テキスト 1 件のみ**で、会話履歴や system_instructions は伝播しない
+        （マルチターンで過去履歴を内部参照したい用途には不向き）。履歴が必要な場合は
+        `as_facade_spec`（経路A/D）を使う。ワークフロー起動を tool 往復（tool call アイテム・
+        `on_tool_start` / `on_tool_end`）として残したい場合は
+        `as_facade_spec(mode=FacadeMode.DETERMINISTIC)`（経路D・実 LLM 0 回）。経路C 固有の
+        利点は「外から 1 Agent・handoff 直接ターゲット・tool 往復を挟まない」点。
 
         Args:
             name: 生成する AgentSpec の名前。
@@ -686,7 +694,8 @@ class WorkflowGraph:
             on_node_end: ノード実行後フック（任意）。
 
         Returns:
-            model に WorkflowModel を据えた AgentSpec（tools / handoffs なし）。
+            model に WorkflowModel・hooks に lib 所有の context 捕捉フックを据えた AgentSpec
+            （tools / handoffs なし）。
         """
         return _facade.build_agent_spec(
             self,
@@ -712,8 +721,9 @@ class WorkflowGraph:
     ) -> AgentSpec:
         """ワークフロー tool だけを持つファサード AgentSpec を返す（経路A/D・FR-9）。
 
-        外側の共有 context をワークフロー内ステップへ透過する（context を渡せない経路C との
-        差別化点）。入口モデルは `mode` で切り替える（`FacadeMode` 参照）:
+        外側の共有 context を tool 経由でワークフロー内ステップへ透過する（経路C も lib 所有
+        フックで透過するため、差別化点はワークフロー起動を tool 往復として session 履歴・tool
+        フックに残す点）。入口モデルは `mode` で切り替える（`FacadeMode` 参照）:
 
         - `LLM_INPUT`（既定・従来の経路A）: 実 LLM が tool 入力を整形して 1 回呼び、結果を
           素通しする（`stop_on_first_tool`）。

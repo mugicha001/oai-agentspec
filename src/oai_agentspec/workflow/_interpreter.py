@@ -135,7 +135,9 @@ async def interpret(
         graph: 解釈対象の WorkflowGraph。
         runner: AGENT ノード実行を委譲する runner シーム。
         input: ワークフローへの初期入力（START 直後のノードの msg）。
-        context: 各ノードへ素通しする共有 context（経路A 時のみ非 None・C-11）。
+        context: 各ノードへ素通しする共有 context（`Runner.run` 経由の経路A/C/D で非 None。
+            実型は SDK の `RunContextWrapper` サブクラス。経路C で `hooks` を上書きした場合は
+            None）。
         on_node_start: ノード実行前フック（任意）。
         on_node_end: ノード実行後フック（任意）。
         tracer: 任意の `WorkflowTracer`（None で span 発行を完全にスキップする no-op に倒す）。

@@ -53,6 +53,9 @@ from .builders import (
     make_handoff,
     mock_spec_tools,
 )
+from .context_capture import (  # noqa: F401 - workflow 層への内部窓口（公開 __all__ には積まない）
+    RunContextCapture,
+)
 from .governance import (
     govern_spec,
     load_policy_bundle,
