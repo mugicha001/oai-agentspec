@@ -2,7 +2,7 @@
 
 題材は「記事作成パイプライン」。AGENT ノード（researcher -> writer）と、その間に
 入力を整える FUNCTION ノード（brief）を 1 つ挟んだ node/edge ワークフローを、上流の
-triage エージェントから呼び出す 3 経路で構築し、決定性 / context 透過 / LLM 層数 の違いを
+triage エージェントから呼び出す 3 経路で構築し、決定性 / tool 往復の有無 / LLM 層数 の違いを
 示す。
 
 ワークフローのトポロジ（公開 API・node/edge 方式）::
@@ -11,12 +11,12 @@ triage エージェントから呼び出す 3 経路で構築し、決定性 / c
 
   経路C（as_agent_spec）: ワークフローを「本物の Agent」として registry 登録し、
     triage から handoff の直接ターゲットにする。WorkflowModel が LLM を呼ばずに
-    エンジンを回すため流入は決定論的（追加 LLM 層 0）。ただし外側 run の共有 context は
-    ワークフロー内ノードへ伝播しない。
+    エンジンを回すため流入は決定論的（追加 LLM 層 0）。外側 run の共有 context は lib 所有
+    フックが捕捉してワークフロー内ノードへ届く（tool 往復は挟まない）。
 
   経路A（as_facade_spec）: ワークフローを tool として持つファサード Agent を作り、
-    triage から handoff する。外側の共有 context をワークフロー内へ透過できる代わりに、
-    流入時にファサードが LLM を 1 回必ず呼ぶ（tool_choice='required' で強制・非決定・
+    triage から handoff する。ワークフロー起動を tool 往復として履歴・tool フックに残せる
+    代わりに、流入時にファサードが LLM を 1 回必ず呼ぶ（tool_choice='required' で強制・非決定・
     追加 LLM 層 1）。
 
   経路B（HandoffGraph.edge で entry 相当へ直接）: ワークフローを介さず、triage から
@@ -27,7 +27,8 @@ triage エージェントから呼び出す 3 経路で構築し、決定性 / c
 
 違いの要約:
   - 決定性:   C=決定論 / A=非決定（流入 LLM 依存）/ B=非決定（通常 handoff）
-  - context:  C=非透過 / A=透過 / B=通常 handoff の context（ワークフロー外）
+  - context:  C=透過（lib フック捕捉）/ A=透過（tool 経由）/ B=通常 handoff の context
+              （ワークフロー外）
   - LLM 層数: C=+0    / A=+1（ファサード）/ B=+0（ただしワークフロー実行はされない）
 
 Azure OpenAI の環境変数（AZURE_OPENAI_* 。examples/_azure.py 参照）を設定して実行:
@@ -133,7 +134,7 @@ def build_path_a(registry: AgentRegistry, wf: WorkflowGraph) -> HandoffGraph:
     """経路A: ワークフロー tool を持つファサード Agent を handoff ターゲットにする。"""
     wf.validate(registry)
     graph = HandoffGraph(entry="triage")
-    # context 透過の代わりに流入時 LLM 1 回（tool_choice='required'・LLM 層 +1）。
+    # tool 往復を残す代わりに流入時 LLM 1 回（tool_choice='required'・LLM 層 +1）。
     # connect_as_facade が registry 登録 + triage->facade エッジ結線を行い、handoff エッジに
     # 既定 input_filter（直近 1 件）を載せて流入履歴を有界化する（C-10）。
     # 経路A のファサードは LLM を 1 回呼ぶため実モデルが必須（未注入だと SDK デフォルトの
@@ -188,8 +189,8 @@ async def main() -> None:
     reg_b = build_base_registry()
     graph_b = build_path_b(reg_b)
 
-    await _run_one("経路C: as_agent_spec（決定論・context 非透過・LLM +0）", reg_c, graph_c)
-    await _run_one("経路A: as_facade_spec（非決定・context 透過・LLM +1）", reg_a, graph_a)
+    await _run_one("経路C: as_agent_spec（決定論・tool 往復なし・LLM +0）", reg_c, graph_c)
+    await _run_one("経路A: as_facade_spec（非決定・tool 往復あり・LLM +1）", reg_a, graph_a)
     await _run_one("経路B: HandoffGraph.edge で entry 直接（ワークフロー非経由）", reg_b, graph_b)
 
 

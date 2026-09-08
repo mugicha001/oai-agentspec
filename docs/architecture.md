@@ -876,8 +876,9 @@ Microsoft Agent Framework（`WorkflowBuilder`）に倣い、ノードとエッ�
     しない）。
   - `add_function_node(name, *, fn)`: `fn(msg, ctx) -> 出力`（msg = 上流ノードの出力、戻り値 = このノードの
     出力）。`ctx` は SDK の `RunContextWrapper | None` で、利用者が `Runner.run(context=...)` に渡した
-    オブジェクトは `ctx.context` で得る（SDK の動的 instructions / ガードレールと同じ流儀）。経路A では実 wrapper
-    （`ToolContext`）が透過し、経路C では `None`（C-11）。sync / async 両対応。
+    オブジェクトは `ctx.context` で得る（SDK の動的 instructions / ガードレールと同じ流儀）。`Runner.run` 経由の
+    経路A / C / D で実 wrapper が透過する（経路A / D は `ToolContext`、経路C は lib 所有フックが run 開始時に
+    捕捉した `RunContextWrapper`。いずれも実型は SDK のサブクラス）。sync / async 両対応。
   - 同名ノードの二重登録はエラー。
 - エッジ宣言（すべて self を返しチェーン可能）:
   - `add_edge(src, dst)`: src→dst の有向エッジ。端点に `START`（入口）/ `END`（終端）の番兵を使える
@@ -964,8 +965,12 @@ DI 拡張点は「生成 = `AgentBuilder`」「実行 = 内部 runner シーム�
   Runner はこれを最終出力として扱いターンを終える。`stream_response` はエンジンを回しきった後に
   最終出力を `ResponseTextDeltaEvent`（逐次表示用）+ `ResponseCompletedEvent`（終端）で流し
   `Runner.run_streamed` に対応する（エンジンが最終値を返す構造のため進捗的ではない
-  post-execution streaming）。`Model.get_response` は context を受け取れないため、外側 context
-  は engine へ渡さない（context 非伝播のハード制約）。構造化出力は `output_extractor`（既定は最終出力を
+  post-execution streaming）。`Model.get_response` は context 引数を持たないため、外側 context は
+  `as_agent_spec` が `AgentSpec.hooks` へ載せる lib 所有フック（`AgentHooks.on_start`）が run 開始時に
+  捕捉し、現在 span をキーにした弱参照テーブル経由で `get_response` が解決して engine へ渡す
+  （1 `WorkflowModel` につき 1 テーブル。エントリは span の GC で自動的に消える）。捕捉できない場合
+  （`get_response` の直接呼び出し・`spec.hooks` の上書き）は警告・例外なしに `context=None` で回す。
+  構造化出力は `output_extractor`（既定は最終出力を
   単一メッセージ化）で `ModelResponse` の output を組み立てる。`ModelResponse` 構築ヘルパ
   （`_adapters/responses.py` の `text_response`。item 構築は公開応答ビルダと共有する非公開ヘルパへ
   委譲し、ワークフロー用の固定 id を渡す）を `_adapters` 内に置き既定で利用する。streaming イベントの
@@ -973,8 +978,8 @@ DI 拡張点は「生成 = `AgentBuilder`」「実行 = 内部 runner シーム�
   `model` にワークフロー用の値（`msg_workflow` / `resp_workflow` / `oai-agentspec-workflow`）を渡す。
 - `workflow_as_tool(interpret, *, tool_name, tool_description, output_extractor=None) -> FunctionTool`
   （経路A / D 共通）: `on_invoke_tool(tool_context, json)` クロージャ内で `tool_context.context` を内部
-  インタプリタへ受け渡し（不変条件。SDK が自動透過しないため配線欠落は経路A / D でのみ共有 context 欠落の
-  事故になる）、内部インタプリタを回して最終結果を畳む。各 AGENT ノード内側 run の暴走上限（`max_turns`）
+  インタプリタへ受け渡し（不変条件。SDK が自動透過しないため、この配線を欠くと経路A / D で共有 context
+  欠落の事故になる）、内部インタプリタを回して最終結果を畳む。各 AGENT ノード内側 run の暴走上限（`max_turns`）
   等の Runner kwarg はグラフ `run_defaults` / ノード `run_options` で握る（passthrough）。
 - `DeterministicToolCallModel(agents.Model)`（経路D の入口）: 不変設定 tool 名のみ保持するステートレス
   Model。`get_response` は実 LLM を呼ばず、入力を `latest_user_text` で素テキスト化した
@@ -1016,25 +1021,34 @@ DI 拡張点は「生成 = `AgentBuilder`」「実行 = 内部 runner シーム�
 
 | 経路 | 起点 | 決定性 | 外側 context 伝播 | 流入時 LLM 層数 | エンジン制御 |
 |---|---|---|---|---|---|
-| 経路C（主軸） | `WorkflowModel` を据えた Agent | 決定論起動 | 非伝播（ハード制約） | 0（LLM を呼ばない） | あり |
+| 経路C（主軸） | `WorkflowModel` を据えた Agent | 決定論起動 | 伝播（lib 所有フック経由。`Runner.run` を経ない呼び出し・`spec.hooks` 上書き時は非伝播） | 0（LLM を呼ばない） | あり |
 | 経路A（補完） | `as_facade_spec(mode=LLM_INPUT \| LLM_INPUT_OUTPUT)` | 非決定（LLM 1〜2 回） | 透過 | 1〜2 | あり |
 | 経路D | `as_facade_spec(mode=DETERMINISTIC)` の決定論ファサード | 決定論起動 | 透過 | 0（LLM を呼ばない） | あり |
 | 経路B（軽量） | raw Handoff（エントリ Agent 直接） | エントリ Agent 依存 | エントリ Agent が受領 | エントリ Agent 依存 | なし |
 
-- 経路C: `WorkflowModel` が LLM を呼ばずエンジンを回すため決定論的に起動する。外側 run の共有 context は
-  ワークフロー内ステップへ伝播しない（`Model.get_response` に context 引数が無い SDK ハード制約）。tool
-  往復を挟まず最終出力を直接返すため、流入アイテムが最小で session 履歴を汚さない。
+- 経路C: `WorkflowModel` が LLM を呼ばずエンジンを回すため決定論的に起動する。tool 往復を挟まず最終出力を
+  直接返すため、流入アイテムが最小で session 履歴を汚さない。外側 run の共有 context は
+  `as_agent_spec` が `AgentSpec.hooks` へ載せる lib 所有フックが run 開始時に捕捉し、ワークフロー内ステップ
+  （AGENT ノード / FUNCTION ノード / router / ノード前後フック）へ伝播する。伝播の条件は
+  `Runner.run`（`run_streamed` を含む）経由であることと `spec.hooks` を上書きしていないことで、独自の
+  agent 単位フックを併用する場合は `chain_agent_hooks(spec.hooks, 独自フック)` で合成する。条件を満たさない
+  呼び出しは警告・例外なしに `context=None` で回る。tracing 有効時、捕捉エントリ（利用者 context を
+  含む）は run 終了後も tracing exporter の送出が完了するまでメモリに残る（tracing 無効時の
+  `NoOpSpan` は run 終了で即解放される）。span を保持し続ける独自 `TracingProcessor` を登録すると
+  残存期間はそれに追従して延びる。捕捉方式の判断と却下案は
+  `docs/adr/0041-workflow-path-c-context-capture.md` を参照。
 - 経路A: 外側 context を透過できる代わりに、ファサード Agent が実 LLM を呼ぶため起動の決定性は保証され
   ない（`mode=LLM_INPUT` は入力整形で LLM 1 回・出口要約なし、`mode=LLM_INPUT_OUTPUT` は入力整形 +
   tool 結果要約で LLM 2 回）。流入履歴は lib 提供の既定 `input_filter`（直近 1 件）で自動有界化する。
 - 経路D: 入口に決定論ステートレスモデル（`DeterministicToolCallModel`）を据え、実 LLM を呼ばずに毎回
-  ワークフロー tool を強制発火する。経路C が埋められない「決定論 + 外側 context 透過 + LLM 0 回」を満たす
-  （経路C の上位互換ではなく、tool 往復 1 回ぶんのアイテム生成・session 履歴蓄積と引き換え）。
+  ワークフロー tool を強制発火する。ワークフロー起動を tool 往復（tool call / tool output アイテム・
+  `on_tool_start` / `on_tool_end` の発火）として残したい場合の経路で、その代償として session 履歴に
+  アイテムが蓄積する。
 - 経路B: エンジン制御が不要なケース向けの最軽量経路。既存 `HandoffGraph.edge(src, entry_agent)` で表現
   でき新 API を要しない。
 
-経路選択指針: context 透過が不要なら経路C（最軽量・履歴クリーン）、決定論を保ったまま context 透過したい
-なら経路D、入力/出力を実 LLM に整形させたいなら経路A。詳細な検討経緯は
+経路選択指針: 既定は経路C（最軽量・履歴クリーン・決定論起動）。ワークフロー起動を tool 往復として
+session 履歴・tool フックに残したいなら経路D、入力/出力を実 LLM に整形させたいなら経路A。詳細な検討経緯は
 `docs/rationale/workflow-handoff-inflow.md` を参照。
 
 ### build-don't-run の線引き
@@ -1057,7 +1071,7 @@ checkpoint）も持たない。
   `Runner.run(input=...)` の入力が msg になる。実行中の各ノード出力は薄い `NodeResults`（ノード名 → 出力の
   可変記録、run 終了で破棄）に持つ。独立 state（reducer）機構は新設せず、非隣接ノードの値は fan-in か共有
   context で明示的に運ぶ。共有 context は lib が型を規定せずジェネリックに透過し、各 AGENT ノードの
-  `runner.run(context=...)` と各 FUNCTION ノードの `ctx` へ素通しする（経路C では C-11 により ctx は届かない）。
+  `runner.run(context=...)` と各 FUNCTION ノードの `ctx` へ素通しする。
 - 会話履歴は既定で引き回さない（前段出力を明示的に input として渡したときのみ繋がる）。`session` は
   グラフ既定 `run_defaults={"session": ...}` で宣言したときのみ SDK Session へ委譲する（opt-in）。
   fan-out（並列）を含む `WorkflowGraph` に session opt-in を宣言すると、SDK Session の `add_items` が

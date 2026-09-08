@@ -1,5 +1,7 @@
 # Rationale: ワークフロー handoff 流入経路の設計経緯
 
+経路C の外側 context 伝播に関する判断は `docs/adr/0041-workflow-path-c-context-capture.md` で更新した。
+
 本ファイルは不変な検討経緯（immutable）を保持する archival ドキュメントである。
 現在の確定仕様は `docs/architecture.md` を参照すること。本ファイルは実装変更に追随して更新しない。
 

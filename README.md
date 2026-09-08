@@ -328,8 +328,9 @@ result = await Runner.run(registry.get("pipeline_agent"), input="...")
 
 実行口は SDK の `Runner.run` 一本（公開の実行 API は持たない）。ワークフローは Agent
 （`as_agent_spec`・経路C）または tool ファサード（`as_facade_spec`・経路A/D）として消費する。
-内部ノードで外側 context を使いたい場合は経路A/D（`as_facade_spec`）、決定論を保ったまま context
-透過したい場合は `as_facade_spec(mode=FacadeMode.DETERMINISTIC)`（経路D・実 LLM 0 回）。詳細は
+外側 context はいずれの経路でも内部ノードへ届く（経路C は `spec.hooks` の lib 所有フックが捕捉。独自
+フック併用は `chain_agent_hooks` で合成）。起動を tool 往復として履歴・tool フックに残すなら経路D
+（`as_facade_spec(mode=FacadeMode.DETERMINISTIC)`）、入出力を実 LLM に整形させるなら経路A。詳細は
 `docs/architecture.md` のワークフロー節を参照。
 
 ワークフロー実行は SDK tracing に自動配線される。`workflow.run.<graph_name>` を親 span として
@@ -455,7 +456,7 @@ PromptLayout(base="base", parts="parts", agents="agents")
 | `examples/workflow/workflow_04_loop.py` | ワークフロー入門: ループ（offline） |
 | `examples/workflow/workflow_05_combined.py` | ワークフロー入門: 並列 + 合流 + 条件の組み合わせ（offline） |
 | `examples/workflow/workflow_06_conditional_fanout.py` | ワークフロー入門: 条件 fan-out + 動的 fan-in（offline） |
-| `examples/workflow/workflow_07_deterministic_context.py` | ワークフロー入門: 経路D（決定論ファサード・context 透過・実 LLM 0 回。offline） |
+| `examples/workflow/workflow_07_deterministic_context.py` | ワークフロー入門: 経路D（決定論ファサード・tool 往復あり・実 LLM 0 回。offline） |
 | `examples/workflow/workflow_handoff_paths.py` | ワークフロー流入 3 経路（C/A/B）の比較 |
 | `examples/conversation/01_inprocess.py` | 会話 Helper を in-process で利用（send 完結 + stream 逐次） |
 | `examples/conversation/02_session_resume.py` | session_id 連動の永続化と途中再開（resume） |
