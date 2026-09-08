@@ -73,8 +73,8 @@ class FacadeMode(str, Enum):  # noqa: UP042 - 規約で str, Enum 併用を許�
     """ファサード（`as_facade_spec`）の入口モデル種別。
 
     入口に何を据えるかで「実 LLM 呼び出し回数 / 決定性 / 入出力を LLM が整形するか」が変わる。
-    いずれの mode でも外側 context は tool 経由で内部ノードへ透過する（context を渡せない
-    経路C との差別化点）。
+    いずれの mode でも外側 context は tool 経由で内部ノードへ透過する（経路C も lib 所有フックで
+    透過するため、差別化点はワークフロー起動を tool 往復として残す点）。
 
     Attributes:
         DETERMINISTIC: 決定論ステートレスモデルを入口に据える。実 LLM 0 回・決定論。入力は

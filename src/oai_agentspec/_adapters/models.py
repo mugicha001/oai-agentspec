@@ -48,8 +48,11 @@ class WorkflowModel(Model):
     """LLM を呼ばず内部インタプリタを回し最終出力を ModelResponse で返す Model（経路C）。
 
     Runner はこれを最終出力として扱いターンを終える（決定論起動）。`get_response` は
-    SDK 仕様上 run context を受け取れないため、外側 context はワークフロー内ステップへ
-    伝播しない（C-11）。`stream_response` はエンジンを回しきった後に最終出力を
+    SDK 仕様上 run context を受け取れないため、外側 context は `context_resolver`（lib 所有
+    `AgentHooks.on_start` が現在 span をキーに捕捉した `RunContextWrapper` を返す callable）
+    経由で取得し `interpret(context=...)` へ素通しする。捕捉不能時（`Runner.run` を経ない直接
+    呼び出し・hooks の上書き・resolver 未指定）は警告・例外なしに `context=None` で回す。
+    `stream_response` はエンジンを回しきった後に最終出力を
     `ResponseTextDeltaEvent` + `ResponseCompletedEvent` として流す（`Runner.run_streamed` 対応。
     エンジンが最終値を返す構造のため進捗的ではない post-execution streaming）。SDK `Model` ABC
     （get_response / stream_response）へ結合する（NFR-7）。
@@ -60,6 +63,7 @@ class WorkflowModel(Model):
         interpret: Callable[..., Awaitable[WorkflowResult]],
         *,
         output_extractor: Callable[[Any], str] | None = None,
+        context_resolver: Callable[[], Any] | None = None,
     ) -> None:
         """WorkflowModel を生成する。
 
@@ -67,9 +71,12 @@ class WorkflowModel(Model):
             interpret: `(input, *, context=None) -> Awaitable[WorkflowResult]`。内部
                 インタプリタを既定 runner で回すクロージャ。
             output_extractor: 最終出力を単一メッセージ文字列へ変換する関数。None で str 化。
+            context_resolver: 現在 run の `RunContextWrapper`（捕捉不能時は None）を返す
+                callable。`get_response` 1 回につき 1 回呼ぶ。None で常に `context=None`。
         """
         self._interpret = interpret
         self._output_extractor = output_extractor
+        self._context_resolver = context_resolver
 
     async def get_response(
         self,
@@ -82,16 +89,24 @@ class WorkflowModel(Model):
 
         SDK `Model.get_response(system_instructions, input, ...)` の実シグネチャに合わせ
         `input` を第 2 引数として明示束縛する（位置/キーワード両様で受かる）。残りの引数は
-        `*args` / `**kwargs` で吸収し SDK の引数追加に追従する。context は受け取らない
-        （C-11）。SDK が `input` を改名した場合は TypeError 相当で早期検知できる。
+        `*args` / `**kwargs` で吸収し SDK の引数追加に追従する。context は SDK 引数では
+        来ないため `context_resolver` で解決する（捕捉不能時は None）。SDK が `input` を改名した
+        場合は TypeError 相当で早期検知できる。
 
         Returns:
             単一テキストメッセージ・tool/handoff なしの ModelResponse。
         """
+        context = self._context_resolver() if self._context_resolver is not None else None
         # START 入力を正規化し、先頭ノードが生メッセージ列でなく素のテキストを受ける
         # ようにする（[{CONTENT:..}] 問題の解消・FR-10）。
         start_input = latest_user_text(input)
-        result = await self._interpret(start_input)
+        if context is None:
+            # 捕捉不能時は `context=` を渡さず interpret 側の既定値（None）に委ねる
+            # （resolver 導入前と同じ呼び出し形を保ち、既存の interpret 代役を壊さない）。
+            result = await self._interpret(start_input)
+        else:
+            # 捕捉した wrapper は詰め替えずに素通しする（経路A/D の ToolContext と同形）。
+            result = await self._interpret(start_input, context=context)
         if self._output_extractor is not None:
             text = self._output_extractor(result.final_output)
         else:

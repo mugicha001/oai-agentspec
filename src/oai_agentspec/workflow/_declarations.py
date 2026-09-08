@@ -148,7 +148,9 @@ class RunnerSeam(Protocol):
         Args:
             agent: 実行する registry 上のエージェント名。
             input: ノードへの入力（上流出力。string / SDK input-list を期待）。
-            context: 各ノードへ素通しする共有 context（経路A 時のみ非 None・C-11）。
+            context: 各ノードへ素通しする共有 context（`Runner.run` 経由の経路A/C/D で
+                非 None。実型は SDK の `RunContextWrapper` サブクラス。経路C で `hooks` を
+                上書きした場合は None）。
             **runner_kwargs: `Runner.run` へ素通しする残りの kwarg（run_config / session /
                 max_turns 等。グラフ既定 run_defaults + ノード run_options のマージ結果）。
 

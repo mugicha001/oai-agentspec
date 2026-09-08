@@ -15,9 +15,9 @@ LLM に振り分けを委ねると、順序・並列度・合流条件が非決�
 | 条件 | `add_conditional_edges(src, router)` | 分岐条件をコードで書く |
 | fan-in 合流 | `add_fan_in_edge([...], dst)` | 並列結果を統合 |
 | ループ | 条件エッジで戻り先を指す | retry / 反復精緻化 |
-| 経路 C（`as_agent_spec`） | ワークフローを Agent として登録 | 外側 handoff から使う |
-| 経路 A（`as_facade_spec`・既定 `LLM_INPUT`） | tool ファサード（LLM 起点） | 内部ノードで context 透過 |
-| 経路 D（`as_facade_spec(mode=FacadeMode.DETERMINISTIC)`） | 決定論ファサード（LLM 0 回） | 完全決定論・context 透過 |
+| 経路 C（`as_agent_spec`） | ワークフローを Agent として登録（context は伝播。lib 所有フック経由のため `spec.hooks` 上書き時・`Runner.run` を経ない呼び出しでは非伝播） | 外側 handoff から使う。tool 往復なし・実 LLM 0 回 |
+| 経路 A（`as_facade_spec`・既定 `LLM_INPUT`） | tool ファサード（LLM 起点） | tool 往復あり・実 LLM 1 回（入力整形） |
+| 経路 D（`as_facade_spec(mode=FacadeMode.DETERMINISTIC)`） | 決定論ファサード | tool 往復あり・実 LLM 0 回 |
 
 ## 使い方
 
@@ -78,6 +78,8 @@ tracing は自動配線されます（span 構造の詳細は `docs/architecture
 | `output_extractor` | `Callable[[Any], str] \| None` | `None` | 最終出力の文字列化 |
 | `on_node_start` / `on_node_end` | `NodeHook \| None` | `None` | ノードフック |
 
+独自の agent 単位フックを併用する場合は `spec.hooks` を直接上書きせず `chain_agent_hooks(spec.hooks, 独自フック)` で合成する。上書きすると context 捕捉が失われ、内部ノードへは警告・例外なしに `context=None` が渡る（伝播条件の完全な列挙は `docs/architecture.md` の handoff 流入経路節を参照）。
+
 ### `as_facade_spec(name, *, ...)`（経路 A/D）
 
 | パラメータ | 型 | 既定 | 説明 |
@@ -98,9 +100,9 @@ tracing は自動配線されます（span 構造の詳細は `docs/architecture
 ## 判断軸
 
 - 実行順序を LLM に任せてよいなら **handoff** で足りるが、順序・条件を厳格に固定したいなら **WorkflowGraph**
-- 外側 handoff の 1 ノードとして扱いたい → **経路 C（`as_agent_spec`）**
-- 内部ノードで外側 context を参照したい → **経路 A（`as_facade_spec`）**
-- 決定論を保ったまま context 透過（実 LLM 0 回） → **経路 D（`as_facade_spec(mode=FacadeMode.DETERMINISTIC)`）**
+- 外側 handoff の 1 ノードとして扱う既定は **経路 C（`as_agent_spec`）**（最軽量・履歴クリーン・決定論起動）
+- ワークフロー起動を tool 往復として session 履歴・tool フックに残したい → **経路 D（`as_facade_spec(mode=FacadeMode.DETERMINISTIC)`）**
+- 入出力を実 LLM に整形させたい → **経路 A（`as_facade_spec`）**
 
 ## 落とし穴
 
