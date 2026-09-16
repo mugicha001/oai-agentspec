@@ -1,0 +1,4 @@
+# テンプレート: ホスト資産 .github/ISSUE_TEMPLATE/config.yml
+# 固定部分: blank_issues_enabled / contact_links のキー。プレースホルダ部分なし。
+blank_issues_enabled: false
+contact_links: []
