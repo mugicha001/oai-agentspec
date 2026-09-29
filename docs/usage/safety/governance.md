@@ -52,6 +52,25 @@ bundle YAML（`default` + `agents`）からの構築。3 引数以下のため�
 - `unapplied_overrides: frozenset[str]` — 一度も適用されていない override キー（typo 検知）
 - `audit_sink: object | None` — 現在の監査 sink
 
+### `GovernedAgentBuilder.post_processor(*, sub_agent_tools=False, factory_agents=False)`
+
+`sub_agents` の as_tool と `register_factory` の Agent を統治対象に加えるオプトイン。戻り値を `AgentRegistry` の `post_processor` 引数へ渡したときだけ、registry が構築・結線の完了後に統治する（渡さなければ統治は build 時だけで完結する）。ポリシー・監査 sink・override の適用記録は生成元の builder と共有する。
+
+| パラメータ | 型 | 既定 | 説明 |
+|---|---|---|---|
+| `sub_agent_tools` | `bool` | `False` | True で registry が注入した `sub_agents` の as_tool を親エージェントのポリシーで評価・記録する（親の `allowed_tools` に as_tool の公開名を書く） |
+| `factory_agents` | `bool` | `False` | True で `register_factory` の Agent を clone して統治する（factory 名で override を引き当てる・`registry.get` は clone を返す） |
+
+両方 `False` は `ValueError`。
+
+```python
+builder = GovernedAgentBuilder(policy="policy.yaml", audit_sink=my_sink)
+registry = AgentRegistry(
+    agent_builder=builder,  # 装飾 builder で包んでもよい
+    post_processor=builder.post_processor(sub_agent_tools=True, factory_agents=True),
+)
+```
+
 ## 強制点は 2 つ（宣言は共通）
 
 同じ `allowed_tools` / `blocked_patterns` が両方に効きます（ポリシー宣言の規約は 1 本のまま）。
@@ -72,7 +91,10 @@ MCP を使う場合も利用者の記述は変わりません（builder を注�
 ## 落とし穴
 
 - AGT の import は関数内遅延。窓口 import 自体は extra 未導入でも壊れないが、`build()` 実行時にアクセスで例外
-- `sub_agents` の as_tool・`register_factory` 経路は govern 対象外
+- `sub_agents` の as_tool・`register_factory` 経路は既定では govern 対象外。`post_processor(sub_agent_tools=True, factory_agents=True)` を registry の `post_processor` 引数へ渡すと対象になる
+- builder 自体を `AgentRegistry(post_processor=builder)` に渡すと `TypeError`。`builder.post_processor(...)` の戻り値を渡す
+- `sub_agent_tools=True` では as_tool の入力文が監査 `tool:` レコードの `details.arguments` に全文記録される（個人情報等を含みうるため `audit_sink` の永続先を考慮する）
+- 統治済みの Agent（`registry.get` の戻り等）を返す factory を `factory_agents=True` で統治すると、元のポリシーと factory 名のポリシーの両方で評価され、`tool:` レコードが 2 行残る（どちらかが deny なら deny）。境界の詳細は `docs/architecture.md`（AGT ガバナンス節）を参照
 - clone された registry は builder を共有する（監査チェーンが混ざる）。系を分けたい場合は builder を別々に注入
 - **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。同様に `list_prompts` / `get_prompt` / resources 経由で取得した文面を `instructions` 等へ流し込む使い方はツール呼び出しでないため統治対象外
 - origin が取得できない（MCP 由来かどうか判定できない）ツールも同様に評価も監査もされない（fail-open・無警告）
