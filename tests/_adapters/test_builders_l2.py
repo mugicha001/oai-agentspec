@@ -418,6 +418,14 @@ def test_stop_at_resolved_qualified_name_matches_without_warning() -> None:
     _assert_no_warning(agent)
 
 
+def test_stop_at_resolved_namespaced_tool_bare_name_matches_without_warning() -> None:
+    """name と qualified_name が異なるツールも素の name 一致で通る（SDK は name でも停止する）。"""
+    (namespaced,) = tool_namespace(name="billing", description="d", tools=[get_order])
+    assert namespaced.name != namespaced.qualified_name
+    agent = _router([namespaced], {"stop_at_tool_names": ["get_order"]})
+    _assert_no_warning(agent)
+
+
 def test_stop_at_resolved_disabled_tool_is_still_candidate() -> None:
     """is_enabled=False のツール名も候補に含まれ、一致すれば警告しない。"""
     agent = _router([_disabled_impl], {"stop_at_tool_names": ["disabled_tool"]})
@@ -443,6 +451,26 @@ def test_stop_at_resolved_mismatch_warns_full_message() -> None:
         "['researcher']（候補: ['ask_researcher', 'get_order', 'refund']）。"
         "この名前では停止しません"
     )
+
+
+def test_stop_at_resolved_mismatch_lists_candidates_sorted() -> None:
+    """候補一覧は sorted 済みで列挙される。
+
+    候補 3 件では set の反復順が偶然 sorted 順と一致するハッシュシードがあり、sorted の
+    退行を見逃す。候補を 8 件にして偶然一致をほぼ起こらなくする。
+    """
+
+    def _noop(x: str) -> str:
+        """ダミーのツール本体。"""
+        return x
+
+    names = ["tool_h", "tool_c", "tool_f", "tool_a", "tool_g", "tool_b", "tool_e", "tool_d"]
+    tools = [function_tool(_noop, name_override=n) for n in names]
+    agent = _router(tools, {"stop_at_tool_names": ["missing"]})
+    with pytest.warns(RuntimeWarning) as records:
+        _adapters.check_stop_at_tool_names_resolved("router", agent)
+    assert len(records) == 1
+    assert f"（候補: {sorted(names)}）" in str(records[0].message)
 
 
 def test_stop_at_resolved_mismatch_lists_names_in_declared_order() -> None:
