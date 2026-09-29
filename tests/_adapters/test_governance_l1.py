@@ -5,7 +5,13 @@
 エスケープ正規化照合 / パース不能フォールバック）、`_field_default`（default /
 default_factory / 必須）を直接検証する。加えて `_make_audit_hooks` の MCP ツール評価
 （origin 判定 / 記録順 / fail-closed / agent_id / 利用者フック非到達 / policy 既定 None での
-非評価）を fake sink・fake policy・fake 拒否例外の注入で検証する。
+非評価）を fake sink・fake policy・fake 拒否例外の注入で検証する。統治済みの判定
+（`_is_governed`: `_govern_tool` が作ったラッパ関数を弱参照で登録した `_GOVERNED_WRAPPERS` との
+同一性照合）と registry 第 3 段 post-process の実体（spec 経路の `govern_ungoverned_tools`・
+factory 経路の `govern_agent`）は `_require_agt` を fake 3 つ組へ差し替え、登録・同一性による
+判定（属性の偽造 / wraps コピー / hash・eq 委譲プロキシ / ハッシュ不能な呼び出し可能オブジェクトは
+未統治）・弱参照保持・同一 list の要素置換・clone の非汚染・as_tool メタ保持・1 呼び出し
+1 レコード・run 単位フック拒否を検証する。
 
 ポリシー評価は原則 fake policy（呼び出し記録付き）を注入し AGT 非依存で検証する。実
 `GovernancePolicy`（dataclass フィールド集合と照合実装が挙動を決める）が必要なのは、YAML 読込と
@@ -16,22 +22,36 @@ skip する。
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import gc
 import warnings
+import weakref
 from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from agents import FunctionTool, ToolOrigin, ToolOriginType
+from agents import Agent, FunctionTool, ToolOrigin, ToolOriginType
+from agents.lifecycle import AgentHooksBase, RunHooksBase
+from agents.tool import get_function_tool_origin
 from agents.tool_context import ToolContext
 
+from oai_agentspec import AgentSpec
+from oai_agentspec._adapters import governance as governance_module
 from oai_agentspec._adapters.governance import (
+    _GOVERNED_WRAPPERS,
     _evaluate_tool,
     _field_default,
     _govern_tool,
     _load_policy,
     _make_audit_hooks,
+    _register_governed,
     _require_agt,
+    govern_agent,
+    govern_spec,
+    govern_ungoverned_tools,
 )
 
 pytestmark = pytest.mark.unit
@@ -988,3 +1008,467 @@ async def test_deny_exception_details_on_govern_tool_path() -> None:
 
     assert excinfo.value.details == {"tool_name": "shell_exec", "reason": "tool not allowed"}
     assert invoked == []  # 実ツール本体は実行されない
+
+
+# ----------------------------------------------------------------------
+# 統治済みの印・govern_ungoverned_tools・govern_agent（registry 第 3 段 post-process の実体）
+# ----------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_agt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_require_agt` を fake 3 つ組（policy 型 / sink 型 / 拒否例外）へ差し替える（AGT 非依存）。
+
+    `govern_spec` / `govern_ungoverned_tools` / `govern_agent` は `_require_agt()` の戻りから
+    拒否例外を取るため、`_DenyExc` が `denied_exc` として使われる。policy はオブジェクト形
+    （`_FakePolicy`）で渡すため `_load_policy` は素通し検証のみ行う。
+    """
+    monkeypatch.setattr(governance_module, "_require_agt", lambda: (object, _Sink, _DenyExc))
+
+
+def _is_governed(tool: Any) -> bool:
+    """実装の統治済み判定（`_is_governed`）を通した結果を返す。"""
+    return governance_module._is_governed(tool) is True
+
+
+def _governed_tool(
+    name: str = "t", *, origin_type: ToolOriginType = ToolOriginType.FUNCTION
+) -> FunctionTool:
+    """`_govern_tool` で統治ラップした `FunctionTool` を作る（実装が登録した統治済み tool）。"""
+    return governance_module._govern_tool(
+        _origin_tool(name, origin_type=origin_type),
+        policy=_FakePolicy(),
+        sink=_Sink(),
+        denied_exc=_DenyExc,
+        agent_name="bot",
+    )
+
+
+class _DelegatingProxy:
+    """統治済みラッパへ `__call__` / `__hash__` / `__eq__` / 属性参照を委譲するプロキシ。
+
+    hash / eq に依存する所属判定（set / WeakSet / dict のキー照合）では統治済みラッパと
+    区別できない。同一性（`is`）で判定する実装だけが未統治と判定できる。
+    """
+
+    def __init__(self, target: Any) -> None:
+        self._target = target
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._target(*args, **kwargs)
+
+    def __hash__(self) -> int:
+        return hash(self._target)
+
+    def __eq__(self, other: object) -> bool:
+        return other is self._target or other is self or self._target == other
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._target, item)
+
+
+class _UnhashableCallable:
+    """`__hash__ = None` の呼び出し可能インスタンス（ハッシュ依存の判定で TypeError を誘発）。"""
+
+    __hash__ = None  # type: ignore[assignment]
+
+    async def __call__(self, ctx: Any, input_json: str) -> str:
+        return "ok"
+
+
+def _is_wrapped(result: FunctionTool, original: FunctionTool) -> bool:
+    """`result` が `original` の govern ラップ（別オブジェクト・実行本体差し替え・名前不変）か。"""
+    return (
+        result is not original
+        and result.on_invoke_tool is not original.on_invoke_tool
+        and result.name == original.name
+    )
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_govern_spec_outputs_are_marked() -> None:
+    """`govern_spec` のラップ済み tool は統治済みと判定され、元 tool はされない。"""
+    fn_tool = _origin_tool("echo", origin_type=ToolOriginType.FUNCTION)
+    dummy = object()
+    spec = AgentSpec(name="bot", instructions="i", tools=[fn_tool, dummy])
+
+    governed = govern_spec(spec, policy=_FakePolicy(), audit_sink=_Sink())
+
+    assert _is_wrapped(governed.tools[0], fn_tool)
+    assert _is_governed(governed.tools[0])
+    assert governed.tools[1] is dummy
+    # 元 tool は統治済みとして登録されない（非破壊）。
+    assert _is_governed(fn_tool) is False
+    assert spec.tools[0] is fn_tool
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_govern_ungoverned_tools_replaces_elements_in_same_list() -> None:
+    """同じ list オブジェクトの要素だけを置換し、統治済み・非 FunctionTool・hooks は同一のまま残す。
+
+    list を再束縛すると、結線の途中で作られた clone（SDK の clone は tools list を共有する）に
+    統治が届かないため、`agent.tools is tools_list` を固定する。置換された要素は統治ラップ
+    （評価 -> allow 記録 -> 実関数実行）で、統治済みと判定される。戻り値は None。
+    """
+    sink = _Sink()
+    invoked: list[str] = []
+    marked = _governed_tool("pre")
+    fn_tool = _origin_tool("echo", origin_type=ToolOriginType.AGENT_AS_TOOL, invoked=invoked)
+    dummy = object()
+    tools_list: list[Any] = [marked, fn_tool, dummy]
+    inner_hooks = AgentHooksBase()
+    agent = Agent(name="bot", instructions="i", tools=tools_list, hooks=inner_hooks)
+
+    result = govern_ungoverned_tools(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="bot")
+
+    assert result is None
+    assert agent.tools is tools_list
+    assert len(tools_list) == 3
+    assert tools_list[0] is marked
+    assert _is_wrapped(tools_list[1], fn_tool)
+    assert _is_governed(tools_list[1])
+    assert tools_list[2] is dummy
+    assert agent.hooks is inner_hooks
+
+    await tools_list[1].on_invoke_tool(_tool_ctx("echo", '{"q": "x"}'), '{"q": "x"}')
+    assert sink.records == [("bot", "tool:echo", "allow", {"arguments": '{"q": "x"}'})]
+    assert invoked == ['{"q": "x"}']
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "marked",
+        "unmarked_function",
+        "unmarked_agent_as_tool",
+        "forged_attribute",
+        "wraps_copy",
+        "delegating_proxy",
+        "unhashable_callable",
+        "non_function_tool",
+    ],
+)
+@pytest.mark.usefixtures("fake_agt")
+def test_ungoverned_predicate_by_marker(case: str) -> None:
+    """統治済みは `_govern_tool` が作ったラッパ関数そのもの（同一性）だけで判定する。
+
+    - marked: `_govern_tool` 産の tool は skip（同一オブジェクトのまま残る）
+    - unmarked_function / unmarked_agent_as_tool: 未統治の FunctionTool はラップ（origin 不問）
+    - forged_attribute: 旧印の属性 `__oai_agentspec_governed__` を手で True にしてもラップ
+    - wraps_copy: `functools.wraps(統治済み関数)(別関数)` の属性コピーでもラップ
+    - delegating_proxy: hash / eq / 属性を統治済みラッパへ委譲するプロキシでもラップ
+    - unhashable_callable: `__hash__ = None` の呼び出し可能インスタンスでも例外にせずラップ
+    - non_function_tool: 非 FunctionTool は素通し
+
+    偽造・コピー・委譲・ハッシュ不能はすべて「ラップされる」側（fail-closed）で固定する。
+    「何もしない」への退行は未統治のケースで、「全部ラップ」への退行は marked で検知する。
+    """
+    tool: Any
+    expect_wrapped = True
+    if case == "non_function_tool":
+        tool, expect_wrapped = object(), False
+    elif case == "marked":
+        tool, expect_wrapped = _governed_tool(), False
+    elif case == "unmarked_function":
+        tool = _origin_tool("t", origin_type=ToolOriginType.FUNCTION)
+    elif case == "unmarked_agent_as_tool":
+        tool = _origin_tool("t", origin_type=ToolOriginType.AGENT_AS_TOOL)
+    elif case == "forged_attribute":
+        tool = _origin_tool("t", origin_type=ToolOriginType.FUNCTION)
+        tool.on_invoke_tool.__oai_agentspec_governed__ = True  # type: ignore[attr-defined]
+    else:
+        governed_fn = _governed_tool().on_invoke_tool
+        base = _origin_tool("t", origin_type=ToolOriginType.FUNCTION)
+        replacement: Any
+        if case == "wraps_copy":
+
+            async def _other(ctx: Any, input_json: str) -> str:
+                return "other"
+
+            replacement = functools.wraps(governed_fn)(_other)
+        elif case == "delegating_proxy":
+            replacement = _DelegatingProxy(governed_fn)
+            assert hash(replacement) == hash(governed_fn)
+            assert replacement == governed_fn
+        else:
+            replacement = _UnhashableCallable()
+        tool = dataclasses.replace(base, on_invoke_tool=replacement)
+
+    agent = Agent(name="bot", instructions="i", tools=[tool])
+    govern_ungoverned_tools(agent, policy=_FakePolicy(), audit_sink=_Sink(), agent_name="bot")
+
+    if expect_wrapped:
+        assert _is_governed(tool) is False
+        assert _is_wrapped(agent.tools[0], tool)
+        assert _is_governed(agent.tools[0])
+    else:
+        assert agent.tools[0] is tool
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_governed_wrappers_are_held_weakly() -> None:
+    """`_GOVERNED_WRAPPERS` はラッパ関数を弱参照で持ち、GC 後に当該 id のエントリが消える。
+
+    登録簿がラッパを強参照で持つ変異（dict に関数そのものを入れる等）では weakref が死なず、
+    エントリも残るため検知できる。
+    """
+    tool = _governed_tool()
+    fn = tool.on_invoke_tool
+    fn_id = id(fn)
+    fn_ref = weakref.ref(fn)
+    wrappers = _GOVERNED_WRAPPERS
+    assert fn_id in wrappers
+    assert wrappers[fn_id]() is fn
+    assert _is_governed(tool)
+
+    del tool, fn
+    gc.collect()
+
+    assert fn_ref() is None
+    assert fn_id not in wrappers
+
+
+def test_drop_callback_keeps_newer_entry_with_same_id() -> None:
+    """削除コールバックは同じ id の新しいエントリを消さない。
+
+    通常経路では到達しない防御条件の pin。登録した関数の弱参照（旧 ref）を保持したまま
+    同じ id のエントリを別の弱参照へ差し替え、元の関数を GC させる。旧 ref の
+    コールバックが発火しても、差し替え後のエントリは残る。旧 ref を保持しないと旧 ref が
+    先に解放されコールバックが発火しないため、変数で保持する。
+    """
+
+    def old() -> None:
+        return None
+
+    def other() -> None:
+        return None
+
+    _register_governed(old)
+    kid = id(old)
+    old_ref = _GOVERNED_WRAPPERS[kid]
+    new_ref = weakref.ref(other)
+    _GOVERNED_WRAPPERS[kid] = new_ref
+    try:
+        del old
+        gc.collect()
+
+        assert old_ref() is None
+        assert _GOVERNED_WRAPPERS.get(kid) is new_ref
+    finally:
+        _GOVERNED_WRAPPERS.pop(kid, None)
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_govern_agent_clone_does_not_mutate_source() -> None:
+    """`govern_agent` は別インスタンスを返し、元 Agent の tools / hooks を一切変えない。"""
+    sink = _Sink()
+    fn_tool = _origin_tool("echo", origin_type=ToolOriginType.FUNCTION)
+    dummy = object()
+    tools_list: list[Any] = [fn_tool, dummy]
+    inner = AgentHooksBase()
+    agent = Agent(name="bot", instructions="i", tools=tools_list, hooks=inner)
+
+    result = govern_agent(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="bot")
+
+    assert result is not agent
+    # 元 Agent は不変（list も各要素も hooks も同一オブジェクト）。
+    assert agent.tools is tools_list
+    assert len(agent.tools) == 2
+    assert agent.tools[0] is fn_tool
+    assert agent.tools[1] is dummy
+    assert agent.hooks is inner
+    # 戻り値側はラップ・合成済み。
+    assert result.tools is not tools_list
+    assert _is_wrapped(result.tools[0], fn_tool)
+    assert result.tools[1] is dummy
+    assert result.hooks is not None
+    assert result.hooks is not inner
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_govern_tool_preserves_agent_as_tool_metadata() -> None:
+    """SDK 実 `Agent.as_tool` 生成物をラップしても as_tool メタ（origin / 内部属性）を保つ。"""
+    sub = Agent(name="sub", instructions="x")
+    original = sub.as_tool(tool_name=None, tool_description=None)
+    agent = Agent(name="bot", instructions="i", tools=[original])
+
+    result = govern_agent(agent, policy=_FakePolicy(), audit_sink=_Sink(), agent_name="bot")
+    wrapped = result.tools[0]
+
+    assert _is_wrapped(wrapped, original)
+    origin = get_function_tool_origin(wrapped)
+    assert origin is not None
+    assert origin.type == ToolOriginType.AGENT_AS_TOOL
+    assert wrapped._is_agent_tool is True
+    assert wrapped._agent_instance is sub
+    assert wrapped.name == original.name
+    assert set(vars(wrapped)) == set(vars(original))
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_governed_agent_tool_single_record_per_call() -> None:
+    """ラップ済み AGENT_AS_TOOL の 1 呼び出しで `tool:` レコードは 1 件（フックは評価しない）。
+
+    合成 hooks の `on_tool_start` と実行本体（`on_invoke_tool`）を 1 回ずつ通し、記録列全体を
+    `==` で固定する（フックが AGENT_AS_TOOL を評価へ回す退行で `tool:` が 2 件になる）。
+    """
+    sink = _Sink()
+    invoked: list[str] = []
+    tool = _origin_tool("sub", origin_type=ToolOriginType.AGENT_AS_TOOL, invoked=invoked)
+    agent = Agent(name="bot", instructions="i", tools=[tool])
+    governed = govern_agent(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="bot")
+    wrapped = governed.tools[0]
+    args = '{"input": "hi"}'
+
+    await governed.hooks.on_tool_start(_tool_ctx("sub", args), governed, wrapped)
+    await wrapped.on_invoke_tool(_tool_ctx("sub", args), args)
+
+    assert sink.records == [
+        ("bot", "tool_start:sub", "allow", None),
+        ("bot", "tool:sub", "allow", {"arguments": args}),
+    ]
+    assert invoked == [args]
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_govern_agent_rejects_run_scope_hooks() -> None:
+    """`agent.hooks` が run 単位フック（`RunHooksBase`）なら `chain_hooks` 案内付き TypeError。
+
+    SDK `Agent` は hooks の型検査で `RunHooksBase` を拒否するため duck 型の Agent を使う。
+    """
+    agent = SimpleNamespace(name="bot", tools=[], hooks=RunHooksBase())
+
+    with pytest.raises(TypeError, match="chain_hooks"):
+        govern_agent(agent, policy=_FakePolicy(), audit_sink=_Sink(), agent_name="bot")
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_govern_agent_mcp_deny_records_registered_name_not_agent_name() -> None:
+    """factory 経路の MCP deny は合成フックへ渡したポリシーで評価し、`tool:` 行は登録名で残す。
+
+    登録名（`agent_name="svc"`）と Agent 名（"inner"）を別にし、`tool:` 行の agent_id が
+    登録名であることを固定する（Agent 名を渡す退行を検知）。deny 例外の送出で、合成フックへ
+    ポリシーが渡っていること（`policy=None` への退行で評価されず素通しになる）も固定する。
+    """
+    sink = _Sink()
+    tool = _origin_tool("mcp_read")
+    agent = Agent(name="inner", instructions="i", tools=[tool])
+    governed = govern_agent(
+        agent,
+        policy=_FakePolicy(tool_reason="tool not allowed"),
+        audit_sink=sink,
+        agent_name="svc",
+    )
+
+    with pytest.raises(_DenyExc, match="mcp_read"):
+        await governed.hooks.on_tool_start(
+            _tool_ctx("mcp_read", '{"q": "x"}'), governed, governed.tools[0]
+        )
+
+    assert [(r[0], r[1], r[2]) for r in sink.records if r[1].startswith("tool:")] == [
+        ("svc", "tool:mcp_read", "deny")
+    ]
+
+
+class _RecordingAgentHooks(AgentHooksBase[Any, Any]):
+    """`AgentHooksBase` 派生の利用者フック（呼び出し時点の sink 記録列を控える）。"""
+
+    def __init__(self, sink: _Sink) -> None:
+        """観測対象の sink を保持する。"""
+        self.sink = sink
+        self.started: list[list[tuple[Any, str, str, dict[str, Any] | None]]] = []
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        """呼ばれた時点の sink 記録列のスナップショットを積む（監査記録との前後関係の観測用）。"""
+        self.started.append(list(self.sink.records))
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_govern_agent_chains_agent_hooks_subclass_after_audit() -> None:
+    """`AgentHooksBase` 派生の利用者フックも合成され、監査記録の後に呼ばれる。
+
+    合成対象から `AgentHooksBase` インスタンスを落とす退行（duck 型だけ合成する等）を検知する
+    ため、duck 型でなく `AgentHooksBase` のサブクラスを使う。利用者フックが呼ばれた時点で
+    `agent_start` が記録済みであることで「監査が先・利用者が後」の順を固定する。
+    """
+    sink = _Sink()
+    user_hooks = _RecordingAgentHooks(sink)
+    agent = Agent(name="inner", instructions="i", hooks=user_hooks)
+    governed = govern_agent(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="svc")
+
+    await governed.hooks.on_start(None, governed)
+
+    assert user_hooks.started == [[("inner", "agent_start", "allow", None)]]
+    assert sink.records == [("inner", "agent_start", "allow", None)]
+
+
+class _PolicyWithoutMethods:
+    """`check_tool` / `check_content` を持たないポリシーもどき。"""
+
+
+def _call_govern_agent(policy: object, sink: _Sink, agent: Any) -> Any:
+    """`govern_agent` を登録名 "svc" で呼ぶ（parametrize 用の呼び出し形統一）。"""
+    return govern_agent(agent, policy=policy, audit_sink=sink, agent_name="svc")
+
+
+def _call_govern_ungoverned_tools(policy: object, sink: _Sink, agent: Any) -> Any:
+    """`govern_ungoverned_tools` を登録名 "svc" で呼び、その場で統治した agent を返す。"""
+    govern_ungoverned_tools(agent, policy=policy, audit_sink=sink, agent_name="svc")
+    return agent
+
+
+_POST_PROCESS_FUNCS = pytest.mark.parametrize(
+    "call",
+    [_call_govern_agent, _call_govern_ungoverned_tools],
+    ids=["govern_agent", "govern_ungoverned_tools"],
+)
+
+
+@_POST_PROCESS_FUNCS
+@pytest.mark.usefixtures("fake_agt")
+def test_post_process_rejects_policy_without_check_methods(call: Any) -> None:
+    """評価メソッドを持たないポリシーは第 3 段 post-process の両入口で build 時 TypeError。
+
+    tools を空にし、ツール評価の遅延エラーではなく入口でのポリシー解決が送出源であることを
+    固定する（解決を飛ばす退行では例外が出ない）。
+    """
+    agent = Agent(name="inner", instructions="i", tools=[])
+
+    with pytest.raises(TypeError, match="check_tool"):
+        call(_PolicyWithoutMethods(), _Sink(), agent)
+
+
+@_POST_PROCESS_FUNCS
+@pytest.mark.parametrize("as_path", [False, True], ids=["str", "pathlike"])
+async def test_post_process_resolves_yaml_policy_path(
+    call: Any, as_path: bool, tmp_path: Path
+) -> None:
+    """YAML パスを渡すと両入口とも実 `GovernancePolicy` へ解決し、その allowlist で deny する。
+
+    実 AGT を使う（fake の policy 型は YAML を構築できないため）。allowlist 外のツールを
+    ラップ済み実行本体で呼び、実 `PolicyViolationError` が送出されて実関数が呼ばれないこと、
+    および許可ツールは実行されることで、パスが解決されポリシーとして使われたことを観測する
+    （解決を飛ばす退行では str に `check_tool` が無く `AttributeError` になる）。
+    """
+    _agt_policy_cls()  # extra 未導入環境では skip
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text('allowed_tools: ["lookup"]\n', encoding="utf-8")
+    policy: Any = policy_path if as_path else str(policy_path)
+    denied_exc = governance_module.policy_violation_error_type()
+    sink = _Sink()
+    invoked: list[str] = []
+    allowed = _origin_tool("lookup", origin_type=ToolOriginType.FUNCTION, invoked=invoked)
+    blocked = _origin_tool("shell", origin_type=ToolOriginType.FUNCTION, invoked=invoked)
+    agent = Agent(name="inner", instructions="i", tools=[allowed, blocked])
+
+    governed = call(policy, sink, agent)
+
+    await governed.tools[0].on_invoke_tool(_tool_ctx("lookup", "{}"), "{}")
+    with pytest.raises(denied_exc, match="shell"):
+        await governed.tools[1].on_invoke_tool(_tool_ctx("shell", "{}"), "{}")
+
+    assert invoked == ["{}"]  # 許可ツールのみ実行された
+    assert [(r[0], r[1], r[2]) for r in sink.records] == [
+        ("svc", "tool:lookup", "allow"),
+        ("svc", "tool:shell", "deny"),
+    ]

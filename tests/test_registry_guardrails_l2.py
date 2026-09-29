@@ -109,12 +109,16 @@ def _registry(provider: Any | None = None) -> AgentRegistry:
 
 
 def test_init_signature_keeps_positional_agent_builder() -> None:
-    """`agent_builder` は位置引数のまま・`guardrail_registry` は keyword-only 既定 None。"""
+    """`agent_builder` は位置引数のまま・kw-only の 2 引数は既定 None。
+
+    kw-only の 2 引数は `guardrail_registry` と `post_processor`。
+    """
     params = inspect.signature(AgentRegistry.__init__).parameters
-    assert list(params) == ["self", "agent_builder", "guardrail_registry"]
+    assert list(params) == ["self", "agent_builder", "guardrail_registry", "post_processor"]
     assert params["agent_builder"].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert params["guardrail_registry"].kind is inspect.Parameter.KEYWORD_ONLY
-    assert params["guardrail_registry"].default is None
+    for name in ("guardrail_registry", "post_processor"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params[name].default is None
 
 
 def test_registry_without_provider_builds_as_before() -> None:

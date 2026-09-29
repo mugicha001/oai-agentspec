@@ -29,6 +29,7 @@ pin する（SDK が MCP を専用 dispatch へ移す退行を、build 後注入
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import inspect
 import re
@@ -45,7 +46,7 @@ pytest.importorskip(
 pytest.importorskip("mcp", reason="mcp（openai-agents の依存）未導入")
 
 import agents.tool as sdk_tool  # noqa: E402
-from agents import FunctionTool, Runner, ToolOrigin, ToolOriginType, UserError  # noqa: E402
+from agents import Agent, FunctionTool, Runner, ToolOrigin, ToolOriginType, UserError  # noqa: E402
 from agents.lifecycle import AgentHooksBase, RunHooksBase  # noqa: E402
 from agents.mcp import MCPServer  # noqa: E402
 from agents.mcp.util import MCPUtil  # noqa: E402
@@ -56,9 +57,18 @@ from mcp.types import Tool as MCPTool  # noqa: E402
 from openai_agents_trust import AuditLog, GovernancePolicy  # noqa: E402
 
 from oai_agentspec import AgentRegistry, AgentSpec, function_tool  # noqa: E402
-from oai_agentspec._adapters import govern_spec, new_audit_sink  # noqa: E402
+from oai_agentspec._adapters import (  # noqa: E402
+    govern_agent,
+    govern_spec,
+    govern_ungoverned_tools,
+    new_audit_sink,
+)
 from oai_agentspec._adapters import governance as governance_module  # noqa: E402
-from oai_agentspec._adapters.governance import _make_audit_hooks  # noqa: E402
+from oai_agentspec._adapters.governance import (  # noqa: E402
+    _govern_tool,
+    _is_governed,
+    _make_audit_hooks,
+)
 from oai_agentspec.runtime.governance import GovernedAgentBuilder  # noqa: E402
 
 from _helpers.fake_model import FakeModel  # noqa: E402
@@ -286,6 +296,89 @@ async def test_blocked_patterns_deny_json_escaped_arguments() -> None:
     with pytest.raises(PolicyViolationError, match="blocked pattern"):
         await governed.on_invoke_tool(_tool_ctx("sh", escaped), escaped)
     assert calls == []  # 実関数は非実行
+
+
+# ----------------------------------------------------------------------
+# govern_agent / govern_ungoverned_tools（構築済み実 Agent への統治焼き込み・実 AGT）
+# ----------------------------------------------------------------------
+
+
+async def test_govern_agent_allow_deny_records_same_shape() -> None:
+    """`govern_agent` 経由のラップも allow / deny の監査レコードと拒否 payload が同形になる。
+
+    allow は `details == {"arguments": ...}`、deny は `PolicyViolationError.details ==
+    {"tool_name", "reason"}`（引数は載らない）と sink の `{"reason", "arguments"}`。`govern_agent`
+    は clone を返す factory 経路専用のため、元 Agent の tool は不変であることも固定する。
+    """
+    calls: list[str] = []
+    tool = _make_tool(calls)
+    src = Agent(name="bot", instructions="i", tools=[tool])
+
+    allow_sink = AuditLog()
+    allowed = govern_agent(
+        src,
+        policy=GovernancePolicy(name="p", allowed_tools=["echo"]),
+        audit_sink=allow_sink,
+        agent_name="bot",
+    )
+    out = await allowed.tools[0].on_invoke_tool(
+        _tool_ctx("echo", '{"text": "hi"}'), '{"text": "hi"}'
+    )
+    assert out == "echo:hi"
+    assert calls == ["hi"]
+    assert [(e.agent_id, e.action, e.decision, e.details) for e in allow_sink.get_entries()] == [
+        ("bot", "tool:echo", "allow", {"arguments": '{"text": "hi"}'})
+    ]
+
+    deny_sink = AuditLog()
+    denied = govern_agent(
+        src,
+        policy=GovernancePolicy(name="p", allowed_tools=[]),  # 空 allowlist = 全拒否
+        audit_sink=deny_sink,
+        agent_name="bot",
+    )
+    with pytest.raises(PolicyViolationError, match="echo") as excinfo:
+        await denied.tools[0].on_invoke_tool(_tool_ctx("echo", '{"text": "x"}'), '{"text": "x"}')
+    assert calls == ["hi"]  # 拒否側では実関数を実行しない
+
+    entries = deny_sink.get_entries()
+    assert [(e.agent_id, e.action, e.decision) for e in entries] == [("bot", "tool:echo", "deny")]
+    reason = entries[0].details["reason"]
+    assert isinstance(reason, str) and reason
+    assert entries[0].details == {"reason": reason, "arguments": '{"text": "x"}'}
+    assert excinfo.value.details == {"tool_name": "echo", "reason": reason}
+    assert src.tools == [tool]  # clone 経路は元 Agent を変えない
+    assert src.tools[0] is tool
+
+
+async def test_govern_ungoverned_tools_keeps_sdk_agent_runnable() -> None:
+    """`govern_ungoverned_tools` で統治した実 Agent は同一 list・hooks 不変のまま Runner で動く。
+
+    spec 経路の第 3 段は hooks を再合成しないため、`agent.hooks is None` の Agent では記録は
+    実行本体ラップ由来の `tool:` 1 行だけになる（記録列全体を `==` で固定する）。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+    model = FakeModel().queue_tool_call("echo", '{"text": "hi"}').queue_text("done")
+    tools = [_make_tool(calls)]
+    agent = Agent(name="bot", instructions="i", model=model, tools=tools)
+
+    govern_ungoverned_tools(
+        agent,
+        policy=GovernancePolicy(name="p", allowed_tools=["echo"]),
+        audit_sink=sink,
+        agent_name="bot",
+    )
+
+    assert agent.tools is tools
+    assert agent.hooks is None
+    result = await Runner.run(agent, input="go")
+    assert result.final_output == "done"
+    assert calls == ["hi"]
+    assert [(e.agent_id, e.action, e.decision, e.details) for e in sink.get_entries()] == [
+        ("bot", "tool:echo", "allow", {"arguments": '{"text": "hi"}'})
+    ]
+    assert sink.verify_chain() is True
 
 
 # ----------------------------------------------------------------------
@@ -1284,3 +1377,723 @@ async def test_agent_hooks_replacement_drops_mcp_enforcement_not_spec_tools() ->
     assert [(e.agent_id, e.action, e.decision) for e in tool_sink.get_entries()] == [
         ("bot", "tool:echo", "deny"),
     ]
+
+
+# ----------------------------------------------------------------------
+# registry 第 3 段 post-process: 既定不変の pin と sub_agents / factory のオプトイン統治
+#
+# 1 つの registry に sub agent（`researcher`）・親（`support`: `spec.tools` の関数ツール +
+# 利用者が直接置いた as_tool + wire 注入の `researcher` as_tool + 部分実装 hooks）・factory
+# （`legacy`）を載せ、FakeModel で各ツールを 1 回ずつ呼ばせる。
+# ----------------------------------------------------------------------
+
+_MIXED_ALLOWED = ["fn_r", "fn_s", "fn_l", "direct_tool", "researcher"]
+
+
+class _SinkObservingHooks:
+    """利用者の `spec.hooks`（duck-typed 部分実装）。到達時の sink 末尾 action を併記する。
+
+    `on_start` / `on_end` / `on_tool_start` / `on_tool_end` のみを持つ（`on_handoff` /
+    `on_llm_*` を持たない部分実装）。到達時点の sink 末尾を併記することで、「監査記録が先・
+    利用者フックへの委譲が後」の順を記録列として観測する。
+    """
+
+    def __init__(self, sink: AuditLog) -> None:
+        """観測対象の sink と記録リストを初期化する。"""
+        self._sink = sink
+        self.events: list[tuple[str, str | None]] = []
+
+    def _last_action(self) -> str | None:
+        entries = self._sink.get_entries()
+        return entries[-1].action if entries else None
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        self.events.append((f"start:{agent.name}", self._last_action()))
+
+    async def on_end(self, context: Any, agent: Any, output: Any) -> None:
+        self.events.append((f"end:{agent.name}", self._last_action()))
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        self.events.append((f"tool_start:{tool.name}", self._last_action()))
+
+    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+        self.events.append((f"tool_end:{tool.name}", self._last_action()))
+
+
+@dataclasses.dataclass
+class _MixedRegistry:
+    """`_mixed_registry` が組んだ registry と観測点の束。"""
+
+    registry: AgentRegistry
+    sink: AuditLog
+    hooks: _SinkObservingHooks
+    calls: dict[str, list[str]]
+    support_model: FakeModel
+    researcher_model: FakeModel
+    direct_model: FakeModel
+    legacy_model: FakeModel
+    legacy_original: list[Agent]
+
+
+def _mixed_registry(
+    *,
+    allowed_tools: list[str],
+    sub_agent_tools: bool | None = None,
+    factory_agents: bool | None = None,
+    support_tool_calls: list[tuple[str, str]] | None = None,
+) -> _MixedRegistry:
+    """sub agent / 親 / factory を 1 つの registry に載せる。
+
+    `sub_agent_tools` / `factory_agents` が両方 None なら registry へ `post_processor` を渡さない
+    （既定経路の pin 用）。片方だけ指定した場合はもう片方を False として
+    `builder.post_processor(...)` を作り、`AgentRegistry(post_processor=...)` へ渡す。
+
+    Args:
+        allowed_tools: 既定ポリシーの `allowed_tools`。
+        sub_agent_tools: `post_processor(sub_agent_tools=...)`（None は False 扱い）。
+        factory_agents: `post_processor(factory_agents=...)`（None は False 扱い）。
+        support_tool_calls: `support` の FakeModel に順に積む (tool 名, 引数 JSON)。None なら
+            `fn_s` → `direct_tool` → `researcher` の 3 件。
+    """
+    sink = AuditLog()
+    builder = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="p", allowed_tools=allowed_tools), audit_sink=sink
+    )
+    if sub_agent_tools is None and factory_agents is None:
+        registry = AgentRegistry(agent_builder=builder)
+    else:
+        registry = AgentRegistry(
+            agent_builder=builder,
+            post_processor=builder.post_processor(
+                sub_agent_tools=bool(sub_agent_tools), factory_agents=bool(factory_agents)
+            ),
+        )
+    calls: dict[str, list[str]] = {"fn_r": [], "fn_s": [], "fn_l": []}
+    hooks = _SinkObservingHooks(sink)
+
+    researcher_model = FakeModel().queue_text("researched")
+    registry.register(
+        AgentSpec(
+            name="researcher",
+            instructions="r",
+            model=researcher_model,
+            tools=[_make_tool(calls["fn_r"], name="fn_r")],
+        )
+    )
+    direct_model = FakeModel().queue_text("direct-done")
+    direct_as_tool = Agent(name="direct", instructions="d", model=direct_model).as_tool(
+        tool_name="direct_tool", tool_description="direct"
+    )
+    support_model = FakeModel()
+    for name, arguments in support_tool_calls or [
+        ("fn_s", '{"text": "s"}'),
+        ("direct_tool", '{"input": "d"}'),
+        ("researcher", '{"input": "r"}'),
+    ]:
+        support_model.queue_tool_call(name, arguments)
+    support_model.queue_text("done")
+    registry.register(
+        AgentSpec(
+            name="support",
+            instructions="s",
+            model=support_model,
+            tools=[_make_tool(calls["fn_s"], name="fn_s"), direct_as_tool],
+            sub_agents=["researcher"],
+            hooks=hooks,
+        )
+    )
+    legacy_model = FakeModel().queue_tool_call("fn_l", '{"text": "l"}').queue_text("l-done")
+    legacy_original: list[Agent] = []
+    fn_l = _make_tool(calls["fn_l"], name="fn_l")
+
+    def _legacy_factory(_registry: AgentRegistry) -> Agent:
+        agent = Agent(name="legacy", instructions="x", tools=[fn_l], model=legacy_model)
+        legacy_original.append(agent)
+        return agent
+
+    registry.register_factory("legacy", _legacy_factory)
+    return _MixedRegistry(
+        registry=registry,
+        sink=sink,
+        hooks=hooks,
+        calls=calls,
+        support_model=support_model,
+        researcher_model=researcher_model,
+        direct_model=direct_model,
+        legacy_model=legacy_model,
+        legacy_original=legacy_original,
+    )
+
+
+def _record_shape(sink: AuditLog) -> list[tuple[str, str, str, list[str]]]:
+    """監査レコード列を `(agent_id, action, decision, sorted(details のキー))` へ写す。"""
+    return [
+        (e.agent_id, e.action, e.decision, sorted((e.details or {}).keys()))
+        for e in sink.get_entries()
+    ]
+
+
+async def test_audit_record_sequence_unchanged_by_default() -> None:
+    """`post_processor` を渡さない registry は対応前と同一の監査レコード列・identity・委譲順を保つ。
+
+    `spec.tools` の関数ツールと利用者が直接置いた as_tool は `tool:` レコードを持ち（統治）、
+    wire 注入の `researcher` as_tool は `tool_start:` / `tool_end:` のみ（非統治）、factory
+    `legacy` は統治されず `registry.get` が factory の戻り値そのものを返す。期待列は対応前の
+    実装（build 時統治）で実測した列であり、`post_processor` 引数の追加後もこの列が変わらない
+    ことが既定不変の証拠になる。部分実装の `spec.hooks` へは各イベントが監査記録の後に届く。
+    """
+    mixed = _mixed_registry(allowed_tools=_MIXED_ALLOWED)
+
+    support = mixed.registry.get("support")
+    result = await Runner.run(support, input="go")
+    legacy = mixed.registry.get("legacy")
+    legacy_result = await Runner.run(legacy, input="go")
+
+    assert result.final_output == "done"
+    assert legacy_result.final_output == "l-done"
+    # 各ツールの実体が 1 回ずつ走った（as_tool はサブ側 model が 1 回呼ばれる）。
+    assert mixed.calls == {"fn_r": [], "fn_s": ["s"], "fn_l": ["l"]}
+    assert len(mixed.researcher_model.calls) == 1
+    assert len(mixed.direct_model.calls) == 1
+    # factory の戻り値がそのまま返る（clone されない）。
+    assert len(mixed.legacy_original) == 1
+    assert legacy is mixed.legacy_original[0]
+    # 対応前の実装で実測した列（推測で書き換えないこと）。
+    assert _record_shape(mixed.sink) == [
+        ("support", "agent_start", "allow", []),
+        ("support", "tool_start:fn_s", "allow", []),
+        ("support", "tool:fn_s", "allow", ["arguments"]),
+        ("support", "tool_end:fn_s", "allow", []),
+        ("support", "tool_start:direct_tool", "allow", []),
+        ("support", "tool:direct_tool", "allow", ["arguments"]),
+        ("support", "tool_end:direct_tool", "allow", []),
+        ("support", "tool_start:researcher", "allow", []),
+        ("researcher", "agent_start", "allow", []),
+        ("researcher", "agent_end", "allow", []),
+        ("support", "tool_end:researcher", "allow", []),
+        ("support", "agent_end", "allow", []),
+    ]
+    # 利用者フックへは監査記録の直後に届く（到達時の sink 末尾が同イベントの監査記録）。
+    assert mixed.hooks.events == [
+        ("start:support", "agent_start"),
+        ("tool_start:fn_s", "tool_start:fn_s"),
+        ("tool_end:fn_s", "tool_end:fn_s"),
+        ("tool_start:direct_tool", "tool_start:direct_tool"),
+        ("tool_end:direct_tool", "tool_end:direct_tool"),
+        ("tool_start:researcher", "tool_start:researcher"),
+        ("tool_end:researcher", "tool_end:researcher"),
+        ("end:support", "agent_end"),
+    ]
+    assert mixed.sink.verify_chain() is True
+
+
+def _tool_records(sink: AuditLog, action: str) -> list[Any]:
+    """sink から `action` が一致するレコードだけを取り出す。"""
+    return [e for e in sink.get_entries() if e.action == action]
+
+
+async def test_opt_in_sub_agent_as_tool_allowed_and_recorded() -> None:
+    """オプトイン時、wire 注入の sub_agents as_tool は親のポリシーで allow 評価され監査に残る。"""
+    mixed = _mixed_registry(allowed_tools=_MIXED_ALLOWED, sub_agent_tools=True, factory_agents=True)
+
+    result = await Runner.run(mixed.registry.get("support"), input="go")
+
+    assert result.final_output == "done"
+    assert len(mixed.researcher_model.calls) == 1  # allow なのでサブエージェントが走る
+    records = _tool_records(mixed.sink, "tool:researcher")
+    assert [(e.agent_id, e.decision, e.details) for e in records] == [
+        ("support", "allow", {"arguments": '{"input": "r"}'})
+    ]
+    assert mixed.sink.verify_chain() is True
+
+
+async def test_opt_in_sub_agent_as_tool_denied_stops_run() -> None:
+    """オプトイン時、ポリシー外の sub_agents as_tool は deny され、サブエージェントは走らない。"""
+    mixed = _mixed_registry(
+        allowed_tools=[n for n in _MIXED_ALLOWED if n != "researcher"],
+        sub_agent_tools=True,
+        factory_agents=True,
+        support_tool_calls=[("researcher", '{"input": "r"}')],
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(mixed.registry.get("support"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert mixed.researcher_model.calls == []  # サブエージェントの run は起きない
+    records = _tool_records(mixed.sink, "tool:researcher")
+    assert [(e.agent_id, e.decision) for e in records] == [("support", "deny")]
+    assert records[0].details["arguments"] == '{"input": "r"}'
+    assert "researcher" in records[0].details["reason"]
+
+
+async def test_opt_in_factory_agent_governed_as_clone_allow_and_deny() -> None:
+    """オプトイン時、factory Agent の tools も allow / deny され、get は clone を返し元は不変。"""
+    allowed = _mixed_registry(
+        allowed_tools=_MIXED_ALLOWED, sub_agent_tools=True, factory_agents=True
+    )
+
+    legacy = allowed.registry.get("legacy")
+    result = await Runner.run(legacy, input="go")
+
+    assert result.final_output == "l-done"
+    assert allowed.calls["fn_l"] == ["l"]
+    records = _tool_records(allowed.sink, "tool:fn_l")
+    assert [(e.agent_id, e.decision, e.details) for e in records] == [
+        ("legacy", "allow", {"arguments": '{"text": "l"}'})
+    ]
+    # factory の戻り値とは別オブジェクト（clone）が返り、元の tools / hooks は変更されない。
+    assert len(allowed.legacy_original) == 1
+    original = allowed.legacy_original[0]
+    assert legacy is not original
+    assert len(original.tools) == 1
+    assert original.tools[0] is not legacy.tools[0]
+    assert original.hooks is None
+    assert legacy.hooks is not None
+
+    denied = _mixed_registry(
+        allowed_tools=[n for n in _MIXED_ALLOWED if n != "fn_l"],
+        sub_agent_tools=True,
+        factory_agents=True,
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(denied.registry.get("legacy"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert denied.calls["fn_l"] == []  # 実関数は非実行
+    records = _tool_records(denied.sink, "tool:fn_l")
+    assert [(e.agent_id, e.decision) for e in records] == [("legacy", "deny")]
+    assert records[0].details["arguments"] == '{"text": "l"}'
+
+
+async def test_opt_in_sub_agent_tools_only_leaves_factory_ungoverned() -> None:
+    """`post_processor(sub_agent_tools=True)` だけでは factory 経路は従来どおり非統治のまま。"""
+    mixed = _mixed_registry(
+        allowed_tools=[n for n in _MIXED_ALLOWED if n != "fn_l"],  # fn_l はポリシー外
+        sub_agent_tools=True,
+    )
+
+    await Runner.run(mixed.registry.get("support"), input="go")
+    legacy = mixed.registry.get("legacy")
+    await Runner.run(legacy, input="go")
+
+    # sub_agents 経路は統治される。
+    assert [e.decision for e in _tool_records(mixed.sink, "tool:researcher")] == ["allow"]
+    # factory 経路は同一オブジェクト・ポリシー外の fn_l も評価されず実行される。
+    assert legacy is mixed.legacy_original[0]
+    assert mixed.calls["fn_l"] == ["l"]
+    assert _tool_records(mixed.sink, "tool:fn_l") == []
+
+
+async def test_opt_in_factory_agents_only_leaves_sub_agent_tools_ungoverned() -> None:
+    """`post_processor(factory_agents=True)` だけでは wire 注入の as_tool は従来どおり非統治。"""
+    mixed = _mixed_registry(
+        allowed_tools=[n for n in _MIXED_ALLOWED if n != "researcher"],  # researcher はポリシー外
+        factory_agents=True,
+    )
+
+    result = await Runner.run(mixed.registry.get("support"), input="go")
+    legacy = mixed.registry.get("legacy")
+    await Runner.run(legacy, input="go")
+
+    # sub_agents の as_tool は評価されずサブエージェントまで走る。
+    assert result.final_output == "done"
+    assert len(mixed.researcher_model.calls) == 1
+    assert _tool_records(mixed.sink, "tool:researcher") == []
+    # factory 経路は clone されて統治される。
+    assert legacy is not mixed.legacy_original[0]
+    assert [e.decision for e in _tool_records(mixed.sink, "tool:fn_l")] == ["allow"]
+
+
+# ----------------------------------------------------------------------
+# 既定経路（build 時統治）の回帰 pin: 装飾 builder / 入れ子 builder
+#
+# 統治は build 時に焼き込まれるため、`build` だけを委譲する装飾 builder や
+# `GovernedAgentBuilder` の入れ子でも外れない。registry 経由の Agent で拒否ツールを
+# 実行し、例外・実関数の非実行・deny レコードの 3 点で観測する。
+# ----------------------------------------------------------------------
+
+
+class _BuildOnlyDecorator:
+    """`build` だけを委譲する装飾 builder（post-processor は registry へ別途明示的に渡す）。"""
+
+    def __init__(self, inner: GovernedAgentBuilder) -> None:
+        """委譲先と build した spec 名の記録を初期化する。"""
+        self.inner = inner
+        self.built: list[str] = []
+
+    def build(self, spec: AgentSpec) -> Agent:
+        """spec 名を記録して委譲先の `build` へ渡す。"""
+        self.built.append(spec.name)
+        return self.inner.build(spec)
+
+
+def _echo_registry(builder: Any) -> tuple[AgentRegistry, list[str]]:
+    """`echo` を 1 回呼ぶ `bot` を登録した registry と、実関数の呼び出し記録を返す。"""
+    calls: list[str] = []
+    registry = AgentRegistry(agent_builder=builder)
+    model = FakeModel().queue_tool_call("echo", '{"text": "x"}').queue_text("done")
+    registry.register(
+        AgentSpec(name="bot", instructions="i", model=model, tools=[_make_tool(calls)])
+    )
+    return registry, calls
+
+
+async def _assert_run_raises_policy_violation(agent: Agent) -> None:
+    """Runner 実行が `PolicyViolationError`（直接 or `__cause__`）で中断されることを確かめる。"""
+    with pytest.raises(Exception) as excinfo:
+        await Runner.run(agent, input="go")
+    err = excinfo.value
+    assert isinstance(err, PolicyViolationError) or isinstance(err.__cause__, PolicyViolationError)
+
+
+async def test_decorated_builder_delegating_only_build_still_governs() -> None:
+    """`build` だけを委譲する装飾 builder で包んでも、拒否ツールは build 時統治で拒否される。"""
+    sink = AuditLog()
+    decorator = _BuildOnlyDecorator(
+        GovernedAgentBuilder(policy=GovernancePolicy(name="p", allowed_tools=[]), audit_sink=sink)
+    )
+    registry, calls = _echo_registry(decorator)
+
+    await _assert_run_raises_policy_violation(registry.get("bot"))
+
+    assert decorator.built == ["bot"]
+    assert calls == []  # 実関数は非実行
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == [("bot", "deny")]
+
+
+@pytest.mark.parametrize(
+    ("outer_allowed", "inner_allowed", "outer_expected", "inner_expected"),
+    [
+        (["echo"], [], [], ["deny"]),
+        ([], ["echo"], ["deny"], ["allow"]),
+        (["echo"], ["echo"], ["allow"], ["allow"]),
+    ],
+    ids=["outer_allow_inner_deny", "outer_deny_inner_allow", "both_allow"],
+)
+async def test_nested_governed_builder_still_governs(
+    outer_allowed: list[str],
+    inner_allowed: list[str],
+    outer_expected: list[str],
+    inner_expected: list[str],
+) -> None:
+    """`GovernedAgentBuilder` の入れ子は外側・内側の両ポリシーで評価され、一方が deny なら deny。
+
+    外側の build が先にラップし、内側の build がその上からラップするため、実行時は内側の
+    ポリシーが先に評価される（内側が deny なら外側まで届かない）。各 sink の `tool:` 行を
+    `==` で固定する。
+    """
+    outer_sink = AuditLog()
+    inner_sink = AuditLog()
+    builder = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="outer", allowed_tools=outer_allowed),
+        audit_sink=outer_sink,
+        inner=GovernedAgentBuilder(
+            policy=GovernancePolicy(name="inner", allowed_tools=inner_allowed),
+            audit_sink=inner_sink,
+        ),
+    )
+    registry, calls = _echo_registry(builder)
+    agent = registry.get("bot")
+
+    if "deny" in outer_expected + inner_expected:
+        await _assert_run_raises_policy_violation(agent)
+        assert calls == []  # 実関数は非実行
+    else:
+        result = await Runner.run(agent, input="go")
+        assert result.final_output == "done"
+        assert calls == ["x"]
+    assert [e.decision for e in _tool_records(outer_sink, "tool:echo")] == outer_expected
+    assert [e.decision for e in _tool_records(inner_sink, "tool:echo")] == inner_expected
+
+
+# ----------------------------------------------------------------------
+# オプトイン（post_processor(sub_agent_tools=True)）: 同一 list の要素置換と追加レコード
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("allowed", [True, False], ids=["allow", "deny"])
+async def test_factory_clone_during_wire_sees_governed_injected_as_tool(allowed: bool) -> None:
+    """結線の途中で factory が作った clone にも、第 3 段で統治した注入 as_tool が届く。
+
+    構成: `a` は handoffs=["f", "b"]、`b` は sub_agents=["sub"]、factory `f` は
+    `r.get("b").clone(name="b2")` を返す。`a` の結線中に `f` が呼ばれ、第 3 段より前の `b` を
+    clone する（SDK の clone は tools list を共有する）。第 3 段が `b.tools` を再束縛せず同じ
+    list の要素を置換していれば、`b2` から呼んだ `sub` の as_tool も `b` のポリシーで評価される。
+    """
+    sink = AuditLog()
+    builder = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="p", allowed_tools=["sub"] if allowed else []),
+        audit_sink=sink,
+    )
+    registry = AgentRegistry(
+        agent_builder=builder, post_processor=builder.post_processor(sub_agent_tools=True)
+    )
+    sub_model = FakeModel().queue_text("sub-done")
+    registry.register(AgentSpec(name="sub", instructions="s", model=sub_model))
+    b_model = FakeModel().queue_tool_call("sub", '{"input": "q"}').queue_text("b-done")
+    registry.register(AgentSpec(name="b", instructions="b", model=b_model, sub_agents=["sub"]))
+    clones: list[Agent] = []
+
+    def _clone_b(r: AgentRegistry) -> Agent:
+        clone = r.get("b").clone(name="b2")
+        clones.append(clone)
+        return clone
+
+    registry.register_factory("f", _clone_b)
+    registry.register(AgentSpec(name="a", instructions="a", handoffs=["f", "b"]))
+
+    registry.get("a")
+    b2 = registry.get("f")
+
+    # 前提: clone は結線中に 1 度だけ作られ、b とは別オブジェクト。
+    assert clones == [b2]
+    assert b2 is not registry.get("b")
+    if allowed:
+        result = await Runner.run(b2, input="go")
+        assert result.final_output == "b-done"
+        assert len(sub_model.calls) == 1
+        assert [(e.agent_id, e.decision, e.details) for e in _tool_records(sink, "tool:sub")] == [
+            ("b", "allow", {"arguments": '{"input": "q"}'})
+        ]
+    else:
+        await _assert_run_raises_policy_violation(b2)
+        assert sub_model.calls == []  # サブエージェントの run は起きない
+        assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:sub")] == [
+            ("b", "deny")
+        ]
+
+
+async def test_opt_in_sub_agent_tools_adds_only_injected_tool_record() -> None:
+    """`post_processor(sub_agent_tools=True)` は既定の記録列に注入 as_tool の `tool:` 1 行を加える。
+
+    build 時に統治済みの `fn_s` / `direct_tool` は統治済み判定により再ラップされず `tool:` が 2 行に
+    ならない。hooks も再合成しないため、ライフサイクル行と利用者フックへの到達列は
+    既定（`test_audit_record_sequence_unchanged_by_default`）と同一のまま。
+    """
+    mixed = _mixed_registry(allowed_tools=_MIXED_ALLOWED, sub_agent_tools=True)
+
+    result = await Runner.run(mixed.registry.get("support"), input="go")
+
+    assert result.final_output == "done"
+    assert mixed.calls == {"fn_r": [], "fn_s": ["s"], "fn_l": []}
+    assert len(mixed.researcher_model.calls) == 1
+    assert len(mixed.direct_model.calls) == 1
+    assert _record_shape(mixed.sink) == [
+        ("support", "agent_start", "allow", []),
+        ("support", "tool_start:fn_s", "allow", []),
+        ("support", "tool:fn_s", "allow", ["arguments"]),
+        ("support", "tool_end:fn_s", "allow", []),
+        ("support", "tool_start:direct_tool", "allow", []),
+        ("support", "tool:direct_tool", "allow", ["arguments"]),
+        ("support", "tool_end:direct_tool", "allow", []),
+        ("support", "tool_start:researcher", "allow", []),
+        ("support", "tool:researcher", "allow", ["arguments"]),
+        ("researcher", "agent_start", "allow", []),
+        ("researcher", "agent_end", "allow", []),
+        ("support", "tool_end:researcher", "allow", []),
+        ("support", "agent_end", "allow", []),
+    ]
+    assert mixed.hooks.events == [
+        ("start:support", "agent_start"),
+        ("tool_start:fn_s", "tool_start:fn_s"),
+        ("tool_end:fn_s", "tool_end:fn_s"),
+        ("tool_start:direct_tool", "tool_start:direct_tool"),
+        ("tool_end:direct_tool", "tool_end:direct_tool"),
+        ("tool_start:researcher", "tool_start:researcher"),
+        ("tool_end:researcher", "tool_end:researcher"),
+        ("end:support", "agent_end"),
+    ]
+    assert mixed.sink.verify_chain() is True
+
+
+# ----------------------------------------------------------------------
+# オプトイン（post_processor(factory_agents=True)）: 統治済み Agent を返す factory の境界
+# ----------------------------------------------------------------------
+
+
+def _alias_registry(builder: GovernedAgentBuilder) -> tuple[AgentRegistry, list[str]]:
+    """spec `a`（`echo` を 1 回呼ぶ）と、`a` をそのまま返す factory `alias` を載せる。
+
+    registry へは `builder.post_processor(factory_agents=True)` を明示的に渡す。
+    """
+    calls: list[str] = []
+    registry = AgentRegistry(
+        agent_builder=builder, post_processor=builder.post_processor(factory_agents=True)
+    )
+    model = FakeModel().queue_tool_call("echo", '{"text": "x"}').queue_text("done")
+    registry.register(AgentSpec(name="a", instructions="i", model=model, tools=[_make_tool(calls)]))
+    registry.register_factory("alias", lambda r: r.get("a"))
+    return registry, calls
+
+
+async def test_factory_returning_governed_agent_is_evaluated_by_both_policies() -> None:
+    """統治済み Agent を返す factory は、factory 名と元 spec 名の両ポリシーで評価される（境界）。
+
+    factory 経路は印で skip しない（skip すると factory 名の override が黙って効かなくなる）。
+    許可では `tool:` が factory 名 -> 元 spec 名の順に 2 行残り、factory 名だけを deny にすると
+    実関数は走らず deny 1 行で止まる。
+    """
+    allow_sink = AuditLog()
+    registry, calls = _alias_registry(
+        GovernedAgentBuilder(
+            policy=GovernancePolicy(name="p", allowed_tools=["echo"]),
+            audit_sink=allow_sink,
+        )
+    )
+    alias = registry.get("alias")
+    assert alias is not registry.get("a")  # 前提: factory 経路は clone を返す
+
+    result = await Runner.run(alias, input="go")
+
+    assert result.final_output == "done"
+    assert calls == ["x"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(allow_sink, "tool:echo")] == [
+        ("alias", "allow"),
+        ("a", "allow"),
+    ]
+
+    deny_sink = AuditLog()
+    registry, calls = _alias_registry(
+        GovernedAgentBuilder(
+            policy=GovernancePolicy(name="p", allowed_tools=["echo"]),
+            overrides={"alias": GovernancePolicy(name="d", allowed_tools=[])},
+            audit_sink=deny_sink,
+        )
+    )
+
+    await _assert_run_raises_policy_violation(registry.get("alias"))
+
+    assert calls == []  # 実関数は非実行
+    assert [(e.agent_id, e.decision) for e in _tool_records(deny_sink, "tool:echo")] == [
+        ("alias", "deny")
+    ]
+
+
+# ----------------------------------------------------------------------
+# 統治済み登録の SDK 契約トリップワイヤ（dataclasses.replace / copy.copy）
+# ----------------------------------------------------------------------
+
+
+def test_governed_registration_survives_replace_and_copy_tripwire() -> None:
+    """`_govern_tool` の統治済み判定は `dataclasses.replace` / `copy.copy` を経ても保たれる。
+
+    判定は実行本体（`on_invoke_tool`）のラッパ関数そのものの同一性で行うため、SDK の
+    `FunctionTool.__post_init__` / `__copy__` が実行本体を包み直すと判定が外れる。外れると
+    第 3 段が build 時統治済みの tool を再ラップし、`tool:` レコードが 2 行になる
+    （fail-closed だが記録が変わる）。
+    """
+    tool = _make_tool([])
+    governed = _govern_tool(
+        tool,
+        policy=GovernancePolicy(name="p"),
+        sink=AuditLog(),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+    assert _is_governed(governed) is True
+    assert _is_governed(tool) is False
+
+    for derived in (dataclasses.replace(governed, name="renamed"), copy.copy(governed)):
+        assert derived is not governed
+        assert _is_governed(derived) is True, (
+            "SDK の FunctionTool 複製が on_invoke_tool を包み直すようになった。"
+            "_adapters/governance.py の統治済み判定（_is_governed）の方法を見直すこと。"
+        )
+
+
+# ----------------------------------------------------------------------
+# オプトインは post-processor の明示的な受け渡し: 装飾 builder / 入れ子 builder
+# ----------------------------------------------------------------------
+
+
+def _researcher_registry(
+    builder: Any, post_processor: Any, *, sub_model: FakeModel
+) -> AgentRegistry:
+    """sub agent `researcher` と、それを 1 回呼ぶ親 `support` を載せた registry を返す。"""
+    registry = AgentRegistry(agent_builder=builder, post_processor=post_processor)
+    registry.register(AgentSpec(name="researcher", instructions="r", model=sub_model))
+    support_model = FakeModel().queue_tool_call("researcher", '{"input": "r"}').queue_text("done")
+    registry.register(
+        AgentSpec(name="support", instructions="s", model=support_model, sub_agents=["researcher"])
+    )
+    return registry
+
+
+async def test_decorated_builder_with_explicit_post_processor_governs_injected_as_tool() -> None:
+    """build だけ委譲する装飾 builder でも、明示的に渡した post-processor が注入 as_tool を統治。
+
+    ポリシー外の `researcher` as_tool は deny され（`UserError.__cause__` が
+    `PolicyViolationError`）、サブエージェントの model は 1 度も呼ばれず、`tool:` 行は
+    親名の deny 1 行だけになる。
+    """
+    sink = AuditLog()
+    governed = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="p", allowed_tools=["other"]), audit_sink=sink
+    )
+    decorator = _BuildOnlyDecorator(governed)
+    sub_model = FakeModel().queue_text("researched")
+    registry = _researcher_registry(
+        decorator, governed.post_processor(sub_agent_tools=True), sub_model=sub_model
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(registry.get("support"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert sorted(decorator.built) == ["researcher", "support"]
+    assert sub_model.calls == []  # サブエージェントの run は起きない
+    assert [
+        (e.agent_id, e.action, e.decision)
+        for e in sink.get_entries()
+        if e.action.startswith("tool:")
+    ] == [("support", "tool:researcher", "deny")]
+
+
+@pytest.mark.parametrize("source", ["outer", "inner"])
+async def test_nested_builder_opt_in_uses_explicit_post_processor_policy(source: str) -> None:
+    """入れ子の builder では、post-processor を作った側の sink にだけ・そのポリシーで残る。
+
+    外側は `researcher` を許可、内側は拒否するポリシーにする。外側から作れば allow で
+    サブエージェントまで走り、内側から作れば deny で止まる。as_tool の `tool:` 行は作った側の
+    sink にだけ 1 行残り、もう一方の sink には残らない。
+    """
+    outer_sink = AuditLog()
+    inner_sink = AuditLog()
+    inner = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="inner", allowed_tools=[]), audit_sink=inner_sink
+    )
+    outer = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="outer", allowed_tools=["researcher"]),
+        audit_sink=outer_sink,
+        inner=inner,
+    )
+    maker = outer if source == "outer" else inner
+    sub_model = FakeModel().queue_text("researched")
+    registry = _researcher_registry(
+        outer, maker.post_processor(sub_agent_tools=True), sub_model=sub_model
+    )
+
+    if source == "outer":
+        result = await Runner.run(registry.get("support"), input="go")
+        assert result.final_output == "done"
+        assert len(sub_model.calls) == 1
+        expected_outer = [("support", "allow", '{"input": "r"}')]
+        expected_inner: list[Any] = []
+    else:
+        with pytest.raises(UserError) as excinfo:
+            await Runner.run(registry.get("support"), input="go")
+        assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+        assert sub_model.calls == []
+        expected_outer = []
+        expected_inner = [("support", "deny", '{"input": "r"}')]
+        assert "researcher" in _tool_records(inner_sink, "tool:researcher")[0].details["reason"]
+    assert [
+        (e.agent_id, e.decision, e.details["arguments"])
+        for e in _tool_records(outer_sink, "tool:researcher")
+    ] == expected_outer
+    assert [
+        (e.agent_id, e.decision, e.details["arguments"])
+        for e in _tool_records(inner_sink, "tool:researcher")
+    ] == expected_inner

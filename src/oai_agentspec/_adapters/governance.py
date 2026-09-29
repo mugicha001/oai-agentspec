@@ -4,7 +4,9 @@
 `govern_spec` は宣言層の `AgentSpec` を受け、各 `FunctionTool` の `on_invoke_tool` をポリシー評価
 付きラップへ非破壊置換し（許可なら実関数を実行・違反なら実関数を実行せず `PolicyViolationError` を
 送出）、ライフサイクル監査を記録する `AgentHooks` を `spec.hooks` と合成した新 `AgentSpec` を
-返す（build-don't-run・実行は SDK Runner に委ねる）。
+返す（build-don't-run・実行は SDK Runner に委ねる）。オプトイン時に registry 第 3 段 post-process
+から呼ばれる `govern_ungoverned_tools`（`sub_agents` の as_tool）/ `govern_agent`（factory Agent）
+も同じラップと監査フックを使う。
 
 ポリシー評価・監査 sink・拒否例外は AGT の `[openai-agents]` 連携（`openai_agents_trust` の
 `GovernancePolicy` / `AuditLog` と core の `PolicyViolationError`）をそのまま使い、自前で再実装しな
@@ -23,6 +25,8 @@ import json
 import os
 import re
 import warnings
+import weakref
+from collections.abc import Callable
 from dataclasses import MISSING as _MISSING
 from dataclasses import fields as _dataclass_fields
 from dataclasses import replace as _dataclass_replace
@@ -65,6 +69,29 @@ _BENIGN_POLICY_FIELDS = frozenset({"name"})
 
 # policy オブジェクトに必須の評価メソッド（build 時に存在を検証する）。
 _REQUIRED_POLICY_METHODS = ("check_tool", "check_content")
+
+# govern ラップ済みの実行本体（`_govern_tool` のラッパ関数）の登録簿（id -> 弱参照）。
+# 判定は登録した関数との同一性（`is`）で行うため、`dataclasses.replace` / `copy` を経ても
+# 同じ関数を指す tool は統治済みと判定される。弱参照のためラッパが GC されるとエントリも消える。
+_GOVERNED_WRAPPERS: dict[int, weakref.ref[Callable[..., Any]]] = {}
+
+
+def _register_governed(fn: Callable[..., Any]) -> None:
+    """`_govern_tool` が作ったラッパ関数を統治済みとして `_GOVERNED_WRAPPERS` へ登録する。
+
+    弱参照のコールバックは、同じ id で後から登録された別のエントリを消さない（自分が
+    登録したエントリのときだけ削除する）。
+
+    Args:
+        fn: 登録するラッパ関数。
+    """
+    fn_id = id(fn)
+
+    def _drop(ref: weakref.ref[Callable[..., Any]], key: int = fn_id) -> None:
+        if _GOVERNED_WRAPPERS.get(key) is ref:
+            del _GOVERNED_WRAPPERS[key]
+
+    _GOVERNED_WRAPPERS[fn_id] = weakref.ref(fn, _drop)
 
 
 def _require_agt() -> tuple[Any, Any, Any]:
@@ -617,7 +644,28 @@ def _govern_tool(
     except (StopIteration, TypeError, ValueError):  # pragma: no cover - 異形シグネチャの防御
         pass
 
+    _register_governed(_on_invoke_tool)
     return _dataclass_replace(tool, on_invoke_tool=_on_invoke_tool)
+
+
+def _is_governed(tool: FunctionTool) -> bool:
+    """`tool` の実行本体が `_GOVERNED_WRAPPERS` に登録されたラッパ関数そのものかを返す。
+
+    判定は登録したラッパ関数との同一性（`is`）で行い、hash / eq に依存しない。このため
+    関数属性の手付け・`functools.wraps` によるコピー・hash / eq を参照先へ委譲するプロキシは
+    統治済みと判定されない（未統治として扱う = fail-closed）。ラッパが GC されるとエントリは
+    消える。統治済みの印は「いずれかのポリシーで統治済み」を示し、どのエージェント・どの
+    ポリシーで統治したかは区別しない。
+
+    Args:
+        tool: 判定対象の `FunctionTool`。
+
+    Returns:
+        `_govern_tool` が作ったラッパ関数を実行本体に持つなら True。
+    """
+    fn = tool.on_invoke_tool
+    ref = _GOVERNED_WRAPPERS.get(id(fn))
+    return ref is not None and ref() is fn
 
 
 def _make_audit_hooks(
@@ -649,8 +697,8 @@ def _make_audit_hooks(
         policy: AGT ポリシーオブジェクト（`check_tool` / `check_content` を持つ）。None なら
             MCP 由来ツールの評価を行わない（監査記録のみ）。**指定する場合は `denied_exc` /
             `agent_name` も同時に渡す**（3 つで 1 組。`policy` のみ渡すと違反検出時に
-            `raise None(...)` となり `TypeError` へ化ける。呼び出し元は `govern_spec` の 1 箇所で
-            `_require_agt()` の戻りから必ず 3 つ揃うため、防御コードは置かない）。
+            `raise None(...)` となり `TypeError` へ化ける。呼び出し元は `govern_spec` /
+            `govern_agent` で `_require_agt()` の戻りから必ず 3 つ揃うため、防御コードは置かない）。
         denied_exc: ポリシー違反時に送出する例外クラス（AGT `PolicyViolationError`）。
         agent_name: `tool:` レコードの `agent_id` に使うエージェント名（`spec.name`）。
 
@@ -690,7 +738,8 @@ def _make_audit_hooks(
                 return
             origin = get_function_tool_origin(tool)
             # MCP 由来のみ評価する（positive 判定）。FUNCTION は build 時の govern ラップ、
-            # AGENT_AS_TOOL は対象外のため、ここで評価すると二重評価・意味変更になる。
+            # AGENT_AS_TOOL は対象外のため、ここで評価すると二重評価・意味変更になる
+            # （オプトイン時の AGENT_AS_TOOL は第 3 段 post-process の実行本体ラップで評価済み）。
             # 比較は `is` でなく `!=` を使う: `ToolOriginType` は `str` 派生 Enum で
             # `ToolOrigin` は型検証を持たない frozen dataclass のため、生 str の
             # `ToolOrigin(type="mcp")` が渡り得る（公開型なので第三者ラッパ・シリアライズ経路で
@@ -762,12 +811,17 @@ def govern_spec(
     run 時解決の MCP 由来ツールの引数も同形で全文記録される（本経路は従来 `tool_start:` の記録のみ
     で `details` を持たなかったため、記録される情報の範囲が広がっている）。
 
-    既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため
-    per-call の allow/deny 評価・監査レコードを持たない（監査フックの tool_start / tool_end 記録の
-    み・サブエージェント自身の内部 `FunctionTool` は別途 build されていれば govern 済み）。
-    `register_factory` 経路は builder を通らないため govern 対象外。SDK の HITL 承認
-    （`needs_approval`）はツール実行前の承認フローとして govern ラップ（実行本体）より**先に**
-    走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny される。
+    既知の境界（govern 対象外）: 既定（registry の `post_processor` 引数へ
+    `GovernedAgentBuilder.post_processor(...)` を渡さない場合）では、`sub_agents` の as_tool は
+    registry が build 後に注入するため per-call の allow/deny 評価・監査レコードを持たない
+    （監査フックの tool_start / tool_end 記録のみ・サブエージェント自身の内部 `FunctionTool` は
+    別途 build されていれば govern 済み）。`register_factory` 経路は builder を通らないため
+    govern 対象外。オプトイン時は `govern_ungoverned_tools`（`sub_agents` の as_tool）/
+    `govern_agent`（factory Agent）が registry 第 3 段 post-process で統治する
+    （`post_processor(sub_agent_tools=True)` / `post_processor(factory_agents=True)` を registry の
+    `post_processor` 引数へ渡した場合）。SDK の HITL 承認（`needs_approval`）はツール実行前の
+    承認フローとして govern ラップ（実行本体）より**先に**走るため、ポリシーが拒否する呼び出し
+    でも承認要求は先に発生し得る（承認後に deny される。
     `needs_approval` の宣言メタは不変に維持する方針のため、承認前に弾きたい場合はポリシー対象と
     承認対象のツールを設計で分ける）。
 
@@ -779,7 +833,8 @@ def govern_spec(
     `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny では実行本体のラップで弾く
     ため到達する非対称。`RunHooks.on_tool_start` は SDK が `asyncio.gather` で並行実行するため
     deny 時も開始済みになり得る）、(4) `AGENT_AS_TOOL` origin（`sub_agents` の as_tool）は対象外
-    （機構上は同じフックで評価しうるが、既存 `allowed_tools` 宣言の意味を変えるため評価しない）、
+    （機構上は同じフックで評価しうるが、既存 `allowed_tools` 宣言の意味を変えるため評価しない。
+    オプトイン時の as_tool はフックでなく実行本体のラップで評価する）、
     (5) `tool:` 行の `agent_id` は宣言時の `spec.name`（build 時捕獲）で、`tool_start:` 行の
     `agent.name`（runtime agent）とは取得元が違うため `Agent.clone(name=...)` すると食い違う、
     (6) `RealtimeAgentSpec` の `mcp_servers` は別 registry / 別 builder Protocol 経路のため govern
@@ -879,3 +934,124 @@ def govern_spec(
         agent_name=agent_name,
     )
     return _dataclass_replace(spec, tools=new_tools, hooks=audit_hooks)
+
+
+def govern_ungoverned_tools(
+    agent: Any,
+    *,
+    policy: object,
+    audit_sink: object,
+    agent_name: str,
+) -> None:
+    """構築済み `Agent` の tools のうち印の無い `FunctionTool` だけをその場で govern ラップする。
+
+    registry 第 3 段 post-process の spec 経路（`GovernedAgentBuilder.post_processor(
+    sub_agent_tools=True)` を registry の `post_processor` 引数へ渡した場合）専用。build 時に
+    `govern_spec` でラップ済みの tool は印（`_GOVERNED_WRAPPERS` への登録。判定は
+    `_is_governed`）で判別して素通しし、印の無い `FunctionTool`
+    （wire が注入した `sub_agents` の as_tool 等）を `_govern_tool` でラップする。`FunctionTool`
+    以外は素通しする。origin では絞らない。`agent.hooks` は触らない（build 時に監査フックを
+    合成済みのため。再合成するとライフサイクル記録・MCP 評価が重複する）。ラップ・評価・監査の
+    境界は `govern_spec` の docstring を参照する。
+
+    所有契約: `agent.tools` の list オブジェクトを再束縛せず、要素をその場で置換する。結線の
+    途中で作られた clone のうち、tools の list を共有するもの（`Agent.clone` に `tools=` を
+    渡さない既定）に限り統治が届く。`tools=` に新しい list を渡した clone や、list をコピー
+    した Agent には届かない。
+    `agent.tools` は builder が作った list（利用者の `spec.tools` とは別物）である前提で書き換える。
+
+    境界: 印は「いずれかのポリシーで統治済み」を示し、この agent のポリシーで統治したかは区別
+    しない。自作 inner builder が別 agent / 別 builder で統治済みの tool を足すと、その tool は
+    元のポリシーだけで評価される。逆に自作 inner が独自に追加した印の無い `FunctionTool` は
+    本関数で統治される。
+
+    Args:
+        agent: 統治対象の構築済み `Agent`（lib 所有・spec 経路）。
+        policy: ポリシー定義（YAML ファイルパス、または AGT ポリシーオブジェクト）。
+        audit_sink: 監査ログ出力先（`record(...)` を持つ任意オブジェクト）。
+        agent_name: `tool:` レコードの `agent_id` に使うエージェント名（登録名）。
+
+    Raises:
+        ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
+        FileNotFoundError: policy が指す YAML パスが存在しない場合。
+        yaml.YAMLError: policy が指す YAML の構文が不正な場合。
+        ValueError: policy YAML がマッピングでない、または未知キーを含む場合。
+        TypeError: policy オブジェクトに callable な `check_tool` / `check_content` が無い場合。
+    """
+    governance_policy, _, policy_violation_error = _require_agt()
+    policy_obj = _load_policy(policy, governance_policy)
+    tools = agent.tools
+    for i, tool in enumerate(tools):
+        if isinstance(tool, FunctionTool) and not _is_governed(tool):
+            tools[i] = _govern_tool(
+                tool,
+                policy=policy_obj,
+                sink=audit_sink,
+                denied_exc=policy_violation_error,
+                agent_name=agent_name,
+            )
+
+
+def govern_agent(
+    agent: Any,
+    *,
+    policy: object,
+    audit_sink: object,
+    agent_name: str,
+) -> Any:
+    """構築済み `Agent` を clone し、全 `FunctionTool` の govern ラップと監査フックを合成して返す。
+
+    registry 第 3 段 post-process の factory 経路（`GovernedAgentBuilder.post_processor(
+    factory_agents=True)` を registry の `post_processor` 引数へ渡した場合）専用。`agent`
+    （利用者所有）は一切変更せず、全 `FunctionTool` を `_govern_tool` でラップした新 list と、
+    監査フックを `agent.hooks` と「監査記録 → 既存フックへ委譲」の順に合成したフック
+    （`agent.hooks is None` なら監査単体）で `agent.clone(tools=..., hooks=...)` を返す。
+    `FunctionTool` 以外は同一オブジェクトのまま残す。ラップ・評価・監査の境界は `govern_spec` の
+    docstring を参照する。
+
+    境界: 印（`_is_governed`）は見ない（統治済みを skip すると factory 名のポリシーが黙って
+    効かなくなるため）。factory が統治済みの Agent（例: `registry.get` の戻り）を返すと、元の
+    ポリシーと factory 名のポリシーの両方で評価され、`tool:` レコードとライフサイクル記録が
+    2 回ずつ残る（どちらかが deny なら deny）。
+
+    Args:
+        agent: 統治対象の構築済み `Agent`（利用者所有・factory 経路）。
+        policy: ポリシー定義（YAML ファイルパス、または AGT ポリシーオブジェクト）。
+        audit_sink: 監査ログ出力先（`record(...)` を持つ任意オブジェクト）。
+        agent_name: `tool:` レコードの `agent_id` に使うエージェント名（登録名）。
+
+    Returns:
+        tools / hooks を govern 化した `agent` の clone。
+
+    Raises:
+        ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
+        FileNotFoundError: policy が指す YAML パスが存在しない場合。
+        yaml.YAMLError: policy が指す YAML の構文が不正な場合。
+        ValueError: policy YAML がマッピングでない、または未知キーを含む場合。
+        TypeError: policy オブジェクトに callable な `check_tool` / `check_content` が無い場合、
+            または `agent.hooks` が run 単位フック（`RunHooksBase` インスタンス）の場合、
+            または `agent.hooks` が `on_*` を 1 つも持たないオブジェクトの場合（監査フックとの
+            合成が `chain_agent_hooks` を通るため）。
+    """
+    governance_policy, _, policy_violation_error = _require_agt()
+    policy_obj = _load_policy(policy, governance_policy)
+    tools = [
+        _govern_tool(
+            tool,
+            policy=policy_obj,
+            sink=audit_sink,
+            denied_exc=policy_violation_error,
+            agent_name=agent_name,
+        )
+        if isinstance(tool, FunctionTool)
+        else tool
+        for tool in agent.tools
+    ]
+    hooks = _make_audit_hooks(
+        audit_sink,
+        agent.hooks,
+        policy=policy_obj,
+        denied_exc=policy_violation_error,
+        agent_name=agent_name,
+    )
+    return agent.clone(tools=tools, hooks=hooks)

@@ -111,10 +111,10 @@ __init__.py (コア公開 API: __all__ は宣言層シンボルのみ)
 | モジュール | 責務 |
 |---|---|
 | `spec.py` | `AgentSpec` の定義。`agents.Agent` の薄い Wrapper。`agents` 非依存の宣言的データ。最下層 |
-| `protocols.py` | `AgentBuilder` の Protocol 定義。`agents` 非依存 |
+| `protocols.py` | `AgentBuilder` の Protocol 定義。構築・結線済み Agent を加工する `AgentPostProcessor`（registry 第 3 段）の Protocol 定義。`agents` 非依存 |
 | `_validation.py` | 宣言 spec の共有バリデーションヘルパ（callable instructions の呼び出し可能性・Realtime の静的 prompt 検証・`extra` kwargs の専用フィールド衝突/未知キー検証（両ルートのアダプタが共有）・宣言 dataclass の `bool` / `bool \| None` フィールドの構築時型検証（ADR-0021。コア宣言層と runtime 各 extra が共有））。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの両 registry / アダプタが共有し、判定とエラーメッセージの単一ソースを保つ |
 | `_mermaid.py` | Mermaid flowchart 整形の共有純フォーマッタ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの `mermaid()` が同一書式を単一ソースで保つ |
-| `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入） |
+| `_registry_core.py` | registry の到達可能収集 + トランザクショナル 2 パス build/wire + 巻き戻しの共有ヘルパ。`agents` 非依存・最下層。通常ルートと Realtime 専用ルートの registry が遅延構築アルゴリズムと巻き戻しセマンティクスを単一ソースで保つ（差分点＝依存辺プロバイダ・bare ビルド・結線はコールバックで注入）。任意の第 3 段 post-process も kw-only のコールバック（既定 None = 第 3 段なし）で注入し、同じトランザクションで巻き戻す |
 | `_adapters/` | `agents` および外部クライアント（採点エンジン `deepeval` / 観測 SaaS `langfuse`）への import 単一窓口。デフォルト `AgentBuilder`（`build_agent`）・`handoff()` 生成・as_tool 生成・SDK 型の再エクスポート・DeepEval 採点窓口・実行トレース捕捉窓口・Langfuse 連携窓口。内部実装は runner シーム / 承認適用 / シリアライズ・session 生成 / SQLite 読取 / HITL 永続テーブル / DeepEval 採点（judge）/ 実行トレース捕捉（routing）/ Langfuse 連携（langfuse）/ 意図予測プロンプト実行（intent）/ Tool メタデータの `function_tool` 結線（tools。`build_function_tool` = メタデータの SDK 引数流し込み・is_enabled callable 結線）/ `RunContextWrapper` 開封の共有ヘルパ `unwrap_run_context`（run_context）等のサブモジュールへ分割し、`__init__.py` を薄い再エクスポート窓口とする（`agents` / 外部クライアントへの import 単一窓口という責務は不変。`deepeval` は `judge` モジュールに、`langfuse` は `langfuse` モジュールの関数内遅延 import に閉じる） |
 | `prompts.py` | `PromptStore` / `PromptLayout` / `PromptTemplate` と合成 API（`compose`）・`dynamic_prompt` ヘルパー |
 | `registry.py` | `AgentRegistry`。DI 注入・遅延構築・循環ハンドオフ解決・ランタイム差し替え・`validate`・`clone`（登録内容を引き継いだ独立 registry を返す。spec は可変コンテナまで独立コピーし元 registry を不変に保つ。LLMOps の非汚染 mock 注入に使う宣言層プリミティブ） |
@@ -517,6 +517,20 @@ openai-agents への結合の隔離は `_adapters/__init__.py`（`from agents im
   `agents.sandbox.SandboxAgent`）を切り替える。
 - 注入点は `AgentRegistry.__init__(agent_builder=None)`。省略時は `_adapters` のデフォルト実装。
 
+構築・結線済みの Agent の加工は、別の Protocol `AgentPostProcessor` が担う。
+
+- `AgentPostProcessor`: `post_process(agent, *, name, spec) -> Agent`（`runtime_checkable`）。registry の第 3 段
+  （全結線の完了後）に呼ばれる。`spec` で所有区分が変わり、`spec` が `AgentSpec`（宣言経由・lib 所有）なら
+  受け取った Agent を in-place で加工して同一オブジェクトを返す（registry が `is` で検査し、違えば
+  `ValueError`）。`spec is None`（factory 経由・利用者所有）なら受け取った Agent を変更せず、加工が必要なら
+  新インスタンスを返す。
+- 注入点は `AgentRegistry.__init__(agent_builder=None, *, guardrail_registry=None, post_processor=None)`。
+  明示的に渡したものだけを呼び、builder が `AgentPostProcessor` を満たしていても発見しない（未指定なら
+  第 3 段は無い）。`AgentPostProcessor` を満たさないオブジェクトは `__init__` で `TypeError`。`clone()` は
+  `post_processor` を共有継承する。
+- post-process は build 時の加工を代替しない（build 時に行うべき加工は `agent_builder` の構築経路に含める）。
+- `oai_agentspec.protocols` の `__all__` にのみ載せ、コア `__all__` には含めない。
+
 `AgentBuilder` はテスト（`agents.Agent` を構築しないフェイク `FakeAgentBuilder` の注入）と、
 tools 一律ラップ等の構築置換という上級用途向けであり、トップレベル公開 API には含めない
 （`oai_agentspec.protocols` で参照）。モデルや instructions のデフォルト補完のような augment は
@@ -636,6 +650,12 @@ mutation が成立する。
 
 パス 1/2 はトランザクショナルに実行し、結線中に例外（未登録参照など）が出た場合は本呼び出しで
 新規キャッシュした bare agent を巻き戻し、不完全なインスタンスを残さない。
+
+`AgentRegistry(post_processor=...)` を渡した場合に限り、全 spec の結線完了後に第 3 段（post-process）を
+収集各 spec につき 1 回行う。spec 経路の post-process は in-place 加工で同一オブジェクトを返す契約で、
+別オブジェクトが返れば `ValueError` とし、パス 1/2 と同じトランザクションで巻き戻す。`register_factory`
+経路は factory 呼び出しの直後に 1 回行い、その戻り値をキャッシュする。`post_processor` 未指定なら構築は
+上記の 2 パスだけで完結する（契約は「SDK 隔離と依存性注入（DI）」節の `AgentPostProcessor` を参照）。
 
 `register` 時点ではビルドしない（遅延性を維持）。構築後、object identity が保証される
 （`a.handoffs[0] is registry.get("b")` かつ `b.handoffs[0] is registry.get("a")`）。
@@ -2448,10 +2468,12 @@ serve / cli / llmops / lightning / guardrails と同型の責務分割・公開�
 `AgentHooks.on_tool_start` で評価する。宣言は同じ `allowed_tools` / `blocked_patterns` で足り、ポリシー
 宣言の規約は 1 本のまま（判定は `_evaluate_tool` の 1 実装を両経路が共有し、照合の意味論が乖離しない）。
 
-既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため per-call の
+既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため、既定では per-call の
 allow / deny 評価・決定記録の対象外（監査フックの tool_start / tool_end 記録のみ。サブエージェント自身の
 内部 `FunctionTool` は同 builder 経由で govern 済み）。`register_factory` 経路は builder を通らないため
-govern 対象外。**hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
+既定では govern 対象外。この 2 経路は `AgentRegistry(agent_builder=b,
+post_processor=b.post_processor(sub_agent_tools=True, factory_agents=True))` で registry の第 3 段により
+対象化できる（「registry 第 3 段のオプトイン統治」小節）。**hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
 され `FunctionTool` でもないため `on_tool_start` が発火せず、評価も監査も発生しない（統治されるのは
 client-side MCP = `spec.mcp_servers` 経由のみ）。同じ理由で、MCP サーバから `list_prompts` /
 `get_prompt` / resources 経由で取得した文面を利用者が `instructions` 等へ流し込む使い方はツール呼び出し
@@ -2488,7 +2510,9 @@ build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む・�
 呼び出しが既に実行済み / 実行中ならその副作用は残る（deny は per-call でありターン単位のロールバックでは
 ない）。
 
-判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。
+判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。`sub_agents` の as_tool と
+`register_factory` の Agent のオプトイン統治の判断は `docs/adr/0042-registry-post-process-stage-for-governance.md`
+を参照する。
 
 ### GovernedAgentBuilder（装飾 builder）
 
@@ -2518,6 +2542,10 @@ class GovernedAgentBuilder:
     def unapplied_overrides(self) -> frozenset[str]: ...  # 未適用の overrides キー（typo 検知）
 
     def build(self, spec: AgentSpec) -> Agent: ...
+
+    def post_processor(
+        self, *, sub_agent_tools: bool = False, factory_agents: bool = False
+    ) -> AgentPostProcessor: ...                          # registry 第 3 段のオプトイン統治（両方 False は ValueError）
 ```
 
 - `policy` / `audit_sink` は `runtime/governance` では**不透明値として保持**し、評価・読込は
@@ -2577,6 +2605,47 @@ class GovernedAgentBuilder:
   `on:` 等）/ 未知キー / 強制対象フィールド（`allowed_tools` / `blocked_patterns`）の不正な値形状 /
   compile 不能な正規表現は、読み込み時に `ValueError` で拒否する。本統合で強制されないフィールドの
   指定は `RuntimeWarning` で警告する（強制対象は `allowed_tools` と `blocked_patterns` のみ）。
+
+### registry 第 3 段のオプトイン統治
+
+`sub_agents` の as_tool と `register_factory` の Agent は、`GovernedAgentBuilder.post_processor(...)` が返す
+`AgentPostProcessor` を `AgentRegistry` の `post_processor` 引数へ渡した場合に限り、registry の第 3 段
+（「循環ハンドオフ解決」節）で統治される。渡さなければ第 3 段は無く、統治は build 時結線だけで完結する。
+
+```python
+governed = GovernedAgentBuilder(policy="policy.yaml")
+registry = AgentRegistry(
+    agent_builder=governed,  # 装飾・入れ子にしてよい
+    post_processor=governed.post_processor(sub_agent_tools=True, factory_agents=True),
+)
+```
+
+- **post-processor は builder の状態を共有する**: 生成元 builder のポリシー（YAML 解決スナップショット）・
+  override・既定 sink・override 適用記録を共有するため、監査チェーンは build 時の記録と連続する。registry は
+  明示的に渡された post-processor だけを呼ぶため、`agent_builder` をどう装飾・入れ子にしても効く。build 時
+  結線を代替しないため、`agent_builder` の構築経路に同じ `GovernedAgentBuilder` の `build` が含まれる前提で
+  使う。builder 自身を `post_processor=` に渡すと `TypeError`、両フラグ False は `ValueError`。
+- **`sub_agent_tools=True`（spec 経路）**: `_adapters/governance` の `govern_ungoverned_tools` が、`agent.tools`
+  のうち build 時に統治済みの印が無い `FunctionTool`（wire が注入した as_tool 等）だけを govern ラップする。
+  `agent.tools` の list を再束縛せず同じ list の要素を置換するため、結線途中で作られた list 共有の clone
+  （`Agent.clone` に `tools=` を渡さない既定）にも統治が届く。hooks は build 時に合成済みのため触らない。
+  統治済みの印は `_govern_tool` が作ったラッパ関数との同一性（弱参照の登録簿）で判定する。
+- **`factory_agents=True`（factory 経路）**: `govern_agent` が factory の戻り値を clone し、全 `FunctionTool` の
+  govern ラップと監査フックの合成を行う（印は見ない）。factory が返した Agent は変更せず、`registry.get` は
+  clone を返す。
+- **監査 `tool:` の `agent_id`**: 注入 as_tool は親エージェントの登録名、factory Agent は `register_factory`
+  の名前。as_tool の評価は親の `allowed_tools` に as_tool の公開名が要る。
+- **適用記録と既定 sink**: factory 名の override は `factory_agents=True` の統治の成功で適用済みになる（既定の
+  素通しでは記録しない）。factory だけの registry で `factory_agents=True` の場合、既定 sink は初回の
+  factory 統治で生成される。
+- **境界**: `sub_agent_tools=True` では as_tool の入力文が `tool:` レコードの `details.arguments` に全文記録
+  される。統治済みの Agent を返す factory は元のポリシーと factory 名のポリシーの両方で評価され、`tool:` と
+  ライフサイクル記録が 2 回ずつ残る。印は「いずれかのポリシーで統治済み」を示し、自作 `inner` が独自に
+  追加した印の無い `FUNCTION` tool はオプトイン時に統治される。結線途中の Agent から factory が作った
+  Agent の統治の詳細を含め、境界の正本は `GovernedAgentBuilder.post_processor()` の docstring とする。
+
+強制点は増えない（オプトイン分も同じ実行本体ラップで評価する）。判断の詳細は
+`docs/adr/0042-registry-post-process-stage-for-governance.md` を参照する。
 
 ### 配置と隔離
 

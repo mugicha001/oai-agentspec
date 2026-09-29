@@ -214,3 +214,44 @@ def test_yaml_policy_resolved_once_and_snapshotted(
     # 元の内容（lookup のみ許可）が両エージェントに効いている。
     tools = {t.name: t for t in agent2.tools}
     assert set(tools) == {"lookup"}
+
+
+async def test_override_yaml_policy_resolved_once_and_snapshotted(
+    agt_symbols: tuple[Any, Any, Any],
+    tmp_path: Path,
+) -> None:
+    """override 値の YAML パスも初回解決でスナップショットされ、builder 共有の再構築で再読込しない。
+
+    既定ポリシー側と同じ不変条件を override 側で固定する。初回 `get` 後に override の YAML を
+    破壊しても、builder を共有する `clone()` 側の再構築は初回スナップショット（refund 許可）で
+    続行し、破壊後の内容で失敗しないことを実行時の allow / deny で観測する。
+    """
+    governance_policy, _, policy_violation_error = agt_symbols
+    override_path = tmp_path / "support.yaml"
+    override_path.write_text("allowed_tools: [lookup, refund]\n", encoding="utf-8")
+    builder = GovernedAgentBuilder(
+        policy=governance_policy(name="readonly", allowed_tools=["lookup"]),
+        overrides={"support": str(override_path)},
+    )
+    registry = AgentRegistry(agent_builder=builder)
+    for name in ("triage", "support"):
+        registry.register(
+            AgentSpec(
+                name=name,
+                instructions="x",
+                tools=[_make_tool("lookup"), _make_tool("refund")],
+            )
+        )
+    registry.get("support")
+
+    # 初回 build 後に override の YAML を破壊しても、builder を共有する clone 側の再構築が通る。
+    override_path.write_text("allowed_tool: [typo]\n", encoding="utf-8")
+    cloned = registry.clone()
+    support_refund = {t.name: t for t in cloned.get("support").tools}["refund"]
+    triage_refund = {t.name: t for t in cloned.get("triage").tools}["refund"]
+    args = '{"text": "A"}'
+
+    # 初回スナップショット（refund 許可）が override 側に効き続け、既定側は deny のまま。
+    assert "refund:" in str(await support_refund.on_invoke_tool(_ctx("refund", args), args))
+    with pytest.raises(policy_violation_error, match="refund"):
+        await triage_refund.on_invoke_tool(_ctx("refund", args), args)

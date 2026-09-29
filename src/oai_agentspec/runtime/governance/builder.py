@@ -3,7 +3,9 @@
 `AgentBuilder` Protocol（`build(spec) -> Agent`）を満たす別実装で、`inner`（既定は `_adapters` の
 `DefaultAgentBuilder`）を装飾する。build 時に各ツールを govern ラップし、監査 `AgentHooks` を装着し
 た新 `AgentSpec` を `inner.build` へ渡す（ポリシー評価・監査記録は実行時に AGT 側で動く・
-build-don't-run）。
+build-don't-run）。`post_processor(...)` が返す `AgentPostProcessor` を registry の `post_processor`
+引数へ渡した場合に限り、registry 第 3 段で `sub_agents` の as_tool と factory Agent も統治する
+（既定では何もしない）。
 
 `policy` / `audit_sink` は本層では不透明値として保持し、評価・読込・SDK/AGT 結合は
 `_adapters.governance` へ委譲する（本層は `agents` / AGT を実 import せず plain 値・不透明型のみ扱
@@ -20,7 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from ..._adapters import Agent
-    from ...protocols import AgentBuilder
+    from ...protocols import AgentBuilder, AgentPostProcessor
     from ...spec import AgentSpec
 
 
@@ -30,6 +32,8 @@ class GovernedAgentBuilder:
     `AgentRegistry(agent_builder=GovernedAgentBuilder(policy=...))` で注入すると、registry の遅延
     構築が唯一の構築経路（`_builder().build`）を通るため、循環ハンドオフ解決後の到達可能 spec も
     govern 済みになる。`AgentSpec` / `tools` / コア `__all__` / `AgentBuilder` Protocol は変えない。
+    統治は `build` で適用されるため、registry 外で `build(spec)` を直接呼んで得た Agent も
+    govern 済みである。
 
     強制点は 2 つある。`spec.tools` の `FunctionTool` は build 時に実行本体
     （`on_invoke_tool`）をラップして評価する。`spec.mcp_servers` 経由の MCP ツールは SDK が
@@ -37,10 +41,15 @@ class GovernedAgentBuilder:
     で評価する（宣言は同じ `allowed_tools` / `blocked_patterns` で足り、規約は 1 本のまま）。
 
     既知の境界（govern 対象外）:
-        - `sub_agents` の as_tool は registry が build 後に注入するため per-call の allow/deny
-          評価・監査レコードを持たない（監査フックの tool_start / tool_end 記録のみ）。サブ
-          エージェント自身が同 builder で build されていれば内部 `FunctionTool` は govern 済み。
-        - `register_factory` 経路は builder（`build`）を通らないため govern 対象外。
+        - `sub_agents` の as_tool は registry が build 後に注入するため、既定では per-call の
+          allow/deny 評価・監査レコードを持たない（監査フックの tool_start / tool_end 記録のみ）。
+          サブエージェント自身が同 builder で build されていれば内部 `FunctionTool` は govern 済み。
+          `post_processor(sub_agent_tools=True)` を registry へ渡すと対象化され、registry 第 3 段で
+          親エージェントのポリシー・親の登録名で評価される（`allowed_tools` には as_tool の公開名
+          を書く）。
+        - `register_factory` 経路は builder（`build`）を通らないため、既定では govern 対象外。
+          `post_processor(factory_agents=True)` を registry へ渡すと対象化され、registry 第 3 段で
+          factory Agent を clone して統治する（`registry.get` は clone を返し identity が変わる）。
         - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより
           先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny）。
         - hosted MCP（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
@@ -51,6 +60,8 @@ class GovernedAgentBuilder:
         - 評価対象はツール名と引数のみで、**ツールの戻り値は評価されない**（許可した呼び出しの
           結果は素通しでモデル文脈へ入る）。第三者の MCP サーバを使う場合、戻り値が間接プロンプト
           インジェクションの経路になるため SDK の出力ガードレールを併用する。
+
+    オプトイン（registry 第 3 段の統治）の使い方と境界は `post_processor()` を参照する。
 
     MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）:
         - MCP の deny は `on_tool_start` からの送出で合成チェーンを中断するため、利用者の
@@ -98,6 +109,8 @@ class GovernedAgentBuilder:
                 フォールバックする。値は `policy` と同形式（YAML パス / ポリシーオブジェクト）で、
                 既定と同一の fail-fast 検証を受ける（None は不正値・既定へ戻す意図はキーの削除で
                 表現する）。未適用キーは `unapplied_overrides` で確認できる（typo 検知）。
+                factory 経路（`post_processor(factory_agents=True)`）では `register_factory` の
+                名前で引き当てる。
         """
         self._policy = policy
         self._audit_sink = audit_sink
@@ -164,7 +177,9 @@ class GovernedAgentBuilder:
         失敗したキーは未適用のまま残る）。registry の解決（`AgentRegistry.get`）は途中失敗時に
         構築済みエージェントをロールバックするが、本プロパティはそのトランザクションを観測しない
         ため、ロールバックされた build のキーも適用済みのままになる（次回の解決成功後に確認する
-        運用を前提とする）。
+        運用を前提とする）。factory 経路の名前は `post_processor(factory_agents=True)` を
+        registry へ渡した場合に限り、factory Agent の統治の成功で適用済みになる（既定の素通し
+        では適用済みにしない）。
 
         Returns:
             未適用の overrides キーの frozenset。全キー適用済み（または overrides 未指定）なら空。
@@ -177,12 +192,61 @@ class GovernedAgentBuilder:
 
         既定 sink（`audit_sink=None` 指定時）は builder 内で生成・build 間で共有され、本プロパティで
         取得・検証できる（記録の `verify_chain` 等）。実運用では
-        `GovernedAgentBuilder(audit_sink=...)` で明示指定もできる。
+        `GovernedAgentBuilder(audit_sink=...)` で明示指定もできる。factory だけの registry で
+        `post_processor(factory_agents=True)` を渡した場合は、初回の factory 統治で生成される。
 
         Returns:
             監査 sink オブジェクト。未指定かつ初回 build 前なら None。
         """
         return self._audit_sink
+
+    def _ensure_sink(self) -> object:
+        """監査 sink を返す（未指定なら既定 sink を 1 度だけ生成して保持する）。
+
+        Returns:
+            利用者指定の sink、または builder 内で共有する既定 sink。
+
+        Raises:
+            ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
+        """
+        from ..._adapters import new_audit_sink
+
+        if self._audit_sink is None:
+            self._audit_sink = new_audit_sink()
+        return self._audit_sink
+
+    def _policy_for(self, name: str) -> object:
+        """`name` に効くポリシー（override または既定）を返す。
+
+        YAML パスのポリシーは初回使用時に 1 度だけ読み込み・検証し、解決済みオブジェクトで
+        保持する（build ごとの再読込は、同一 registry 解決内でのエージェント間ポリシー不整合
+        （ファイル更新タイミング差）や非強制フィールド警告の重複発火を生むため。以降の build
+        はスナップショットを共有する）。オブジェクト形はそのまま返す（govern 側で検証）。
+
+        Args:
+            name: エージェント名（spec 経路では `spec.name`・factory 経路では登録名）。
+
+        Returns:
+            適用するポリシー（解決済みオブジェクト、または利用者指定のオブジェクト）。
+
+        Raises:
+            ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
+        """
+        import os
+
+        from ..._adapters import resolve_policy
+
+        if name in self._overrides:
+            policy = self._overrides[name]
+            if isinstance(policy, (str, os.PathLike)):
+                policy = resolve_policy(policy)
+                self._overrides[name] = policy
+        else:
+            policy = self._policy
+            if isinstance(policy, (str, os.PathLike)):
+                policy = resolve_policy(policy)
+                self._policy = policy
+        return policy
 
     def build(self, spec: AgentSpec) -> Agent:
         """spec を govern 化して `inner` で Agent 化する（`AgentBuilder` Protocol 実装）。
@@ -198,8 +262,9 @@ class GovernedAgentBuilder:
         `unapplied_overrides` から除かれる（override の読込・検証に失敗した build ではキーが
         未適用のまま残り、失敗した override を診断できる）。
 
-        `sub_agents` の as_tool（registry が build 後に注入）と `register_factory` 経路は govern
-        対象外（クラス docstring の「既知の境界」を参照）。
+        `sub_agents` の as_tool（registry が build 後に注入）と `register_factory` 経路は既定では
+        govern 対象外（オプトイン時は `post_processor()` が返す post-processor が統治する。
+        クラス docstring の「既知の境界」を参照）。
 
         Args:
             spec: 構築対象の `AgentSpec`。
@@ -210,31 +275,165 @@ class GovernedAgentBuilder:
         Raises:
             ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
         """
-        import os
+        from ..._adapters import DefaultAgentBuilder, govern_spec
 
-        from ..._adapters import DefaultAgentBuilder, govern_spec, new_audit_sink, resolve_policy
-
-        if self._audit_sink is None:
-            self._audit_sink = new_audit_sink()
-        # YAML パスのポリシーは初回使用時に 1 度だけ読み込み・検証し、解決済みオブジェクトで
-        # 保持する（build ごとの再読込は、同一 registry 解決内でのエージェント間ポリシー不整合
-        # （ファイル更新タイミング差）や非強制フィールド警告の重複発火を生むため。以降の build
-        # はスナップショットを共有する）。オブジェクト形はそのまま渡す（govern_spec 内で検証）。
-        used_override = spec.name in self._overrides
-        if used_override:
-            policy = self._overrides[spec.name]
-            if isinstance(policy, (str, os.PathLike)):
-                policy = resolve_policy(policy)
-                self._overrides[spec.name] = policy
-        else:
-            policy = self._policy
-            if isinstance(policy, (str, os.PathLike)):
-                policy = resolve_policy(policy)
-                self._policy = policy
-        governed = govern_spec(spec, policy=policy, audit_sink=self._audit_sink)
+        sink = self._ensure_sink()
+        policy = self._policy_for(spec.name)
+        governed = govern_spec(spec, policy=policy, audit_sink=sink)
         builder = self._inner if self._inner is not None else DefaultAgentBuilder()
         agent = builder.build(governed)
         # 適用済み記録は build 成功後（失敗した override を unapplied_overrides に残すため）。
-        if used_override:
+        if spec.name in self._overrides:
             self._applied_overrides.add(spec.name)
         return agent
+
+    def post_processor(
+        self, *, sub_agent_tools: bool = False, factory_agents: bool = False
+    ) -> AgentPostProcessor:
+        """registry 第 3 段で統治する `AgentPostProcessor` を返す（オプトイン）。
+
+        戻り値を `AgentRegistry` の `post_processor` 引数へ渡した場合に限り、registry は構築・
+        結線の完了後に本 builder のポリシー・監査 sink・override 適用記録を共有して統治する
+        （監査チェーンは build 時の記録と連続する）。registry は明示的に渡された post-processor
+        だけを呼ぶため、`agent_builder` をどう装飾・入れ子にしても効く::
+
+            governed = GovernedAgentBuilder(policy="policy.yaml")
+            registry = AgentRegistry(
+                agent_builder=governed,
+                post_processor=governed.post_processor(sub_agent_tools=True),
+            )
+
+        post-processor は build 時の統治（`spec.tools` のラップ・監査 / MCP フック・`spec.hooks`
+        との合成）を代替しない。`agent_builder` の構築経路に同じ `GovernedAgentBuilder` の
+        `build` が含まれる前提である（装飾してよい）。構築経路に `GovernedAgentBuilder` が無いと、
+        spec 経路の Agent は `sub_agent_tools=True` の第 3 段で印の無い `FunctionTool`（`spec.tools`
+        と注入された as_tool）がラップされるだけで、監査フックが付かないため MCP ツールの評価と
+        ライフサイクル監査は行われない（例外も警告も出ない。`factory_agents=True` の factory Agent
+        は `govern_agent` が hooks も合成する）。通常は `agent_builder` に注入した同じ
+        `GovernedAgentBuilder` から作る。別の builder から作ると、その builder のポリシー・
+        sink で評価される。
+
+        オプトイン時の境界:
+            - `sub_agent_tools=True` では、wire が注入した `sub_agents` の as_tool を親
+              エージェントのポリシー・親の登録名で評価し、as_tool の入力文が `tool:` レコードの
+              `details.arguments` に全文記録される（個人情報等を含みうる。記録先を `audit_sink`
+              で選定して考慮する）。
+            - as_tool は build 時の統治済みの印（`_adapters` 側でラップ済み実行本体を登録した
+              もの）が無い `FunctionTool` として判別する。印は「いずれかのポリシーで統治済み」を
+              示すため、自作 `inner` が別 agent / 別 builder で統治済みの tool を足すと、その
+              tool は元のポリシーだけで評価される。逆に自作 `inner` が独自に追加した印の無い
+              `FUNCTION` tool は統治される。
+            - 統治済みの Agent（例: `registry.get` の戻り）を返す factory は、元のポリシーと
+              factory 名のポリシーの両方で評価され、`tool:` レコードとライフサイクル記録が 2 回
+              ずつ残る（どちらかが deny なら deny）。
+            - 結線途中の Agent X（spec）から factory F が作った Agent における、X の注入 as_tool
+              の統治は次のとおり。`factory_agents=True` の統治 clone は新しい list を持つため、
+              X への要素置換は届かず、clone 後に注入された as_tool も含まれない。
+
+              ================================  =======================  =====================
+              F の戻り値                        factory_agents=False     factory_agents=True
+              ================================  =======================  =====================
+              X そのもの                        X の第 3 段で X の       F 名のポリシーだけ
+                                                ポリシー（sub_agent_
+                                                tools=True のとき）
+              `X.clone(...)`（list 共有）       同上（X のポリシー）     F 名のポリシーだけ
+              新しい list へ写したもの          未統治                   F 名のポリシーだけ
+              X の get がロールバックした場合   未統治（F のキャッシュ   F 名のポリシーの
+                                                が第 3 段前の X を持ち   統治は残る
+                                                続け、X の第 3 段は
+                                                起きない）
+              ================================  =======================  =====================
+
+        Args:
+            sub_agent_tools: True なら registry が build 後に注入した `sub_agents` の as_tool を
+                親エージェントのポリシーで統治する。
+            factory_agents: True なら `register_factory` 経路の Agent を clone して統治する
+                （`registry.get` は clone を返す）。
+
+        Returns:
+            本 builder の状態を共有する `AgentPostProcessor`。
+
+        Raises:
+            ValueError: `sub_agent_tools` / `factory_agents` の両方が False の場合。
+        """
+        if not sub_agent_tools and not factory_agents:
+            raise ValueError(
+                "post_processor() には sub_agent_tools / factory_agents の少なくとも一方を "
+                "True で指定してください"
+            )
+        return _GovernancePostProcessor(
+            self, sub_agent_tools=sub_agent_tools, factory_agents=factory_agents
+        )
+
+
+class _GovernancePostProcessor:
+    """`GovernedAgentBuilder.post_processor()` が返す `AgentPostProcessor` 実装。
+
+    ポリシー・監査 sink・override 適用記録は生成元の builder と共有する。
+    """
+
+    def __init__(
+        self, builder: GovernedAgentBuilder, *, sub_agent_tools: bool, factory_agents: bool
+    ) -> None:
+        """post-processor を初期化する。
+
+        Args:
+            builder: 状態（ポリシー・sink・適用記録）を共有する生成元の builder。
+            sub_agent_tools: spec 経路で注入 as_tool を統治するか。
+            factory_agents: factory 経路の Agent を統治するか。
+        """
+        self._builder = builder
+        self._sub_agent_tools = sub_agent_tools
+        self._factory_agents = factory_agents
+
+    def post_process(self, agent: Agent, *, name: str, spec: AgentSpec | None) -> Agent:
+        """構築・結線済みの Agent を統治する（`AgentPostProcessor` Protocol 実装）。
+
+        spec 経路（`spec is not None`）は `sub_agent_tools` が True のときだけ、`name` に効く
+        ポリシーと共有 sink で `_adapters.govern_ungoverned_tools` を呼び、build 時に統治済みで
+        ない `FunctionTool`（結線段で注入された `sub_agents` の as_tool 等）を `agent.tools` の
+        同じ list 上で統治して `agent` 自身を返す（`hooks` は build 時に合成済みのため触らず、
+        override の適用記録も build 時に済んでいる）。
+
+        factory 経路（`spec is None`）は `factory_agents` が True のときだけ
+        `_adapters.govern_agent` で統治した clone を返し（factory が返した `agent` は変更しない）、
+        成功後に `name` が `overrides` の掲載キーなら適用済みとして記録する。
+
+        Args:
+            agent: registry が構築・結線した Agent（factory 経路では factory の戻り値）。
+            name: registry の登録名（監査 `tool:` レコードの `agent_id` とポリシー引き当てに使う）。
+            spec: spec 経路では宣言した `AgentSpec`、factory 経路では None。
+
+        Returns:
+            spec 経路は `agent` 自身、factory 経路は `factory_agents` が True なら統治した clone・
+            False なら `agent`。
+
+        Raises:
+            ImportError: governance extra（agent-governance-toolkit）が未導入の場合（案内付き）。
+            TypeError: factory 経路で `agent.hooks` が run 単位フックの場合（監査フックとの合成が
+                拒否する）。
+        """
+        from ..._adapters import govern_agent, govern_ungoverned_tools
+
+        builder = self._builder
+        if spec is not None:
+            if self._sub_agent_tools:
+                govern_ungoverned_tools(
+                    agent,
+                    policy=builder._policy_for(name),
+                    audit_sink=builder._ensure_sink(),
+                    agent_name=name,
+                )
+            return agent
+        if not self._factory_agents:
+            return agent
+        result = govern_agent(
+            agent,
+            policy=builder._policy_for(name),
+            audit_sink=builder._ensure_sink(),
+            agent_name=name,
+        )
+        # 適用済み記録は統治成功後（失敗した override を unapplied_overrides に残すため）。
+        if name in builder._overrides:
+            builder._applied_overrides.add(name)
+        return result
