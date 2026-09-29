@@ -255,6 +255,7 @@ agent = registry.get(Names.PLANNER)
 - `mcp_config` の dict は build 時にコピーされず参照が渡ります。宣言後に mutate すると構築済み `Agent` へ伝播します（`registry.freeze()` は複製するため遮断されます）
 - `mcp_config={"include_server_in_tool_names": True}` にすると公開名は `mcp_{サーバ名}__{ツール名}` を基本形とし、SDK が文字置換 / 長さ超過時の切り詰め等の変形を加える場合があります（詳細は `docs/architecture.md` を参照）。名前でツールを参照する仕組み（ポリシー等）を併用している場合は、実際の公開名を確認して宣言してください
 - `validate_agent_names` は任意の追加手段です。呼ばなくても従来どおり `validate()` / `get()` の実行時検出は働きます
+- `extra["tool_use_behavior"]` に `{"stop_at_tool_names": "refund"}` のように値を文字列のまま渡すと、SDK はツール名がその文字列の部分文字列かどうかで判定するため、意図しないツール（例: `re`）でも停止します。形の誤り（値が list / tuple でない・キー欠落・要素が str でない）は構築時に `ValueError`、値が実行時のツール名（name override 適用後）のどれとも一致しない場合は `RuntimeWarning` になります。検査の対象・時点の詳細は `docs/architecture.md`「名前参照の検証」節を参照してください
 
 ## 参照
 

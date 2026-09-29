@@ -1312,6 +1312,28 @@ str 以外の要素」「ツール境界の guardrail 名（振り分け先が�
 `guardrails` のコンテナ型は登録時（`register` / `update`）に検証する。素の str を渡すと 1 文字ずつ名前参照として
 解釈され、偽の「未登録」が大量に報告されるため、宣言の時点で拒否する。
 
+`extra["tool_use_behavior"]` に dict 形（`{"stop_at_tool_names": [...]}`）を渡した場合、形状検査と名前の
+突合を別の時点で行う。形状検査（`stop_at_tool_names` キーの存在・値が list / tuple・各要素が str）は
+`build_agent` 時に行い、違反は `ValueError` で構築を止める。`AgentBuilder` を差し替えて `build_agent`
+を通らない場合も、結線後の突合の前に同じ形状検査をやり直す。形状違反のエラー文面には、str の値は
+そのまま載せるが、str 以外の値・要素は repr を載せず型名と `name` 属性（str の場合のみ）だけを載せる
+（ツールの repr はモデル向けの description を含み、例外文面・ログへ漏れるため）。名前の突合
+（`stop_at_tool_names` の値が実行時のツール名のどれとも一致するか）は `_wire` 完了後、sub_agents の
+as_tool 名が確定した時点で行い、不一致は `RuntimeWarning` に留める（構築は成功する）。突合の候補は
+`agent.tools` に含まれる `FunctionTool` の `name` / `qualified_name` で、`is_enabled` で無効化されうる
+ツールも候補に含める。`agent.handoffs` 側のハンドオフは候補に含めない（SDK の停止判定が function tool
+の実行結果のみを見るため）。MCP サーバを持つエージェントと `SandboxAgent` は突合の対象外とする
+（どちらも run 時にツールが増えるため、構築時点のツール集合では判定できない）。dict 形以外の
+`tool_use_behavior`（文字列形・関数形・None）は両検査とも素通しする。不一致をエラーでなく警告に
+留めているのは、run 時にツールが増える経路を構築時点で静的に網羅できないためで、誤検知時も構築は
+止めない。
+
+この検証は `registry.validate()` の対象外で、`get(name)` によるビルド時に行う（`validate()` は
+ビルドしないため、as_tool 名などの実行時のツール名を得られない）。`register_factory` で
+登録した spec は `build_agent` / `_wire` を経由しないため検査対象外（factory の責務）。registry を
+経由しない直接 `build_agent` 呼び出しでは、形状検査のみが効き、名前の突合（sub_agents 結線後にしか
+判定できない）は行われない。
+
 ## ランタイム差し替え
 
 起動後の Agent / テンプレートのホットスワップを支える API。
