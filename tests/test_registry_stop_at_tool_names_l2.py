@@ -8,12 +8,14 @@ MCP / Sandbox の突合除外、DI 差し替え builder 経路での形状検査
 
 from __future__ import annotations
 
+import dataclasses
 import warnings
 
 import pytest
 from agents import Agent, function_tool
 
 from oai_agentspec import AgentRegistry, AgentSpec, FacadeMode, HandoffGraph
+from oai_agentspec.protocols import AgentPostProcessor
 from oai_agentspec.spec import SandboxAgentSpec
 from oai_agentspec.workflow import END, START, WorkflowGraph
 
@@ -44,7 +46,19 @@ def _get_without_warning(registry: AgentRegistry, name: str) -> Agent:
 
 def _registry_with_researcher(**router_kwargs: object) -> AgentRegistry:
     """sub_agent `researcher` を持つ router を登録した registry を返す。"""
-    registry = AgentRegistry()
+    return _registry_with_researcher_using(None, **router_kwargs)
+
+
+def _registry_with_researcher_using(
+    post_processor: AgentPostProcessor | None, **router_kwargs: object
+) -> AgentRegistry:
+    """`_registry_with_researcher` と同じ構成を、指定 post-processor を渡した registry で返す。
+
+    None なら `post_processor` 引数自体を渡さない（既定経路と同一）。
+    """
+    registry = (
+        AgentRegistry() if post_processor is None else AgentRegistry(post_processor=post_processor)
+    )
     registry.register(AgentSpec(name="researcher", instructions="r", model=FakeModel()))
     registry.register(
         AgentSpec(
@@ -199,6 +213,47 @@ def test_get_with_di_builder_reruns_shape_check_in_wire() -> None:
         "である必要がありますが 'str' が渡されました: 'refund'"
     )
     assert registry._built == {}
+
+
+# ----------------------------------------------------------------------
+# post-process（第 3 段）で as_tool を差し替える post-processor
+# ----------------------------------------------------------------------
+
+
+async def _replacement_invoke(ctx: object, input_json: str) -> str:
+    """差し替え後の as_tool 実行本体（呼ばれない。同一性の観測にのみ使う）。"""
+    return input_json
+
+
+class _ToolReplacingPostProcessor:
+    """post_process で tools を `dataclasses.replace` 版へ in-place で差し替える post-processor。"""
+
+    def __init__(self) -> None:
+        self.replaced: dict[str, list[object]] = {}
+
+    def post_process(self, agent: Agent, *, name: str, spec: AgentSpec | None) -> Agent:
+        agent.tools[:] = [
+            dataclasses.replace(tool, on_invoke_tool=_replacement_invoke) for tool in agent.tools
+        ]
+        self.replaced[name] = list(agent.tools)
+        return agent
+
+
+def test_get_accepts_stop_at_name_with_post_process_replacing_as_tool() -> None:
+    """post-process が as_tool を差し替えても、停止指定は警告なしで通り差し替え後が載る。
+
+    post-processor は `AgentRegistry(post_processor=...)` で明示的に渡す。
+    """
+    post = _ToolReplacingPostProcessor()
+    assert isinstance(post, AgentPostProcessor)
+    registry = _registry_with_researcher_using(post, extra=_stop_at("researcher"))
+
+    agent = _get_without_warning(registry, "router")
+
+    assert agent.tools[0].name == "researcher"
+    assert agent.tools[0].on_invoke_tool is _replacement_invoke
+    assert len(post.replaced["router"]) == 1
+    assert agent.tools[0] is post.replaced["router"][0]
 
 
 # ----------------------------------------------------------------------

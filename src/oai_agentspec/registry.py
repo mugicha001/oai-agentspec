@@ -2,7 +2,9 @@
 
 `agents` には依存せず（SDK 型は `TYPE_CHECKING` + `_adapters` 経由）、DI で注入された
 `AgentBuilder` を用いて Agent を遅延構築する。循環ハンドオフは `get(name)` 起点・
-到達可能 spec のみの局所 2 パス遅延バインドで解決する（詳細は docs/architecture.md）。
+到達可能 spec のみの局所 2 パス遅延バインドで解決し、`post_processor`
+（`AgentPostProcessor`）を渡した場合のみ結線完了後の第 3 段で post-process する
+（詳細は docs/architecture.md）。
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from ._validation import (
     validate_instructions_append_shape,
     validate_instructions_callable,
 )
+from .protocols import AgentPostProcessor
 from .spec import AgentSpec, HandoffConfig
 
 if TYPE_CHECKING:
@@ -43,8 +46,10 @@ class RegistryFrozenError(RuntimeError):
 class AgentRegistry:
     """Agent を宣言的に登録し、遅延構築・差し替えを管理する。
 
-    エージェントは初回 `get()` 時に局所 2 パスで構築されるため、handoffs / sub_agents の
-    循環を許容する。単一スレッド / 単一イベントループ前提（並行制御は利用者責任）。
+    エージェントは初回 `get()` 時に build（パス 1）→ wire（パス 2）→ post-process（第 3 段）
+    の 3 段で構築される。局所 2 パスで結線するため handoffs / sub_agents の循環を許容し、
+    第 3 段は `post_processor` を渡した場合のみ行う。単一スレッド /
+    単一イベントループ前提（並行制御は利用者責任）。
     """
 
     def __init__(
@@ -52,6 +57,7 @@ class AgentRegistry:
         agent_builder: AgentBuilder | None = None,
         *,
         guardrail_registry: GuardrailProvider | None = None,
+        post_processor: AgentPostProcessor | None = None,
     ):
         """レジストリを生成する。
 
@@ -61,9 +67,23 @@ class AgentRegistry:
             guardrail_registry: `AgentSpec.guardrails` の名前参照を解決する
                 `GuardrailProvider` 実装（`runtime.guardrails` の `GuardrailRegistry` 等）。
                 省略時は名前参照を解決できず、宣言があれば build / validate で報告する。
+            post_processor: 構築・結線済みの Agent を第 3 段で加工する `AgentPostProcessor`
+                実装。明示的に渡したものだけを呼び、builder が同 Protocol を満たしていても
+                呼ばない。省略時は第 3 段を行わない。post-process は build 時の加工を代替
+                しない（build 時に行うべき加工は `agent_builder` の構築経路に含める。
+                `agent_builder` を装飾してよい）。
+
+        Raises:
+            TypeError: `post_processor` が `AgentPostProcessor` を満たさない場合。
         """
+        if post_processor is not None and not isinstance(post_processor, AgentPostProcessor):
+            raise TypeError(
+                "post_processor には `post_process(agent, *, name, spec)` を持つオブジェクト"
+                f"（AgentPostProcessor）を渡してください: {type(post_processor).__name__}"
+            )
         self._agent_builder = agent_builder
         self._guardrail_registry = guardrail_registry
+        self._post_processor = post_processor
         self._specs: dict[str, AgentSpec] = {}
         self._factories: dict[str, AgentFactory] = {}
         self._built: dict[str, Agent] = {}
@@ -139,7 +159,8 @@ class AgentRegistry:
         `RunContextWrapper` を複数 run へ渡した場合は記録が残るが、禁止が残る方向（安全側）。
         guardrail 名前参照の解決元（`GuardrailProvider`）は参照を共有継承する（登録簿は
         宣言の保持に徹し build 結果を汚さないため共有で安全・継承しないと clone 側で名前
-        参照が解決不能になる）。
+        参照が解決不能になる）。post-process の実装（`AgentPostProcessor`）も参照を共有継承する
+        （継承しないと clone 側で第 3 段の加工が静かに脱落する）。
 
         評価（LLMOps）で「利用者 registry を一切汚さずに tools をモック化した派生 registry」を
         作るための宣言層プリミティブ。`transform_spec` には plain な `AgentSpec -> AgentSpec` を
@@ -151,7 +172,11 @@ class AgentRegistry:
         Returns:
             独立した新 `AgentRegistry`。
         """
-        cloned = AgentRegistry(self._agent_builder, guardrail_registry=self._guardrail_registry)
+        cloned = AgentRegistry(
+            self._agent_builder,
+            guardrail_registry=self._guardrail_registry,
+            post_processor=self._post_processor,
+        )
         for name in self._order:
             if name in self._specs:
                 # 先に独立コピーを作って transform へ渡す。transform が mutate した結果を
@@ -204,31 +229,77 @@ class AgentRegistry:
         return self._order[0] if self._order else None
 
     # ------------------------------------------------------------------
-    # 取得・遅延構築（局所 2 パス遅延バインド）
+    # 取得・遅延構築（build → wire → post-process の 3 段）
     # ------------------------------------------------------------------
     def get(self, name: str) -> Agent:
-        """エージェントを取得する。未構築なら到達可能 spec を局所 2 パスで構築する。
+        """エージェントを取得する。未構築なら構築してキャッシュする。
+
+        spec 経路は到達可能 spec を build（パス 1）→ wire（パス 2）→ post-process（第 3 段）
+        の 3 段でトランザクショナルに構築する（いずれかの段の例外で同じ呼び出しの構築分を
+        巻き戻す）。factory 経路は factory 呼び出し直後に `spec=None` で post-process を
+        1 回行う。post-process は `post_processor` を渡した場合のみ行う。
 
         Raises:
             KeyError: 未登録名の場合。
+            ValueError: spec 経路の post-process が受け取った Agent と別のオブジェクトを
+                返した場合。
         """
         if name in self._built:
             return self._built[name]
         if name in self._factories:
             agent = self._factories[name](self)
+            agent = self._post_process(agent, name=name, spec=None)
             self._built[name] = agent
             return agent
         if name not in self._specs:
             raise KeyError(f"unknown agent: {name}")
 
-        # 到達可能収集とトランザクショナルな 2 パス build/wire + 巻き戻しは共有 leaf
-        # `_registry_core` に委譲する（差分点＝依存辺・bare ビルド・結線はコールバックで注入）。
+        # 到達可能収集とトランザクショナルな 3 段構築 + 巻き戻しは共有 leaf `_registry_core`
+        # に委譲する（差分点＝依存辺・bare ビルド・結線・post-process はコールバックで注入）。
         reachable = collect_reachable(name, self._specs, self._built, self._dependencies)
-        build_two_pass(reachable, self._specs, self._built, self._build_bare, self._wire)
+        build_two_pass(
+            reachable,
+            self._specs,
+            self._built,
+            self._build_bare,
+            self._wire,
+            post_process=self._post_process_spec if self._post_processor is not None else None,
+        )
         return self._built[name]
 
     def _build_bare(self, spec: AgentSpec) -> Agent:
         return self._builder().build(spec)
+
+    def _post_process_spec(self, spec: AgentSpec, agent: Agent) -> Agent:
+        """`build_two_pass` の第 3 段コールバック（spec 経路の post-process）。"""
+        return self._post_process(agent, name=spec.name, spec=spec)
+
+    def _post_process(self, agent: Agent, *, name: str, spec: AgentSpec | None) -> Agent:
+        """`post_processor` を渡していれば、構築済み Agent を加工する。
+
+        Args:
+            agent: 結線完了後（factory 経路では factory の戻り値）の Agent。
+            name: registry に登録された名前。
+            spec: spec 経路なら対応する AgentSpec、factory 経路なら None。
+
+        Returns:
+            加工後の Agent。`post_processor` を渡していなければ `agent` をそのまま返す。
+
+        Raises:
+            ValueError: spec 経路で post_process が受け取った Agent と別のオブジェクトを
+                返した場合。
+        """
+        if self._post_processor is None:
+            return agent
+        result = self._post_processor.post_process(agent, name=name, spec=spec)
+        if spec is not None and result is not agent:
+            raise ValueError(
+                f"agent {name!r} の post_process が受け取った Agent と別のオブジェクトを"
+                "返しました。spec 経路の post_process は受け取った Agent と同一オブジェクトを"
+                "返す必要があります（他 Agent の handoffs / as_tool が同一オブジェクトを参照"
+                "するため）"
+            )
+        return result
 
     def _wire(self, spec: AgentSpec, agent: Agent) -> None:
         """ビルド済み Agent に handoffs / dynamic_handoffs / sub_agents / guardrails を結線する。

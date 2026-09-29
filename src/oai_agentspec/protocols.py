@@ -27,6 +27,8 @@ class AgentBuilder(Protocol):
     実装側の責務となる。デフォルト実装が構築へ反映するのはライブラリが宣言する
     フィールドのみで、利用者定義のサブクラスが追加した独自フィールドは関知しない
     （反映したい場合はカスタム builder を注入する）。
+
+    構築後の加工（post-process）は別 Protocol `AgentPostProcessor` が担う。
     """
 
     def build(self, spec: AgentSpec) -> Agent:
@@ -40,6 +42,39 @@ class AgentBuilder(Protocol):
 
         Raises:
             ValueError: extra に専用フィールドと同名キー、または未知のキーがある場合。
+        """
+        ...
+
+
+@runtime_checkable
+class AgentPostProcessor(Protocol):
+    """構築・結線済みの Agent を加工する責務（DI 注入点）。
+
+    `AgentBuilder` とは別の Protocol である。`AgentRegistry` は
+    `AgentRegistry(post_processor=...)` で明示的に受け取ったものだけを呼び、builder が
+    本 Protocol を満たしていても呼ばない。
+
+    呼び出しは構築の第 3 段（handoffs / サブエージェントの as_tool 結線など、全ての
+    結線が完了した後）に 1 回行われる。`spec` 引数で所有区分が変わる:
+
+    - `spec is not None`（宣言経由・ライブラリ所有の Agent）: 受け取った Agent を
+      in-place で加工し、同一オブジェクトを返す契約。`AgentRegistry` は戻り値を
+      `is` で検査し、異なるオブジェクトが返された場合は `ValueError` を送出する
+      （他の Agent の handoffs / as_tool が同一オブジェクトを参照しているため）。
+    - `spec is None`（factory 経由・利用者所有の Agent）: 受け取った Agent を
+      変更せず、加工が必要であれば新しいインスタンスを返す。
+    """
+
+    def post_process(self, agent: Agent, *, name: str, spec: AgentSpec | None) -> Agent:
+        """構築・結線済みの Agent を加工する。
+
+        Args:
+            agent: 加工対象の agents.Agent（結線完了後）。
+            name: registry に登録された名前。
+            spec: 宣言経由なら対応する AgentSpec、factory 経由なら None。
+
+        Returns:
+            加工後の agents.Agent。`spec` が None でない場合は `agent` と同一オブジェクト。
         """
         ...
 
@@ -88,4 +123,4 @@ class GuardrailProvider(Protocol):
         ...
 
 
-__all__ = ["AgentBuilder", "GuardrailProvider"]
+__all__ = ["AgentBuilder", "AgentPostProcessor", "GuardrailProvider"]

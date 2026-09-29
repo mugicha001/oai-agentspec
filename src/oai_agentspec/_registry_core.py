@@ -1,13 +1,14 @@
-"""registry の到達可能収集 + トランザクショナル 2 パス build/wire の共有ヘルパ（最下層）。
+"""registry の到達可能収集 + トランザクショナル構築（局所 2 パス + 任意の第 3 段）の共有ヘルパ。
 
 通常ルート（`AgentRegistry`）と Realtime 専用ルート（`RealtimeAgentRegistry`）が、遅延構築の
-到達可能収集アルゴリズムと 2 パス build/wire + 巻き戻しセマンティクスを単一ソースで保つための
+到達可能収集アルゴリズムと 2 パス build/wire（+ 任意の第 3 段 post-process）+ 巻き戻し
+セマンティクスを単一ソースで保つための最下層の
 純ヘルパ。`agents` には依存せず、plain な `Mapping` / `MutableMapping`（`_specs` / `_built`）+
 narrow なコールバックのみを受け取る（`_validation` / `_mermaid` と同じ共有 leaf パターン）。
 
 両ルートは宣言型・registry を共用しないが、片側修正による挙動乖離を最も招きやすい安全
-クリティカルな巻き戻し部分を単一ソース化する。差分点（依存辺プロバイダ・bare ビルド・結線）は
-コールバックで注入し、`_wire` / `_require` / factory 分岐は各 registry に据え置く。
+クリティカルな巻き戻し部分を単一ソース化する。差分点（依存辺プロバイダ・bare ビルド・結線・
+post-process）はコールバックで注入し、`_wire` / `_require` / factory 分岐は各 registry に据え置く。
 """
 
 from __future__ import annotations
@@ -64,13 +65,17 @@ def build_two_pass(
     built: MutableMapping[str, Any],
     build_bare: Callable[[Any], Any],
     wire: Callable[[Any, Any], None],
+    *,
+    post_process: Callable[[Any, Any], Any] | None = None,
 ) -> None:
-    """到達可能 spec を局所 2 パス（bare ビルド → 結線）でトランザクショナルに構築する。
+    """到達可能 spec を局所 2 パス + 任意の第 3 段でトランザクショナルに構築する。
 
     パス 1 で handoffs 空・サブツール未注入の bare agent を `build_bare` でビルドして
-    `built` に登録し、パス 2 で `wire` により handoffs / sub_agents を後付け結線する。途中で
-    例外が出たら本呼び出しで新規キャッシュした bare agent を巻き戻し、不完全なインスタンスを
-    残さない（差分点＝bare ビルド・結線はコールバックで注入）。
+    `built` に登録し、パス 2 で `wire` により handoffs / sub_agents を後付け結線する。
+    `post_process` が与えられた場合は、全 spec の結線完了後の第 3 段で各 spec 1 回ずつ
+    呼び、戻り値で `built` を置き換える。いずれかの段で例外が出たら本呼び出しで新規
+    キャッシュした agent を巻き戻し、不完全なインスタンスを残さない（差分点＝bare ビルド・
+    結線・post-process はコールバックで注入）。
 
     Args:
         reachable: `collect_reachable` が返した未ビルド spec 名リスト。
@@ -78,6 +83,8 @@ def build_two_pass(
         built: 構築済みキャッシュのマッピング（`_built`・本関数が破壊的に更新する）。
         build_bare: spec から handoffs 空の agent を構築するコールバック。
         wire: `(spec, agent)` を受け取り handoffs / sub_agents を後付け結線するコールバック。
+        post_process: `(spec, agent)` を受け取り加工後の agent を返す第 3 段のコールバック
+            （任意）。None なら第 3 段を行わない。
     """
     newly_built: list[str] = []
     try:
@@ -89,6 +96,10 @@ def build_two_pass(
         # パス 2: handoffs / sub_agents を後付け結線
         for target in reachable:
             wire(specs[target], built[target])
+        # 第 3 段: 全結線の完了後に post-process（任意）
+        if post_process is not None:
+            for target in reachable:
+                built[target] = post_process(specs[target], built[target])
     except Exception:
         for target in newly_built:
             built.pop(target, None)
