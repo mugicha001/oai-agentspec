@@ -58,7 +58,9 @@ from .context_capture import (  # noqa: F401 - workflow 層への内部窓口（
     RunContextCapture,
 )
 from .governance import (
+    govern_agent,
     govern_spec,
+    govern_ungoverned_tools,
     load_policy_bundle,
     new_audit_sink,
     policy_violation_error_type,
@@ -239,7 +241,9 @@ __all__ = [
     "guardrail_boundary",
     "run_judge_prompt",
     # AGT ガバナンス（ツール単位ポリシー強制 + 監査の SDK/AGT 結合窓口・AGT はトップ非 import）
+    "govern_agent",
     "govern_spec",
+    "govern_ungoverned_tools",
     "load_policy_bundle",
     "new_audit_sink",
     "policy_violation_error_type",

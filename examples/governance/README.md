@@ -47,7 +47,8 @@ agent = registry.get("support")  # 各 tool が govern 済み・監査フック�
 
 エージェントごとにポリシーを出し分ける場合は `overrides`（エージェント名 -> ポリシー）を渡す。
 掲載エージェントはそのポリシー、未掲載は `policy`（既定）へフォールバックする（`spec.name` との
-完全一致で引き当て・正規化なし）。同一ツールでもエージェントによって allow / deny を分けられる。
+完全一致で引き当て・正規化なし。`register_factory` 経路では registry の登録名で引き当てる）。
+同一ツールでもエージェントによって allow / deny を分けられる。
 
 ```python
 builder = GovernedAgentBuilder(
@@ -157,9 +158,19 @@ MCP 経路の非対称（利用者が観測しうる差）:
 
 ## 既知の境界（govern 対象外）
 
-- `sub_agents` の as_tool は registry が build 後に注入するため、per-call の allow / deny 評価・
-  決定記録の対象外（hooks の `tool_start` / `tool_end` 記録のみ。サブエージェント自身の内部
-  `FunctionTool` は同 builder 経由で govern 済み）。
+- `sub_agents` の as_tool（registry が結線段で注入するため build 時のラップ対象に含まれない。
+  既定では hooks の `tool_start` / `tool_end` 記録のみ。サブエージェント自身の内部 `FunctionTool` は
+  同 builder 経由で govern 済み）と `register_factory` 経由の Agent（builder の `build` を通らない。
+  既定では評価も記録も無い）は、既定では対象外。
+  `AgentRegistry(agent_builder=builder, post_processor=builder.post_processor(sub_agent_tools=True, factory_agents=True))`
+  で registry の post-process 段で対象化できる（as_tool の公開名を `allowed_tools` に書く・factory は
+  オプトイン時 clone が返り identity が変わる）。`sub_agent_tools=True` では as_tool の入力文が
+  監査ログ（`tool:` レコードの `details.arguments`）に全文記録される。
+- オプトインは post-processor を `post_processor=` で明示的に渡すので、`agent_builder` の
+  `GovernedAgentBuilder` を装飾 builder でどう包んでも効く。ただし `agent_builder` の構築経路に
+  `GovernedAgentBuilder` 自体が含まれている必要がある（無いと spec 経路の Agent は post-process 段で
+  印の無いツールがラップされるだけで監査フックが付かず、MCP ツールの評価とライフサイクル監査は
+  行われない）。
 - **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行され
   `on_tool_start` が発火しないため、評価も監査も発生しない。統治されるのは client-side MCP
   （`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。
@@ -170,7 +181,6 @@ MCP 経路の非対称（利用者が観測しうる差）:
   ションの経路になるため、SDK の出力ガードレールを併用する。
 - deny は per-call でありターン単位のロールバックではない。同一ターンに複数のツール呼び出しが
   ある場合、deny 発生時点で兄弟呼び出しが既に実行済み / 実行中ならその副作用は残る。
-- `register_factory` 経路は builder を通らないため govern 対象外。
 - hosted tool 等の非 `FunctionTool` は素通し（ポリシー強制境界は関数ツールの呼び出し）。
 - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより先に
   走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny される）。
