@@ -16,6 +16,7 @@ import re
 
 import pytest
 
+from oai_agentspec import _validation
 from oai_agentspec._validation import (
     validate_bool,
     validate_instructions_callable,
@@ -191,3 +192,173 @@ def test_異常系_validate_optional_bool_に_int_は_ValueError() -> None:
         ValueError, match=re.escape("strict_mode must be a bool or None, got 'int'")
     ):
         validate_optional_bool(0, "strict_mode")
+
+
+# ------------------------------------------------------------------
+# validate_stop_at_tool_names_shape: tool_use_behavior dict 形の形状検査（Issue #115 T1）
+# ------------------------------------------------------------------
+# 新関数は名前で import せず `_validation.<関数名>` で属性参照する（未実装時に本モジュール
+# 全体の収集を壊さず、新規テストだけを AttributeError で落とすため）。
+class FunctionTool:
+    """name 属性を持つ非 str 要素のダミー（SDK の FunctionTool を誤って渡したケースの代用）。
+
+    agents 非依存の L1 テストのため SDK 型は使わない。repr に固有文字列
+    （SECRET-DESCRIPTION）を持たせ、メッセージに repr が混入しないことを確かめる。
+    """
+
+    def __init__(self) -> None:
+        self.name = "refund"
+        self.description = "SECRET-DESCRIPTION"
+
+    def __repr__(self) -> str:
+        return f"FunctionTool(name={self.name!r}, description={self.description!r})"
+
+
+def test_異常系_stop_at_tool_names_に文字列値は全文つき_ValueError() -> None:
+    """値が list / tuple でない（文字列）場合、型名と repr を含む全文の ValueError。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_names": "refund"})
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'str' が渡されました: 'refund'"
+    )
+
+
+def test_異常系_stop_at_tool_names_キー欠落は指定キー一覧つき_ValueError() -> None:
+    """dict に stop_at_tool_names キーが無い場合、指定されたキー一覧を含む全文の ValueError。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_name": ["refund"]})
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の dict には stop_at_tool_names キーが必要です"
+        "（指定されたキー: ['stop_at_tool_name']）"
+    )
+
+
+def test_異常系_stop_at_tool_names_キー欠落のキー一覧はソート済み() -> None:
+    """キー欠落時のキー一覧は sorted 順で列挙される。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {"zzz": 1, "aaa": 2})
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の dict には stop_at_tool_names キーが必要です"
+        "（指定されたキー: ['aaa', 'zzz']）"
+    )
+
+
+def test_異常系_stop_at_tool_names_に_name_属性つき非str要素は_ValueError() -> None:
+    """name 属性が str の非 str 要素は位置・型名・name を含み、repr 由来の内容は含まない。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape(
+            "router", {"stop_at_tool_names": [FunctionTool()]}
+        )
+    message = str(excinfo.value)
+    assert message == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names[0] は str である必要が"
+        "ありますが 'FunctionTool' が渡されました（name='refund'）"
+    )
+    assert "SECRET-DESCRIPTION" not in message
+
+
+def test_異常系_stop_at_tool_names_の非str要素は位置を示す() -> None:
+    """str 要素に続く非 str 要素は、その位置（[1]）をメッセージに含む。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_names": ["ok", 123]})
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names[1] は str である必要が"
+        "ありますが 'int' が渡されました"
+    )
+
+
+def test_異常系_stop_at_tool_names_に_name_属性なし要素は_name_を含まない() -> None:
+    """name 属性を持たない要素（123）は型名 'int' を含み、name= を含まない全文の ValueError。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_names": [123]})
+    message = str(excinfo.value)
+    assert message == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names[0] は str である必要が"
+        "ありますが 'int' が渡されました"
+    )
+    assert "name=" not in message
+
+
+def test_異常系_stop_at_tool_names_の_name_属性が非strなら_name_を含まない() -> None:
+    """name 属性が str でない要素は name= を付けない。"""
+
+    class _NonStrName:
+        name = 42
+
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape(
+            "router", {"stop_at_tool_names": [_NonStrName()]}
+        )
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names[0] は str である必要が"
+        "ありますが '_NonStrName' が渡されました"
+    )
+
+
+def test_正常系_stop_at_tool_names_の_list_tuple_空list_は通過() -> None:
+    """list / tuple / 空 list の str 要素は検証を通過する（戻り値 None）。"""
+    assert (
+        _validation.validate_stop_at_tool_names_shape(
+            "router", {"stop_at_tool_names": ["refund", "get_order"]}
+        )
+        is None
+    )
+    assert (
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_names": ("refund",)})
+        is None
+    )
+    assert (
+        _validation.validate_stop_at_tool_names_shape("router", {"stop_at_tool_names": []}) is None
+    )
+
+
+def test_正常系_tool_use_behavior_の非dict形は素通し() -> None:
+    """文字列形 / 関数形 / None は検査対象外で例外を出さない。"""
+
+    def behavior(context: object, results: object) -> object:
+        return results
+
+    assert _validation.validate_stop_at_tool_names_shape("router", "stop_on_first_tool") is None
+    assert _validation.validate_stop_at_tool_names_shape("router", behavior) is None
+    assert _validation.validate_stop_at_tool_names_shape("router", None) is None
+
+
+def test_異常系_stop_at_tool_names_に非list非str値は型名と_name_のみで_repr_を含まない() -> None:
+    """list で包まずに渡した非 str 値は型名と name だけを載せ、repr 由来の内容を含まない。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape(
+            "router", {"stop_at_tool_names": FunctionTool()}
+        )
+    message = str(excinfo.value)
+    assert message == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'FunctionTool' が渡されました（name='refund'）"
+    )
+    assert "SECRET-DESCRIPTION" not in message
+
+
+def test_異常系_stop_at_tool_names_に_name_属性なし非list値は型名のみ() -> None:
+    """name 属性の無い非 list 値（dict）は型名だけで終わり、name= も値の中身も含まない。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape(
+            "router", {"stop_at_tool_names": {"secret_key": "SECRET-VALUE"}}
+        )
+    message = str(excinfo.value)
+    assert message == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'dict' が渡されました"
+    )
+    assert "name=" not in message
+    assert "secret_key" not in message
+    assert "SECRET-VALUE" not in message
+
+
+def test_異常系_stop_at_tool_names_キー欠落でキー型混在でも_ValueError() -> None:
+    """キーの型が混在する dict でも TypeError にならず、repr 順のキー一覧つき ValueError。"""
+    with pytest.raises(ValueError) as excinfo:
+        _validation.validate_stop_at_tool_names_shape("router", {1: "x", "b": 2})
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の dict には stop_at_tool_names キーが必要です"
+        "（指定されたキー: ['b', 1]）"
+    )
