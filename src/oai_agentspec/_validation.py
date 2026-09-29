@@ -164,6 +164,52 @@ def validate_extra_kwargs(
         )
 
 
+def validate_stop_at_tool_names_shape(agent_name: str, tool_use_behavior: object) -> None:
+    """`tool_use_behavior` の dict 形（`stop_at_tool_names`）の形状を検証する。
+
+    dict 以外（文字列形・関数形・None）は検査しない。str 以外の値・要素は repr を載せず、型名と
+    `name` 属性（str の場合のみ）だけを載せる（ツールの repr は description を含むため）。
+
+    Args:
+        agent_name: エラーメッセージに含めるエージェント名。
+        tool_use_behavior: spec.extra の tool_use_behavior 値。
+
+    Raises:
+        ValueError: `stop_at_tool_names` キーが無い・値が list / tuple でない・
+            str でない要素を含む場合。
+    """
+    if not isinstance(tool_use_behavior, dict):
+        return
+    if "stop_at_tool_names" not in tool_use_behavior:
+        raise ValueError(
+            f"agent {agent_name!r}: tool_use_behavior の dict には stop_at_tool_names "
+            f"キーが必要です（指定されたキー: {sorted(tool_use_behavior, key=repr)}）"
+        )
+    names = tool_use_behavior["stop_at_tool_names"]
+    if not isinstance(names, (list, tuple)):
+        detail = f": {names!r}" if isinstance(names, str) else _describe_name_attr(names)
+        raise ValueError(
+            f"agent {agent_name!r}: tool_use_behavior の stop_at_tool_names は str の list / tuple "
+            f"である必要がありますが {type(names).__name__!r} が渡されました{detail}"
+        )
+    for i, elem in enumerate(names):
+        if not isinstance(elem, str):
+            raise ValueError(
+                f"agent {agent_name!r}: tool_use_behavior の stop_at_tool_names[{i}] は str である"
+                f"必要がありますが {type(elem).__name__!r} が渡されました"
+                f"{_describe_name_attr(elem)}"
+            )
+
+
+def _describe_name_attr(value: object) -> str:
+    """`name` 属性が str なら `（name='...'）` を、それ以外は空文字を返す。
+
+    repr は description を含みうるため使わない。
+    """
+    name = getattr(value, "name", None)
+    return f"（name={name!r}）" if isinstance(name, str) else ""
+
+
 def ensure_static_prompt(agent_name: str, prompt: Any) -> None:
     """prompt が callable（DynamicPromptFunction）でないことを検証する（Realtime ルート用）。
 

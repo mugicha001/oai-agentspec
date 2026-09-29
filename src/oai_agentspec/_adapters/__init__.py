@@ -48,6 +48,7 @@ from .approvals import (
 from .builders import (
     DefaultAgentBuilder,
     build_agent,
+    check_stop_at_tool_names_resolved,
     make_agent_tool,
     make_dynamic_handoff,
     make_handoff,
@@ -177,6 +178,7 @@ __all__ = [
     "make_handoff",
     "make_dynamic_handoff",
     "make_agent_tool",
+    "check_stop_at_tool_names_resolved",
     "make_session",
     "close_session",
     "list_session_ids",

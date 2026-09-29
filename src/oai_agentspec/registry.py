@@ -236,7 +236,8 @@ class AgentRegistry:
         `spec.guardrails` の名前参照は `GuardrailProvider` で実体へ解決し、宣言境界に応じて
         Agent の `input_guardrails` / `output_guardrails` へ append する（builder が専用
         フィールドのコピーを渡すため spec を汚さない）。append 順により連結順序は
-        「専用フィールド -> 名前参照」になり、同名の重複宣言は排除しない。
+        「専用フィールド -> 名前参照」になり、同名の重複宣言は排除しない。結線完了後、
+        `stop_at_tool_names` の名前解決を突合する。
         """
         from . import _adapters
 
@@ -265,6 +266,7 @@ class AgentRegistry:
                 agent.input_guardrails.append(guardrail)
             else:
                 agent.output_guardrails.append(guardrail)
+        _adapters.check_stop_at_tool_names_resolved(spec.name, agent)
 
     def _next_turn_config(
         self, src: str, dst: str, config: HandoffConfig | None

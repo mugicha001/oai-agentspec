@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import warnings
 from dataclasses import fields as _dataclass_fields
 from dataclasses import replace as _dataclass_replace
 from typing import TYPE_CHECKING, Any
@@ -27,6 +28,7 @@ from .._validation import (
     validate_extra_kwargs,
     validate_instructions_append_shape,
     validate_instructions_callable,
+    validate_stop_at_tool_names_shape,
 )
 
 # isinstance 分岐・フィールド集合の導出に使うため実行時 import（spec.py は最下層で
@@ -207,6 +209,7 @@ def build_agent(spec: AgentSpec) -> Agent:
         field_names=_SANDBOX_AGENT_FIELD_NAMES if is_sandbox else _AGENT_FIELD_NAMES,
         agent_label="agents.sandbox.SandboxAgent" if is_sandbox else "agents.Agent",
     )
+    validate_stop_at_tool_names_shape(spec.name, extra.get("tool_use_behavior"))
 
     kwargs: dict[str, Any] = {
         "name": spec.name,
@@ -491,6 +494,43 @@ def make_agent_tool(agent: Agent, *, tool_name: str | None, tool_description: st
         FunctionTool（agents.Tool として tools に追加可能）。
     """
     return agent.as_tool(tool_name=tool_name, tool_description=tool_description)
+
+
+def check_stop_at_tool_names_resolved(agent_name: str, agent: object) -> None:
+    """`stop_at_tool_names` の各名前が agent の function tool の実行時名と一致するか突合する。
+
+    `tool_use_behavior` が dict でない agent は対象外。mcp_servers を持つ agent と
+    SandboxAgent は run 時にツールが増えるため突合しない。
+
+    Args:
+        agent_name: メッセージに含めるエージェント名。
+        agent: 構築済みの Agent（属性を持たない任意の DI 実体も受け付ける）。
+
+    Raises:
+        ValueError: `stop_at_tool_names` の形状が不正な場合（形状検査の再実行）。
+
+    Warns:
+        RuntimeWarning: function tool の name / qualified_name のどれとも一致しない名前がある場合。
+    """
+    behavior = getattr(agent, "tool_use_behavior", None)
+    if not isinstance(behavior, dict):
+        return
+    validate_stop_at_tool_names_shape(agent_name, behavior)
+    if getattr(agent, "mcp_servers", None) or isinstance(agent, SandboxAgent):
+        return
+    candidates: set[str] = set()
+    for tool in getattr(agent, "tools", None) or []:
+        if isinstance(tool, FunctionTool):
+            candidates.update((tool.name, tool.qualified_name))
+    unresolved = [name for name in behavior["stop_at_tool_names"] if name not in candidates]
+    if unresolved:
+        warnings.warn(
+            f"agent {agent_name!r}: tool_use_behavior の stop_at_tool_names に、このエージェントの "
+            f"function tool の実行時名（name / qualified_name）と一致しない名前があります: "
+            f"{unresolved}（候補: {sorted(candidates)}）。この名前では停止しません",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _mock_invoker(value: Any) -> Any:

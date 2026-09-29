@@ -13,10 +13,14 @@ Issue #19（純リファクタ）の安全網として、標準ルート `build_
 
 from __future__ import annotations
 
-import pytest
-from agents import Agent
-from agents.sandbox import SandboxAgent
+import warnings
 
+import pytest
+from agents import Agent, function_tool
+from agents.sandbox import SandboxAgent
+from agents.tool import WebSearchTool, tool_namespace
+
+from oai_agentspec import _adapters
 from oai_agentspec._adapters import build_agent
 from oai_agentspec._adapters.builders import (
     _AGENT_FIELD_NAMES,
@@ -343,3 +347,210 @@ def test_dedicated_agent_kwargs_are_valid_agent_fields() -> None:
     唯一の例外（`builders.py` の定義直前コメントで明示）。
     """
     assert _DEDICATED_AGENT_KWARGS - {"guardrails"} <= _AGENT_FIELD_NAMES
+
+
+# ---------------------------------------------------------------------------
+# check_stop_at_tool_names_resolved: 停止対象名と実行時ツール名の突合（Issue #115 T3）
+# ---------------------------------------------------------------------------
+# 新関数は名前で import せず `_adapters.<関数名>` で属性参照する（未実装時に本モジュール
+# 全体の収集を壊さず、新規テストだけを AttributeError で落とすため）。
+@function_tool
+def get_order(order_id: str) -> str:
+    """注文を取得する。"""
+    return order_id
+
+
+@function_tool(name_override="refund")
+def _refund_impl(order_id: str) -> str:
+    """返金する（name_override で実行時名を refund にする）。"""
+    return order_id
+
+
+@function_tool(name_override="ask_researcher")
+def _ask_researcher_impl(query: str) -> str:
+    """調査担当へ問い合わせる（sub_agent の as_tool 名相当）。"""
+    return query
+
+
+@function_tool(name_override="disabled_tool", is_enabled=False)
+def _disabled_impl(x: str) -> str:
+    """is_enabled=False のツール。"""
+    return x
+
+
+def _router(tools: list[object], behavior: object, **kwargs: object) -> Agent:
+    """停止指定を持つ router エージェントを直接構築する。"""
+    return Agent(
+        name="router",
+        instructions="i",
+        tools=tools,
+        tool_use_behavior=behavior,
+        **kwargs,
+    )
+
+
+def _assert_no_warning(agent: object) -> None:
+    """突合ヘルパが警告を 1 件も出さないことを記録件数 0 で確認する。"""
+    with warnings.catch_warnings(record=True) as records:
+        warnings.simplefilter("always")
+        assert _adapters.check_stop_at_tool_names_resolved("router", agent) is None
+    assert records == []
+
+
+def test_stop_at_resolved_plain_tool_name_matches_without_warning() -> None:
+    """通常の function tool 名（関数名由来）と一致すれば警告しない。"""
+    agent = _router([get_order], {"stop_at_tool_names": ["get_order"]})
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_name_override_matches_without_warning() -> None:
+    """name_override で付けた実行時名と一致すれば警告しない。"""
+    agent = _router([_refund_impl], {"stop_at_tool_names": ["refund"]})
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_qualified_name_matches_without_warning() -> None:
+    """tool_namespace で name と異なる qualified_name を持つツールは qualified_name 一致で通る。"""
+    (namespaced,) = tool_namespace(name="billing", description="d", tools=[get_order])
+    assert namespaced.qualified_name == "billing.get_order"
+    assert namespaced.name != namespaced.qualified_name
+    agent = _router([namespaced], {"stop_at_tool_names": ["billing.get_order"]})
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_disabled_tool_is_still_candidate() -> None:
+    """is_enabled=False のツール名も候補に含まれ、一致すれば警告しない。"""
+    agent = _router([_disabled_impl], {"stop_at_tool_names": ["disabled_tool"]})
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_mismatch_warns_full_message() -> None:
+    """不一致名があると RuntimeWarning（エージェント名・不一致名・sorted 済み候補の全文）。
+
+    tools の定義順（refund, get_order, ask_researcher）は sorted 順と異なる構成にし、
+    候補一覧が sorted されることを確かめる。
+    """
+    agent = _router(
+        [_refund_impl, get_order, _ask_researcher_impl],
+        {"stop_at_tool_names": ["refund", "researcher"]},
+    )
+    with pytest.warns(RuntimeWarning) as records:
+        _adapters.check_stop_at_tool_names_resolved("router", agent)
+    assert len(records) == 1
+    assert str(records[0].message) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names に、このエージェントの "
+        "function tool の実行時名（name / qualified_name）と一致しない名前があります: "
+        "['researcher']（候補: ['ask_researcher', 'get_order', 'refund']）。"
+        "この名前では停止しません"
+    )
+
+
+def test_stop_at_resolved_mismatch_lists_names_in_declared_order() -> None:
+    """複数の不一致名は宣言順（sorted ではない）で列挙される。"""
+    agent = _router([get_order], {"stop_at_tool_names": ["zeta", "get_order", "alpha"]})
+    with pytest.warns(RuntimeWarning) as records:
+        _adapters.check_stop_at_tool_names_resolved("router", agent)
+    assert len(records) == 1
+    assert "['zeta', 'alpha']（候補: ['get_order']）" in str(records[0].message)
+
+
+def test_stop_at_resolved_hosted_tool_name_is_not_candidate() -> None:
+    """hosted tool（WebSearchTool の name 'web_search'）は候補に含めず不一致として警告する。"""
+    hosted = WebSearchTool()
+    assert hosted.name == "web_search"
+    agent = _router([hosted, get_order], {"stop_at_tool_names": ["web_search"]})
+    with pytest.warns(RuntimeWarning) as records:
+        _adapters.check_stop_at_tool_names_resolved("router", agent)
+    assert len(records) == 1
+    assert str(records[0].message) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names に、このエージェントの "
+        "function tool の実行時名（name / qualified_name）と一致しない名前があります: "
+        "['web_search']（候補: ['get_order']）。この名前では停止しません"
+    )
+
+
+def test_stop_at_resolved_skips_agent_with_mcp_servers() -> None:
+    """mcp_servers を持つエージェントは不一致でも突合せず警告しない。"""
+    agent = _router([get_order], {"stop_at_tool_names": ["mcp_only_tool"]}, mcp_servers=[object()])
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_skips_sandbox_agent() -> None:
+    """SandboxAgent（capabilities 未指定＝SDK 既定）は不一致でも突合せず警告しない。"""
+    agent = SandboxAgent(
+        name="router",
+        instructions="i",
+        tools=[get_order],
+        tool_use_behavior={"stop_at_tool_names": ["sandbox_only_tool"]},
+    )
+    _assert_no_warning(agent)
+
+
+def test_stop_at_resolved_ignores_non_dict_behavior() -> None:
+    """tool_use_behavior が dict でない（文字列形・既定）なら何もしない。"""
+    _assert_no_warning(_router([get_order], "stop_on_first_tool"))
+    _assert_no_warning(Agent(name="router", instructions="i", tools=[get_order]))
+
+
+def test_stop_at_resolved_ignores_agent_without_attributes() -> None:
+    """tool_use_behavior 属性を持たないオブジェクト（フェイク Agent 等）は何もしない。"""
+    _assert_no_warning(object())
+
+
+def test_stop_at_resolved_reruns_shape_check_on_string_value() -> None:
+    """文字列値の dict を持つ agent を直接渡すと、形状検査の再実行で ValueError。"""
+    agent = _router([_refund_impl], {"stop_at_tool_names": "refund"})
+    with pytest.raises(ValueError) as excinfo:
+        _adapters.check_stop_at_tool_names_resolved("router", agent)
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'str' が渡されました: 'refund'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# build_agent: stop_at_tool_names の形状検査（Issue #115 T2・registry 非経由）
+# ---------------------------------------------------------------------------
+def test_build_rejects_stop_at_tool_names_string_value() -> None:
+    """build_agent を直接呼んでも、dict 形の文字列値は agent 名と値を含む全文の ValueError。"""
+    spec = AgentSpec(
+        name="router",
+        instructions="i",
+        extra={"tool_use_behavior": {"stop_at_tool_names": "refund"}},
+    )
+    with pytest.raises(ValueError) as excinfo:
+        build_agent(spec)
+    assert str(excinfo.value) == (
+        "agent 'router': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'str' が渡されました: 'refund'"
+    )
+
+
+def test_sandbox_build_rejects_stop_at_tool_names_string_value() -> None:
+    """SandboxAgentSpec でも同じ形状検査で agent 名入りの ValueError になる。"""
+    spec = SandboxAgentSpec(
+        name="sbx",
+        instructions="i",
+        extra={"tool_use_behavior": {"stop_at_tool_names": "refund"}},
+    )
+    with pytest.raises(ValueError) as excinfo:
+        build_agent(spec)
+    assert str(excinfo.value) == (
+        "agent 'sbx': tool_use_behavior の stop_at_tool_names は str の list / tuple "
+        "である必要がありますが 'str' が渡されました: 'refund'"
+    )
+
+
+def test_build_accepts_valid_stop_at_tool_names_and_string_behavior() -> None:
+    """正しい dict 形と文字列形 "stop_on_first_tool" は構築でき、値が素通しされる。"""
+    behavior = {"stop_at_tool_names": ["refund"]}
+    agent = build_agent(
+        AgentSpec(name="router", instructions="i", extra={"tool_use_behavior": behavior})
+    )
+    assert agent.tool_use_behavior == {"stop_at_tool_names": ["refund"]}
+    agent = build_agent(
+        AgentSpec(
+            name="router", instructions="i", extra={"tool_use_behavior": "stop_on_first_tool"}
+        )
+    )
+    assert agent.tool_use_behavior == "stop_on_first_tool"
