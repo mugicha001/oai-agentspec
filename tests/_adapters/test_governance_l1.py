@@ -1340,3 +1340,135 @@ def test_govern_agent_rejects_run_scope_hooks() -> None:
 
     with pytest.raises(TypeError, match="chain_hooks"):
         govern_agent(agent, policy=_FakePolicy(), audit_sink=_Sink(), agent_name="bot")
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_govern_agent_mcp_deny_records_registered_name_not_agent_name() -> None:
+    """factory 経路の MCP deny は合成フックへ渡したポリシーで評価し、`tool:` 行は登録名で残す。
+
+    登録名（`agent_name="svc"`）と Agent 名（"inner"）を別にし、`tool:` 行の agent_id が
+    登録名であることを固定する（Agent 名を渡す退行を検知）。deny 例外の送出で、合成フックへ
+    ポリシーが渡っていること（`policy=None` への退行で評価されず素通しになる）も固定する。
+    """
+    sink = _Sink()
+    tool = _origin_tool("mcp_read")
+    agent = Agent(name="inner", instructions="i", tools=[tool])
+    governed = govern_agent(
+        agent,
+        policy=_FakePolicy(tool_reason="tool not allowed"),
+        audit_sink=sink,
+        agent_name="svc",
+    )
+
+    with pytest.raises(_DenyExc, match="mcp_read"):
+        await governed.hooks.on_tool_start(
+            _tool_ctx("mcp_read", '{"q": "x"}'), governed, governed.tools[0]
+        )
+
+    assert [(r[0], r[1], r[2]) for r in sink.records if r[1].startswith("tool:")] == [
+        ("svc", "tool:mcp_read", "deny")
+    ]
+
+
+class _RecordingAgentHooks(AgentHooksBase[Any, Any]):
+    """`AgentHooksBase` 派生の利用者フック（呼び出し時点の sink 記録列を控える）。"""
+
+    def __init__(self, sink: _Sink) -> None:
+        """観測対象の sink を保持する。"""
+        self.sink = sink
+        self.started: list[list[tuple[Any, str, str, dict[str, Any] | None]]] = []
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        """呼ばれた時点の sink 記録列のスナップショットを積む（監査記録との前後関係の観測用）。"""
+        self.started.append(list(self.sink.records))
+
+
+@pytest.mark.usefixtures("fake_agt")
+async def test_govern_agent_chains_agent_hooks_subclass_after_audit() -> None:
+    """`AgentHooksBase` 派生の利用者フックも合成され、監査記録の後に呼ばれる。
+
+    合成対象から `AgentHooksBase` インスタンスを落とす退行（duck 型だけ合成する等）を検知する
+    ため、duck 型でなく `AgentHooksBase` のサブクラスを使う。利用者フックが呼ばれた時点で
+    `agent_start` が記録済みであることで「監査が先・利用者が後」の順を固定する。
+    """
+    sink = _Sink()
+    user_hooks = _RecordingAgentHooks(sink)
+    agent = Agent(name="inner", instructions="i", hooks=user_hooks)
+    governed = govern_agent(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="svc")
+
+    await governed.hooks.on_start(None, governed)
+
+    assert user_hooks.started == [[("inner", "agent_start", "allow", None)]]
+    assert sink.records == [("inner", "agent_start", "allow", None)]
+
+
+class _PolicyWithoutMethods:
+    """`check_tool` / `check_content` を持たないポリシーもどき。"""
+
+
+def _call_govern_agent(policy: object, sink: _Sink, agent: Any) -> Any:
+    """`govern_agent` を登録名 "svc" で呼ぶ（parametrize 用の呼び出し形統一）。"""
+    return govern_agent(agent, policy=policy, audit_sink=sink, agent_name="svc")
+
+
+def _call_govern_ungoverned_tools(policy: object, sink: _Sink, agent: Any) -> Any:
+    """`govern_ungoverned_tools` を登録名 "svc" で呼び、その場で統治した agent を返す。"""
+    govern_ungoverned_tools(agent, policy=policy, audit_sink=sink, agent_name="svc")
+    return agent
+
+
+_POST_PROCESS_FUNCS = pytest.mark.parametrize(
+    "call",
+    [_call_govern_agent, _call_govern_ungoverned_tools],
+    ids=["govern_agent", "govern_ungoverned_tools"],
+)
+
+
+@_POST_PROCESS_FUNCS
+@pytest.mark.usefixtures("fake_agt")
+def test_post_process_rejects_policy_without_check_methods(call: Any) -> None:
+    """評価メソッドを持たないポリシーは第 3 段 post-process の両入口で build 時 TypeError。
+
+    tools を空にし、ツール評価の遅延エラーではなく入口でのポリシー解決が送出源であることを
+    固定する（解決を飛ばす退行では例外が出ない）。
+    """
+    agent = Agent(name="inner", instructions="i", tools=[])
+
+    with pytest.raises(TypeError, match="check_tool"):
+        call(_PolicyWithoutMethods(), _Sink(), agent)
+
+
+@_POST_PROCESS_FUNCS
+@pytest.mark.parametrize("as_path", [False, True], ids=["str", "pathlike"])
+async def test_post_process_resolves_yaml_policy_path(
+    call: Any, as_path: bool, tmp_path: Path
+) -> None:
+    """YAML パスを渡すと両入口とも実 `GovernancePolicy` へ解決し、その allowlist で deny する。
+
+    実 AGT を使う（fake の policy 型は YAML を構築できないため）。allowlist 外のツールを
+    ラップ済み実行本体で呼び、実 `PolicyViolationError` が送出されて実関数が呼ばれないこと、
+    および許可ツールは実行されることで、パスが解決されポリシーとして使われたことを観測する
+    （解決を飛ばす退行では str に `check_tool` が無く `AttributeError` になる）。
+    """
+    _agt_policy_cls()  # extra 未導入環境では skip
+    policy_path = tmp_path / "policy.yaml"
+    policy_path.write_text('allowed_tools: ["lookup"]\n', encoding="utf-8")
+    policy: Any = policy_path if as_path else str(policy_path)
+    denied_exc = governance_module.policy_violation_error_type()
+    sink = _Sink()
+    invoked: list[str] = []
+    allowed = _origin_tool("lookup", origin_type=ToolOriginType.FUNCTION, invoked=invoked)
+    blocked = _origin_tool("shell", origin_type=ToolOriginType.FUNCTION, invoked=invoked)
+    agent = Agent(name="inner", instructions="i", tools=[allowed, blocked])
+
+    governed = call(policy, sink, agent)
+
+    await governed.tools[0].on_invoke_tool(_tool_ctx("lookup", "{}"), "{}")
+    with pytest.raises(denied_exc, match="shell"):
+        await governed.tools[1].on_invoke_tool(_tool_ctx("shell", "{}"), "{}")
+
+    assert invoked == ["{}"]  # 許可ツールのみ実行された
+    assert [(r[0], r[1], r[2]) for r in sink.records] == [
+        ("svc", "tool:lookup", "allow"),
+        ("svc", "tool:shell", "deny"),
+    ]
