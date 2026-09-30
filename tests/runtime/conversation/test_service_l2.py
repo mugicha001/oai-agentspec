@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from agents.exceptions import ModelTimeoutError
 from agents.items import ModelResponse
 from agents.models.interface import Model
 
@@ -439,6 +440,51 @@ def test_to_conversation_error_unrelated_maps_to_execution_error() -> None:
     """無関係なメッセージの例外は EXECUTION_ERROR へ分類される。"""
     err = _SvcForHelper._to_conversation_error(RuntimeError("network timeout"))
     assert err.code == ConversationErrorCode.EXECUTION_ERROR
+
+
+# ----------------------------------------------------------------------
+# SDK の ModelTimeoutError は型で EXECUTION_ERROR へ分類する（文言の "model" に引きずられない）
+# ----------------------------------------------------------------------
+
+
+def _model_timeout_error() -> ModelTimeoutError:
+    """SDK の送出箇所（run_internal/model_retry.py）と同じコンストラクタで作る。"""
+    return ModelTimeoutError(30.0)
+
+
+def test_model_timeout_error_message_contains_model_keyword() -> None:
+    """ModelTimeoutError の文言は 'model' を含む（修正前から緑でよい前提確認）。
+
+    型判定を外すと文言ヒューリスティックで MODEL_NOT_CONFIGURED（serve で 503）へ落ちる
+    ことの前提を pin する。
+    """
+    assert "model" in str(_model_timeout_error()).lower()
+
+
+def test_to_conversation_error_model_timeout_maps_to_execution_error() -> None:
+    """ModelTimeoutError は文言に 'model' を含んでも型判定で EXECUTION_ERROR へ分類される。"""
+    err = _SvcForHelper._to_conversation_error(_model_timeout_error())
+    assert err.code == ConversationErrorCode.EXECUTION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_send_model_timeout_becomes_execution_error() -> None:
+    """send 中のモデル呼び出しタイムアウトは EXECUTION_ERROR の構造化エラーになる。"""
+    svc = _service_with_agent(RaisingModel(_model_timeout_error()))
+    cid = await svc.create_conversation()
+    with pytest.raises(ConversationError) as exc:
+        await svc.send("bot", "x", conversation_id=cid)
+    assert exc.value.code == ConversationErrorCode.EXECUTION_ERROR
+
+
+@pytest.mark.asyncio
+async def test_stream_model_timeout_yields_execution_error() -> None:
+    """stream 中のモデル呼び出しタイムアウトは EXECUTION_ERROR の StreamError で終端する。"""
+    svc = _service_with_agent(RaisingModel(_model_timeout_error()))
+    cid = await svc.create_conversation()
+    events = [e async for e in svc.stream("bot", "x", conversation_id=cid)]
+    assert isinstance(events[-1], StreamError)
+    assert events[-1].code == ConversationErrorCode.EXECUTION_ERROR.value
 
 
 # ----------------------------------------------------------------------
