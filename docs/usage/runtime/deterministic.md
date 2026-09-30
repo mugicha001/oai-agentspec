@@ -94,6 +94,8 @@ registry.register(AgentSpec("booking", "予約", model=model))
 - `multi_tool_call_response(calls: Sequence[tuple[str, str, str]]) -> ModelResponse` — 要素は `(tool 名, 引数 JSON, call_id)`
 - `mixed_response(text: str, calls: Sequence[tuple[str, str, str]], *, total_tokens: int = 0, requests: int = 0) -> ModelResponse` — テキストメッセージ 1 件の後ろに宣言順の ToolCall を並べる
 
+usage を指定する場合（`text_response_with_usage` / `mixed_response` の `total_tokens`）はトークン数を 1 以上にしてください。トークンがすべて 0 の応答は、`requests` の値によらず usage 欠損として扱われます（`RunBudgetPolicy` で上限を設定した場合は warning が出ます。`text_response` / `tool_call_response` の usage もすべて 0 です）。
+
 ```python
 # 「一言返してからハンドオフする」応答
 return mixed_response("担当へおつなぎします", [("transfer_to_booking", "{}", "call_1")])
@@ -105,7 +107,7 @@ return mixed_response("担当へおつなぎします", [("transfer_to_booking",
 |---|---|
 | メッセージ id | `msg_deterministic` |
 | ToolCall のアイテム id | `fc_deterministic`（`multi_tool_call_response` / `mixed_response` は `fc_<call_id>`） |
-| `call_id` | `call_deterministic` |
+| `call_id` | ビルダが返す値は `call_deterministic`。`DeterministicResponseModel` 経由で観測される値は導出値 `call_deterministic_<ハッシュ先頭 24 桁>`（下記「落とし穴」） |
 | ストリーミング終端の response id | `resp_deterministic` |
 | ストリーミング終端の model 名 | `oai-agentspec-deterministic` |
 
@@ -120,7 +122,10 @@ return mixed_response("担当へおつなぎします", [("transfer_to_booking",
 - **多ターンは `turn` で分岐します**。`user_text` だけで分岐すると tool 結果を受けた次のターンでも同じ ToolCall を返し続け、`max_turns` に達するまで無限ループになります。tool 実行結果は role が `user` のアイテムではないため、tool 呼び出しの前後で `user_text` は変わりません。戻り値や `call_id` で分岐したい場合は `tool_outputs` を見てください
 - **`tool_outputs` に載るアイテムは tool 名を持ちません**。SDK が載せる `function_call_output` アイテムのフィールドは `call_id` / `output` / `type`（+ `id` / `status`）だけで、tool 名は `request.input` 側の `function_call` アイテムにしかありません。したがって `tool_outputs` の絞り込みは **`call_id` で行うのが正典**です。tool 名で絞りたい場合は 2 段階の手順を踏みます: (1) `request.input` を走査して `type == "function_call"` のアイテムから `name` -> `call_id` の対応を作る、(2) その `call_id` で `tool_outputs` を絞る
 - **`tool_outputs` にはハンドオフ（`transfer_to_*`）の結果も載ります**。ハンドオフも SDK 上は関数呼び出しだからです。`if request.tool_outputs:` のように無条件で分岐すると、ハンドオフ後の応答まで tool 分岐が乗っ取ります。tool 実行で分岐するときは `call_id` で絞り込んでください（応答ビルダは `call_id` を指定できます）
-- **tool 実行とハンドオフを併用する場合は、呼び出しごとに一意な `call_id` を指定してください**。`tool_call_response` の既定 `call_id` は `call_deterministic` という、全呼び出しで共有される単一の固定値です。1 つのルール関数が tool 呼び出しと `transfer_to_*` の双方を既定値のまま発行すると、両方の `function_call_output` が同じ `call_id` を持ち、`call_id` による絞り込みが判別能力を失います。`multi_tool_call_response` / `mixed_response` は `call_id` が必須引数なので、この穴はありません
+- **既定 `call_id` はモデル経由では導出値に置き換わります**。`tool_call_response` がビルダとして返す既定 `call_id` は固定値 `call_deterministic` ですが、`DeterministicResponseModel` は応答を返す直前に、既定値のままの function ToolCall の `call_id` を、要求と当該 tool call の内容（instructions・入力・応答内の位置・tool 名・引数）から導出した `call_deterministic_<ハッシュ先頭 24 桁>` へ置き換えます（明示した `call_id` は置き換えません）。このため既定値のまま 1 run で複数回 tool 呼び出ししても `call_id` は重複せず、同じインスタンスで同じ run を再実行すれば同じ値の列になります。ルール関数が次ターンに受け取る `request.input` / `request.tool_outputs` の `call_id` も導出値です
+- **値を固定したい・`call_id` で tool 結果を探したい場合は `call_id=` を明示してください**。`call_id == "call_deterministic"` で `tool_outputs` を探すルール関数は一致しません。tool 実行とハンドオフを併用する場合も、呼び出しごとに一意な `call_id` を明示しておくと、どの `function_call_output` がどの呼び出しの結果かを `call_id` で判別できます。`multi_tool_call_response` / `mixed_response` は `call_id` が必須引数です
+- **既定 `call_id` の ToolCall を返す応答で、入力に JSON 化できない要素（bytes 等）があると `TypeError` になります**。導出の材料を決定的に直列化できないためで、`call_id=` の明示で回避できます
+- 既定 `call_id` の導出には次の限界があり、いずれも `call_id=` の明示で回避できます: (1) 別の Agent が同じ instructions・同じ入力・同じ tool 名・同じ引数で呼ぶと同じ値になる、(2) 明示で `call_id="call_deterministic"` を渡しても既定値と区別できず置き換わる、(3) 材料が完全に一致する呼び出しが続く構成（`call_model_input_filter` で入力を毎回同じ形に刈り込み、同じ tool を同じ引数で呼び続ける等）では 2 回目以降の tool 実行を SDK が省く、(4) list へ正規化できない入力では入力の材料が空になり、instructions と応答内容が同じなら値が重複する。設計判断は `docs/adr/0044-deterministic-default-call-id-derivation.md`
 - **`input` は必ず list で渡してください**。単体 dict（`Runner.run(agent, input={"role": ..., "content": ...})`）を渡すと list へ正規化できず、`user_text` が空文字列・`turn` が 0・`tool_outputs` が空になります。**例外も警告も出ない**ため、気づけるのはルール関数の分岐が想定と違う挙動をしたときだけです（`None` や非 iterable を渡した場合も同じ空値になります）
 - Session（`runtime.conversation` / `Runner.run(session=...)`）併用時に run 単位で分岐したい場合は、`turn` の絶対値に依存せず `tool_outputs` または `input` を見てください。Session 併用時の `turn` にはセッション履歴中の応答も数に入るため、run ごとの初回でも 0 になりません
 - ストリーミング（`Runner.run_streamed`）は **post-execution streaming** です。ルール関数が返した完成済みの応答を一定長で区切って delta として流すため、delta は進捗を表しません（実 LLM の逐次生成と同じ体感にはなりません）。ツール呼び出しのみの応答では delta が流れず終端イベントのみになります

@@ -13,10 +13,9 @@ from typing import Any
 class RunBudgetExceeded(Exception):
     """`RunBudgetPolicy` の累積上限に達した際に送出される例外。
 
-    SDK の `RunErrorHandlers` は `MaxTurnsExceeded` / `ModelRefusalError` のみを
-    isinstance dispatch するため、本例外は SDK に握り潰されず `Runner.run` の
-    呼び出し元まで素通しで伝播する（streaming の場合は `stream_events()` 消費時に
-    raise される）。
+    SDK の `RunErrorHandlers` が扱う種別に本例外は含まれないため、SDK に握り潰されず
+    `Runner.run` の呼び出し元まで素通しで伝播する（streaming の場合は `stream_events()`
+    消費時に raise される）。
 
     Attributes:
         usage: 例外送出時点の累積 usage（SDK `Usage` インスタンス相当・不透明値）。

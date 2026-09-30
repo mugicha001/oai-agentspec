@@ -297,7 +297,9 @@ def _build_input_json_schema(type_adapter: Any, *, strict: bool = True) -> dict[
     `strict=True`（既定）の場合、SDK の `agents.strict_schema.ensure_strict_json_schema` が
     利用できれば生成スキーマを OpenAI strict tool calling 形式に整形する
     （`additionalProperties: false` の付与・全 properties を `required` に含める等）。
-    SDK 内部 API のため、不在時 / 想定外スキーマ時は pydantic 生成スキーマをそのまま返す。
+    SDK 内部 API のため、SDK の変換関数が無い（`ImportError`）か、スキーマ形状が変換の
+    想定外（`TypeError` / `ValueError` / `KeyError`）なら素の pydantic 生成スキーマを返す。
+    strict に変換できない型は SDK の `UserError` をそのまま送出し、build 時に拒否される。
 
     `strict=False` の場合は strict 化を skip し、pydantic 生成スキーマ（optional / default 値
     ありフィールドは `required` に含まれない）をそのまま返す。`Handoff.strict_json_schema=False`

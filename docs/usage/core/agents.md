@@ -54,7 +54,7 @@ agent = registry.get("triage")  # 依存解決して agents.Agent を構築
 | `instructions_append` | `list[Callable[..., Any]]` | `[]` | run ごとに評価して末尾へ連結する追記関数（kw_only。下記参照） |
 | `prompt` | `Any` | `None` | `agents.Prompt` / `DynamicPromptFunction`（Responses API 用） |
 | `tools` | `list[Any]` | `[]` | SDK Tool のリスト |
-| `model` | `Any` | `None` | モデル指定（str / `agents.Model` / None） |
+| `model` | `Any` | `None` | モデル指定（str / `agents.Model` / None）。省略すると SDK の既定モデルを使う（lib は既定モデルを持たない。本番では明示を推奨） |
 | `model_settings` | `Any` | `None` | `agents.ModelSettings` |
 | `hooks` | `Any` | `None` | `agents.AgentHooks`（複数宣言は `chain_agent_hooks` で合成。下記参照） |
 | `input_guardrails` | `list[Any]` | `[]` | 入力ガードレール（kw_only） |

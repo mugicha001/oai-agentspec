@@ -105,6 +105,7 @@ MCP を使う場合も利用者の記述は変わりません（builder を注�
 - `mcp_config={"include_server_in_tool_names": True}` にすると公開名は基本形（`mcp_{サーバ名}__{ツール名}`）から SDK が変形を加える場合がある。`allowed_tools` は実際の公開名を確認して宣言する必要がある（未対応なら全 deny になり安全側で顕在化する。詳細は `docs/architecture.md` を参照）
 - `allowed_tools` は名前照合で、MCP ツールの実体はターンごとに再解決される。同名のまま schema / 意味だけ差し替える変更は検知しない
 - build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む）と、MCP 経路は強制と監査がともに失われる（`spec.tools` 経路は強制と per-call の記録が残る）。差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言する
+- SDK の HITL 承認（`needs_approval`）は govern の評価より先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に出る。govern 済みツールの条件付き承認（callable な `needs_approval`）の判定は govern なしと同じで、型変換される引数（数値の文字列表現等）も SDK の引数事前検証を経てから判定される。設計判断は `docs/adr/0045-govern-wrapper-sdk-invoker-conformance.md`
 - deny は per-call であり、同一ターンに複数のツール呼び出しがある場合、deny 発生時点で並行実行済みの兄弟呼び出しの副作用は残る（ターン単位のロールバックではない）
 - 監査の `details` には MCP ツールの引数も全文記録される（URL / 接続情報が入りうるため `audit_sink` の永続先を考慮する）
 - 一方で**例外**の `details` には引数を含めない（`tool_name` / `reason` のみ）。引数の取得先は監査 sink であり、例外からは辿れない

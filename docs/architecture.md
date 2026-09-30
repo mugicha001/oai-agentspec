@@ -2592,7 +2592,10 @@ class GovernedAgentBuilder:
 - **非 `FunctionTool` は素通し**: hosted tool 等の関数ツール以外は走査時にそのまま通す（ポリシー強制境界は
   関数ツールの呼び出し）。SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern
   ラップより先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny・承認メタ
-  は不変に維持）。
+  は不変に維持）。govern 済みツールでも callable な `needs_approval` の判定は govern なしと同じになる
+  （SDK の失敗ハンドラ付き invoker を持つツールでは govern ラップがその invoker に準拠し、SDK の引数事前
+  検証・型変換が govern なしと同じく効く。
+  詳細な判断は `docs/adr/0045-govern-wrapper-sdk-invoker-conformance.md`）。
 - **監査 `AgentHooks` を装着・`spec.hooks` は上書きでなく合成**: 監査フックを生成し、`spec.hooks` があれば
   各ライフサイクルメソッドで「監査記録 → 既存 `spec.hooks` の同名メソッドへ委譲」の順に呼ぶ合成 `AgentHooks`
   を作る（`spec.hooks is None` のときは監査フック単体）。これにより利用者のフックを失わずに監査を上乗せ
@@ -3256,10 +3259,9 @@ build-time `ValueError`。
 
 上限超過時は `RunBudgetExceeded`（plain Exception・`runtime/resilience/_errors.py`）を送出する。
 `usage`（トークン内訳・不透明型）・`elapsed_seconds`（累積秒）・`context`（トリガした agent 名・
-LLM 呼び出し回数・超過した上限名）を属性として保持する。SDK `error_handlers` は
-`MaxTurnsExceeded` / `ModelRefusalError` 限定の isinstance dispatch のため、`RunBudgetExceeded` は
-素通しで呼び出し元まで伝播する（塗りつぶしなし・SDK ネイティブ `RunErrorHandlers` と併用可能で
-相互干渉しない）。
+LLM 呼び出し回数・超過した上限名）を属性として保持する。`RunBudgetExceeded` は SDK の
+`RunErrorHandlers` が扱う種別とは独立に動作し、素通しで呼び出し元まで伝播する（塗りつぶしなし・
+SDK ネイティブ `RunErrorHandlers` と併用可能で相互干渉しない）。
 
 enforcement 特性:
 
@@ -3267,7 +3269,9 @@ enforcement 特性:
   （tool 実行中も含む即中断）が必要な場合は、利用者が `asyncio.wait_for(Runner.run(...), timeout=...)`
   を自前で被せる（docstring で案内）
 - 累積トークンは `context.usage` を読むだけで自前加算しない（SDK run_loop が `on_llm_end` 直前に
-  加算済みのため、自前加算は二重計上になる）。usage が取得できないターンは 0 として扱い、無音に
+  加算済みのため、自前加算は二重計上になる）。usage の欠損は `input_tokens` / `output_tokens` /
+  `total_tokens` がすべて 0 で判定し `requests` は見ない（`docs/adr/0046-usage-missing-detection-without-requests.md`）。
+  usage が取得できないターンは 0 として扱い、無音に
   せず `logger.warning`（構造化: agent 名・ターン番号・理由。logger 名は
   `constants.RESILIENCE_LOGGER_NAME`）で通知する
 - 経過時間は最初の `on_llm_start` で `time.monotonic()` を遅延初期化する（hooks 構築から run 開始
@@ -3450,8 +3454,8 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   システムプロンプト・資格情報を含みうる不透明値）が `repr()` に出ない。`==` と
   `dataclasses.fields()` のフィールド集合・順序には影響しない（属性としては従来どおり参照でき、
   比較にも従来どおり含まれる）。
-- SDK ネイティブ `RunErrorHandlers`（`MaxTurnsExceeded` / `ModelRefusalError` 限定の isinstance
-  dispatch）とは独立に動作する。SDK 側が先に処理した例外は Failsafe には伝播しない。
+- SDK ネイティブ `RunErrorHandlers` が扱う種別とは独立に動作する。SDK 側が先に処理した例外は
+  Failsafe には伝播しない。
 
 ### 実行モード
 
@@ -3601,11 +3605,19 @@ dataclass）を組み立て、ルール関数へ渡す。フィールドは `sys
 
 | 用途 | メッセージ id | ToolCall の item id | `call_id` | stream 終端の id / model |
 |---|---|---|---|---|
-| 公開（`runtime/deterministic`） | `msg_deterministic` | `fc_deterministic`（複数指定できる版は `fc_<call_id>`） | `call_deterministic`（指定可） | `resp_deterministic` / `oai-agentspec-deterministic` |
+| 公開（`runtime/deterministic`） | `msg_deterministic` | `fc_deterministic`（複数指定できる版は `fc_<call_id>`） | `call_deterministic`（ビルダが返す既定値・指定可。モデル経由で観測される値は下記の導出値） | `resp_deterministic` / `oai-agentspec-deterministic` |
 | 内部ワークフロー用（`_adapters/responses.py`） | `msg_workflow` | SDK 既定（`None`） | `wf_call` | `resp_workflow` / `oai-agentspec-workflow` |
 
 公開側の既定値 5 件は `Fake` / `Mock` / `Dummy` / `workflow` / `wf` のいずれも含まず、SDK の id 接頭辞
 慣行（`msg_` / `fc_` / `call_` / `resp_`）を守る。内部ワークフロー用の値は既存挙動を変えないため不変。
+
+`call_id` はビルダの戻り値と `DeterministicResponseModel` 経由で観測される値で異なる。ビルダは既定値
+`call_deterministic` をそのまま返す。`DeterministicResponseModel` は応答を返す直前に、`call_id` が既定値の
+function ToolCall だけを、要求（instructions・正規化した入力）と当該 tool call の内容（応答内の位置・名前・
+引数）から導出した `call_deterministic_<SHA-256 の 16 進表記の先頭 24 文字>` へ置換する（元の応答は変更せず
+複製する。明示した `call_id` は置換しない）。SDK が run 内の同一 `call_id` で異なる呼び出しを拒否するため、
+既定値のまま複数回 tool call できるようにする置換で、材料は要求と応答だけなのでステートレス契約を保つ
+（詳細な判断は `docs/adr/0044-deterministic-default-call-id-derivation.md`）。
 
 ### 公開窓口と配置
 

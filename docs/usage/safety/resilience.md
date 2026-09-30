@@ -264,6 +264,7 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 - `max_retries > 0` かつ有効な retry 条件がゼロは build-time `ValueError`
 - `retry_on_network_error` / `retry_on_timeout` / `retry_on_rate_limit` / `retry_on_server_error` / `retry_on_retry_after`（`bool`）と `backoff_jitter`（`bool | None`）に bool 以外を渡すと構築時 `ValueError`。設定ファイル / env 由来の `"false"` のような文字列が truthy として通ることはない（`backoff_jitter` のみ `None` を「SDK 既定へ委譲」の正当値として受理）
 - `FailsafePolicy.handlers` は宣言順 first-match。より specific な型を先に宣言する責務は利用者側にある
+- SDK のモデル呼び出しのタイムアウト（`ModelTimeoutError`。`ModelSettings.timeout` 指定時に送出）は SDK の `AgentsException` の派生で、組み込みの `TimeoutError` の派生ではない。`handlers` のキーに `TimeoutError` を置いても着地しないため、`ModelTimeoutError` か `AgentsException` をキーにする（キーの型は利用者コード側で `agents.exceptions` から import する）
 - `Exception` / `BaseException` / `ExceptionGroup` / `KeyboardInterrupt` / `SystemExit` / `asyncio.CancelledError` / `GeneratorExit` は `handlers` のキーにできない（build-time `ValueError`）。`ExceptionGroup` は `isinstance` マッチのため `TaskGroup` が束ねた無関係な例外まで丸ごと着地させる広すぎる捕捉になるため禁止する（利用者定義のサブクラスは捕捉範囲が限定されるので許容）
 - `log_on_apply`（既定 True）の warning ログには例外メッセージとトレースバックがそのまま出る。機密を含みうる例外を扱う場合は `log_on_apply=False` にし `on_apply` でマスキングしたうえで記録する（`on_apply` 側でも result を丸ごと文字列化・シリアライズしない）
 - `FailsafePolicy.handlers` は不変化されるため、policy 自体の `copy.deepcopy` / `dataclasses.asdict` は `TypeError` になる。複製が必要な場合は `FailsafePolicy(dict(policy.handlers), ...)` で再構築する
