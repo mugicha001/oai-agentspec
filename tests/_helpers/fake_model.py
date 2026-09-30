@@ -33,6 +33,8 @@ class _Call:
 class FakeModel(Model):
     """カンネドレスポンスを返し呼び出しを記録するテスト用 Model。
 
+    call_id はインスタンス内で一意に採番する（SDK が同一 run 内の call_id 再利用を拒否するため）。
+
     Attributes:
         responses: 順に返す ModelResponse のキュー。空なら空テキストを返す。
         calls: 各 get_response 呼び出しの記録。
@@ -40,6 +42,7 @@ class FakeModel(Model):
 
     responses: list[ModelResponse] = field(default_factory=list)
     calls: list[_Call] = field(default_factory=list)
+    _tool_call_seq: int = field(default=0, init=False, repr=False)
 
     def queue_text(self, text: str) -> FakeModel:
         """テキスト応答をキューに積む（自身を返す）。"""
@@ -75,7 +78,9 @@ class FakeModel(Model):
             name: 呼び出す tool 名。
             arguments: tool 引数の JSON 文字列。
         """
-        self.responses.append(tool_call_response(name, arguments))
+        call_id = f"call_fake_{self._tool_call_seq}"
+        self._tool_call_seq += 1
+        self.responses.append(tool_call_response(name, arguments, call_id=call_id))
         return self
 
     async def get_response(
@@ -117,6 +122,8 @@ class ChoiceAwareModel(Model):
     reset 既定（True）なら 2 ターン目は tool_choice が None に戻り text を返して終了する。
     reset=False なら 2 ターン目も required のままで ToolCall を返し続け max_turns 例外になる。
 
+    call_id はインスタンス内で一意に採番する（SDK が同一 run 内の call_id 再利用を拒否するため）。
+
     Attributes:
         tool_name: required 時に呼ぶ tool 名。
         text: required でないとき返すテキスト。
@@ -138,7 +145,9 @@ class ChoiceAwareModel(Model):
         model_settings = args[0] if args else kwargs.get("model_settings")
         tool_choice = getattr(model_settings, "tool_choice", None)
         if tool_choice == "required":
-            return tool_call_response(self.tool_name, '{"input": "x"}')
+            return tool_call_response(
+                self.tool_name, '{"input": "x"}', call_id=f"call_choice_{self.calls}"
+            )
         return text_response(self.text)
 
     def stream_response(  # type: ignore[override]
