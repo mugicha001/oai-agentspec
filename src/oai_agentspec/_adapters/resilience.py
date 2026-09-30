@@ -33,6 +33,7 @@ from agents.lifecycle import RunHooksBase
 from ..constants import RESILIENCE_LOGGER_NAME
 from ..runtime.resilience._errors import RunBudgetExceeded
 from ..runtime.resilience._types import ModelRetryPolicy, RunBudgetPolicy
+from .runner import usage_is_missing
 
 # SDK 生型 10 種を本モジュール属性として集約再エクスポートする。
 # `runtime/resilience/__init__.py` の PEP 562 `__getattr__` が本モジュール経由で遅延取得する
@@ -147,7 +148,8 @@ class _BudgetHooks(RunHooksBase[Any, Any]):
     - **usage は読むだけ**: SDK `run_loop` が `on_llm_end` 呼び出し直前に
       `context.usage.add(response.usage)` を済ませているため、hooks 内は
       `context.usage.total_tokens` を参照するだけ（自前加算は二重計上になる）。
-    - **usage 欠損検知**: `response.usage.requests == 0` かつ `total_tokens == 0` の場合、
+    - **usage 欠損検知**: `response.usage` の `input_tokens` / `output_tokens` /
+      `total_tokens` がすべて 0 の場合（`requests` は見ない・ADR-0046）、
       `RESILIENCE_LOGGER_NAME` の logger に warning を emit する。判定自体は継続する。
     - **境界の扱い**: `>`（strict greater than）で比較する。`==` は超過扱いしない。
     - **上限 None は判定 skip**: `max_total_tokens` / `max_elapsed_seconds` それぞれ独立に
@@ -210,14 +212,10 @@ class _BudgetHooks(RunHooksBase[Any, Any]):
             return
 
         r_usage = getattr(response, "usage", None)
-        if (
-            r_usage is not None
-            and getattr(r_usage, "requests", 0) == 0
-            and getattr(r_usage, "total_tokens", 0) == 0
-        ):
+        if r_usage is not None and usage_is_missing(r_usage):
             _logger.warning(
                 "resilience budget: usage missing for agent=%s (call #%s): "
-                "response.usage.requests==0 and total_tokens==0",
+                "response.usage.input_tokens==0 and output_tokens==0 and total_tokens==0",
                 _agent_name(agent),
                 self._llm_calls,
             )

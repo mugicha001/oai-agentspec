@@ -402,7 +402,7 @@ def test_正常系_on_llm_start二回目は開始時刻を上書きしない(
 def test_正常系_usage欠損時にwarningをemitし判定は継続する(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """`response.usage` の requests==0 かつ total_tokens==0 で warning。例外は出さない。"""
+    """`response.usage` のトークン 3 項目がすべて 0 で warning。例外は出さない。"""
     hooks = _build_budget_hooks(RunBudgetPolicy(max_total_tokens=100))
     ctx = _make_budget_context(total_tokens=0, requests=0)
     agent = _make_agent("agent_w")
