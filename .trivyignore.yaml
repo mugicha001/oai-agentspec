@@ -6,10 +6,10 @@
 # フィールド名は snake_case の `expired_at` である（`expiredAt` は未知フィールドとして黙って
 # 無視され、ignore が無期限に効いてしまう。追加・編集時は必ず過去日で再浮上を実測して確認する）。
 #
-# 検知経路の限界（重要）: 下記の解除条件は Dependabot では検知できない。`pyproject.toml` が
-# `agent-governance-toolkit[openai-agents]>=4.0,<5` と major 上限で pin しているため、上流が
-# 5.x を公開しても更新候補にならず PR は作られない。したがって解除の契機は本ファイルの
-# `expired_at` による再浮上のみ（pull 型）である。期限到来時は解除条件の成否を手で確認する。
+# 検知経路の限界（重要）: 下記の解除条件の成立（上流の新版公開）を Dependabot の PR で知れるとは限らない。
+# 上限を課している上流の agent-governance-toolkit は、`<5` の内側の新版（4.1.0）が公開されても
+# Dependabot の更新 PR が出ていない。したがって解除の契機は本ファイルの `expired_at` による再浮上時の
+# 手動確認とする（pull 型）。期限到来時は解除条件の成否を手で確認する。
 #
 # YAML 形式の ignore は Trivy 側で experimental 扱い（後方互換なく変わりうる）であり、`--ignorefile`
 # での明示指定が必須。Trivy 更新時は本ファイルが依然有効かを `make sca` の挙動で確認する。
