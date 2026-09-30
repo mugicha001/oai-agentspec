@@ -1,6 +1,6 @@
 # 0019: ルール関数が応答を決めるステートレス Model と応答ビルダを runtime.deterministic で公開する
 
-- Status: accepted
+- Status: accepted (partially superseded by 0044: 8 の call_id の既定値のうち DeterministicResponseModel が返す値)
 - Date: 2026-08-04
 
 ## Context
