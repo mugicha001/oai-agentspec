@@ -2052,10 +2052,12 @@ async def test_governed_copy_rebinds_inner_invoker_to_the_copied_tool() -> None:
 
 
 def test_governed_tool_exposes_same_wrapped_callable_as_ungoverned() -> None:
-    """govern 済み tool の `__wrapped__` は govern なしと同じ元関数を返す（ADR-0045）。
+    """govern 済み tool の `__wrapped__` は govern なしと同じ元関数を返す（公開面の parity）。
 
     SDK の `FunctionTool.__wrapped__` は invoker の実行本体に付いた印から元関数を辿る。
-    govern の実行本体へ印を写さないと、govern 済みだけ AttributeError になる。
+    govern の実行本体へ印を写さないと、govern 済みだけ AttributeError になる。返るのは未統治の
+    元関数であり、SDK が実行経路でこの印を読まないことはトリップワイヤ
+    （`test_sdk_function_tool_invoker_private_symbols_tripwire`）が検査する。
     """
     tool = _make_tool([])
     governed = _govern_tool(
@@ -2348,6 +2350,53 @@ async def test_governed_invoker_copy_records_single_tool_entry_per_run(derive: s
     ]
 
 
+async def test_deepcopied_governed_tool_is_ungoverned_and_regoverned_fail_closed() -> None:
+    """govern 済み tool を `copy.deepcopy` した複製は統治済みの印を保たない（fail-closed）。
+
+    deepcopy は `__init__` を通らないため `_GovernedInvoker` の複製は登録されず、`_is_governed` は
+    偽になる。第 3 段（`govern_ungoverned_tools`）で再び govern され、1 回の実行で評価と `tool:`
+    記録が 2 回ずつになる（評価が抜けるのではなく二重になる方向）。複製の実行本体は元の評価を
+    保つので、deny ポリシーでは本体が実行されない。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+    policy = GovernancePolicy(name="p", allowed_tools=["echo"])
+    governed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+        policy=policy,
+        audit_sink=sink,
+    ).tools[0]
+    cloned = copy.deepcopy(governed)
+
+    assert _is_governed(governed) is True
+    assert _is_governed(cloned) is False
+
+    model = FakeModel().queue_tool_call("echo", '{"text": "hi"}').queue_text("done")
+    agent = Agent(name="bot", instructions="i", model=model, tools=[cloned])
+    govern_ungoverned_tools(agent, policy=policy, audit_sink=sink, agent_name="bot")
+
+    result = await Runner.run(agent, input="go")
+
+    assert result.final_output == "done"
+    assert calls == ["hi"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == [
+        ("bot", "allow"),
+        ("bot", "allow"),
+    ]
+
+    deny_sink = AuditLog()
+    denied = copy.deepcopy(
+        govern_spec(
+            AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+            policy=GovernancePolicy(name="deny", allowed_tools=["other"]),
+            audit_sink=deny_sink,
+        ).tools[0]
+    )
+    with pytest.raises(PolicyViolationError):
+        await denied.on_invoke_tool(_tool_ctx("echo", '{"text": "no"}'), '{"text": "no"}')
+    assert calls == ["hi"]
+
+
 async def test_governed_deny_propagates_without_failure_error_function_message() -> None:
     """deny は `PolicyViolationError` で run を止め、`failure_error_function` の文言を返さない。
 
@@ -2475,16 +2524,20 @@ async def test_bare_function_tool_governed_by_plain_wrapper_allow_and_deny() -> 
             on_invoke_tool=_on_invoke,
         )
 
+    allow_sink = AuditLog()
     allowed = govern_spec(
         AgentSpec(name="bot", instructions="i", tools=[_bare()]),
         policy=GovernancePolicy(name="p", allowed_tools=["bare"]),
-        audit_sink=AuditLog(),
+        audit_sink=allow_sink,
     ).tools[0]
     assert not isinstance(allowed.on_invoke_tool, sdk_tool._FailureHandlingFunctionToolInvoker)
     for derived in (allowed, dataclasses.replace(allowed, description="d"), copy.copy(allowed)):
         assert _is_governed(derived) is True
     assert await allowed.on_invoke_tool(_tool_ctx("bare", "{}"), "{}") == "ok"
     assert calls == ["{}"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(allow_sink, "tool:bare")] == [
+        ("bot", "allow")
+    ]
 
     deny_sink = AuditLog()
     denied = govern_spec(
@@ -2498,6 +2551,29 @@ async def test_bare_function_tool_governed_by_plain_wrapper_allow_and_deny() -> 
     assert [(e.agent_id, e.decision) for e in _tool_records(deny_sink, "tool:bare")] == [
         ("bot", "deny")
     ]
+
+
+# SDK（openai-agents 0.22.x）内で実行本体と元関数の印を参照する既知の箇所（ファイル, 行の中身）。
+# 行番号は patch 更新でずれるため中身で照合する。
+_SDK_INVOKER_REFERENCES = [
+    (
+        "tool.py",
+        '_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER = "__agents_function_tool_wrapped_callable__"',
+    ),
+    ("tool.py", "wrapped_callable = instance.on_invoke_tool._get_wrapped_callable()"),
+    ("tool.py", 'raise AttributeError("FunctionTool.__wrapped__ is read-only")'),
+    ("tool.py", "__wrapped__ = _FunctionToolWrappedCallableDescriptor()"),
+    ("tool.py", "self._invoke_tool_impl = invoke_tool_impl"),
+    ("tool.py", "def _get_wrapped_callable(self) -> object:"),
+    ("tool.py", "self._invoke_tool_impl,"),
+    ("tool.py", "_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,"),
+    ("tool.py", "self._invoke_tool_impl,"),
+    ("tool.py", 'prepare = getattr(self._invoke_tool_impl, "__agents_prepare_arguments__", None)'),
+    ("tool.py", "return await self._invoke_tool_impl(ctx, input)"),
+    ("tool.py", 'inspect.getattr_static(func, "__wrapped__", missing) is not missing'),
+    ("tool.py", 'or hasattr(call_descriptor, "__wrapped__")'),
+    ("tool.py", "_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,"),
+]
 
 
 def test_sdk_function_tool_invoker_private_symbols_tripwire() -> None:
@@ -2514,12 +2590,13 @@ def test_sdk_function_tool_invoker_private_symbols_tripwire() -> None:
     - 事前検証の材料 `__agents_prepare_arguments__` と `__agents_function_tool_wrapped_callable__`
       （`@function_tool` が `_invoke_tool_impl` の関数属性として付与する。govern は統治済みの実行
       本体へ写す）と、それを参照する `prepare_arguments`
-    - SDK 内で `_invoke_tool_impl` を呼ぶ箇所が invoker の `__call__` の 1 箇所に限られること
-      （govern は `__call__` と `_invoke_tool_impl` の両方に評価を置く。第 3 の呼び出し経路が
-      増えると迂回されうる）
-    - SDK 内で元関数の印を辿る箇所（`_get_wrapped_callable()` の呼び出し）が `__wrapped__` の
-      記述子の 1 箇所に限られ、`__wrapped__` を呼び出す箇所が無いこと（govern は印を写すので
-      `__wrapped__` は未統治の元関数を返す。SDK がそれを実行に使うとポリシー評価を迂回する）
+    - SDK 内で実行本体（`_invoke_tool_impl`）と元関数の印（`_get_wrapped_callable` /
+      `__wrapped__` / `_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER`）を参照する箇所が、下の既知の集合と
+      完全に一致すること。呼び出しの字面に限らず、変数への代入・`getattr`・定義を含む全参照を単語
+      境界で列挙する。govern は `__call__` と `_invoke_tool_impl` の両方に評価を置き、元関数の印を
+      実行本体へ写す（`__wrapped__` は未統治の元関数を返す）ため、SDK がこれらを新しい経路で参照・
+      実行するとポリシー評価を迂回しうる。参照が増減したら SDK の差分を読み、迂回にならないことを
+      確かめてから既知の集合を更新する
     """
     invoker_cls = sdk_tool._FailureHandlingFunctionToolInvoker
     params = inspect.signature(invoker_cls.__init__).parameters
@@ -2542,21 +2619,22 @@ def test_sdk_function_tool_invoker_private_symbols_tripwire() -> None:
     assert copied.on_invoke_tool is not invoker
     assert copied.on_invoke_tool._function_tool is copied
 
-    call_sites = []
-    wrapped_sites = []
-    for path in sorted(Path(inspect.getfile(sdk_tool)).parent.rglob("*.py")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if re.search(r"\._invoke_tool_impl\(", line):
-                call_sites.append((path.name, line.strip()))
-            if re.search(r"\._get_wrapped_callable\(|\.__wrapped__\(", line):
-                wrapped_sites.append((path.name, line.strip()))
-    assert call_sites == [("tool.py", "return await self._invoke_tool_impl(ctx, input)")]
-    assert wrapped_sites == [
-        ("tool.py", "wrapped_callable = instance.on_invoke_tool._get_wrapped_callable()")
-    ], (
-        "SDK が govern 済みツールの元関数（写した印が指す未統治の関数）を `__wrapped__` の記述子"
-        "以外で参照・実行するようになった。その経路はポリシー評価を通らないので、govern の実行"
-        "本体へ印を写す設計（ADR-0045 Decision 4）を見直すこと。"
+    reference = re.compile(
+        r"\b(_invoke_tool_impl|_get_wrapped_callable|__wrapped__|_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER"
+        r"|__agents_function_tool_wrapped_callable__)\b"
+    )
+    sdk_root = Path(inspect.getfile(sdk_tool)).parent
+    references = sorted(
+        (str(path.relative_to(sdk_root)), line.strip())
+        for path in sdk_root.rglob("*.py")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if reference.search(line)
+    )
+    assert references == sorted(_SDK_INVOKER_REFERENCES), (
+        "SDK 内で実行本体（_invoke_tool_impl）か元関数の印（__wrapped__ 等）を参照する箇所が"
+        "増減した。新しい参照がポリシー評価を通らずに実行本体・元関数を呼ぶ経路でないかを SDK の"
+        "差分で確かめ、迂回にならない場合だけ _SDK_INVOKER_REFERENCES を更新すること"
+        "（ADR-0045 Decision 3・4）。"
     )
 
 

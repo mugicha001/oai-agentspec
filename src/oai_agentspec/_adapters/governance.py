@@ -26,7 +26,7 @@ import os
 import re
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import MISSING as _MISSING
 from dataclasses import fields as _dataclass_fields
 from dataclasses import replace as _dataclass_replace
@@ -49,8 +49,10 @@ from agents.run_context import RunContextWrapper  # noqa: F401
 # import する（`_AuditAgentHooks.on_tool_start` の MCP origin 判定用）。
 # 以下の 3 つは SDK 非公開要素。`_FailureHandlingFunctionToolInvoker` は `_GovernedInvoker` の
 # 継承元で承認強化の型判定の対象、`_SYNC_FUNCTION_TOOL_MARKER` は timeout 設定の検証が参照する
-# 印（いずれも ADR-0045 Decision 3）。`_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER` は実行本体へ写す
-# 元関数の印（同 Decision 4。写す属性の一覧は SDK バージョン耐性トリップワイヤのテスト docstring）。
+# 印（いずれも ADR-0045 Decision 3）。`_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER` は `@function_tool`
+# が実行関数へ付ける元関数の印で、govern 済みツールの `FunctionTool.__wrapped__` が govern なしと
+# 同じ元関数を返すよう実行本体へ写す（SDK はこの印を `__wrapped__` の解決にだけ使い実行経路では
+# 読まない。参照箇所は SDK バージョン耐性トリップワイヤのテストで検査する）。
 from agents.tool import (
     _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,
     _SYNC_FUNCTION_TOOL_MARKER,
@@ -596,6 +598,56 @@ def _deny_tool_call(
     )
 
 
+async def _governed_invoke(
+    call: Callable[[Any, str], Awaitable[Any]],
+    ctx: Any,
+    input_json: str,
+    *,
+    policy: Any,
+    sink: Any,
+    denied_exc: Any,
+    agent_name: str,
+    tool_name: str,
+) -> Any:
+    """ツール呼び出しをポリシーで評価し、許可なら記録して `call` を実行する（govern の実行手順）。
+
+    invoker 経路（`_GovernedInvoker`）と素の関数経路（`_govern_tool` のラッパ）が共有する唯一の
+    実行手順。違反なら "deny" を記録して `denied_exc` を送出し `call` を実行しない。許可なら
+    "allow" を記録してから `call` を await する。2 経路で評価・記録の順序と監査の形式を揃える
+    （ADR-0045 Decision 1）。
+
+    Args:
+        call: 評価後に実行する元の実行本体（SDK の invoker か素の `on_invoke_tool`）。
+        ctx: SDK が渡すツールコンテキスト。
+        input_json: ツール引数の生 JSON 文字列（評価と記録はこの文字列で行う）。
+        policy: AGT ポリシーオブジェクト。
+        sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
+        denied_exc: ポリシー違反時に送出する例外クラス（AGT `PolicyViolationError`）。
+        agent_name: 監査記録に使うエージェント名（`spec.name`）。
+        tool_name: 評価・記録に使うツールの公開名。
+
+    Returns:
+        `call` の実行結果。
+    """
+    reason = _evaluate_tool(policy, tool_name, input_json)
+    if reason is not None:
+        _deny_tool_call(
+            sink=sink,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            reason=reason,
+            arguments=input_json,
+            denied_exc=denied_exc,
+        )
+    sink.record(
+        agent_id=agent_name,
+        action=f"tool:{tool_name}",
+        decision="allow",
+        details={"arguments": input_json},
+    )
+    return await call(ctx, input_json)
+
+
 class _GovernedInvoker(_FailureHandlingFunctionToolInvoker):
     """SDK の失敗ハンドラ付き invoker に準拠した govern ラップ（ADR-0045）。
 
@@ -637,26 +689,21 @@ class _GovernedInvoker(_FailureHandlingFunctionToolInvoker):
         """
 
         async def governed_impl(ctx: ToolContext[Any], input_json: str) -> Any:
-            reason = _evaluate_tool(policy, tool_name, input_json)
-            if reason is not None:
-                _deny_tool_call(
-                    sink=sink,
-                    agent_name=agent_name,
-                    tool_name=tool_name,
-                    reason=reason,
-                    arguments=input_json,
-                    denied_exc=denied_exc,
-                )
-            sink.record(
-                agent_id=agent_name,
-                action=f"tool:{tool_name}",
-                decision="allow",
-                details={"arguments": input_json},
+            return await _governed_invoke(
+                inner,
+                ctx,
+                input_json,
+                policy=policy,
+                sink=sink,
+                denied_exc=denied_exc,
+                agent_name=agent_name,
+                tool_name=tool_name,
             )
-            return await inner(ctx, input_json)
 
-        # SDK の承認の事前検証は材料を `_invoke_tool_impl` の関数属性から辿るため、inner の
-        # 実装関数が持つものを写す（写さないと govern 済みツールだけ事前検証が効かない）。
+        # SDK の承認の事前検証は材料（`__agents_prepare_arguments__`）を `_invoke_tool_impl` の
+        # 関数属性から辿るため、inner の実装関数が持つものを写す（写さないと govern 済みツールだけ
+        # 事前検証が効かない。ADR-0045 Decision 4）。元関数の印も写し、`__wrapped__` を
+        # govern なしと揃える（`__wrapped__` は未統治の元関数を返す。govern なしと同じ公開面）。
         inner_impl = inner._invoke_tool_impl
         for attr in ("__agents_prepare_arguments__", _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER):
             if hasattr(inner_impl, attr):
@@ -764,23 +811,16 @@ def _govern_tool(
         return _dataclass_replace(tool, on_invoke_tool=governed)
 
     async def _on_invoke_tool(ctx: Any, input_json: str) -> Any:
-        reason = _evaluate_tool(policy, tool_name, input_json)
-        if reason is not None:
-            _deny_tool_call(
-                sink=sink,
-                agent_name=agent_name,
-                tool_name=tool_name,
-                reason=reason,
-                arguments=input_json,
-                denied_exc=denied_exc,
-            )
-        sink.record(
-            agent_id=agent_name,
-            action=f"tool:{tool_name}",
-            decision="allow",
-            details={"arguments": input_json},
+        return await _governed_invoke(
+            original,
+            ctx,
+            input_json,
+            policy=policy,
+            sink=sink,
+            denied_exc=denied_exc,
+            agent_name=agent_name,
+            tool_name=tool_name,
         )
-        return await original(ctx, input_json)
 
     try:
         first = next(iter(inspect.signature(original).parameters.values()))
