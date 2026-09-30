@@ -2582,8 +2582,12 @@ class GovernedAgentBuilder:
 実行時に AGT 側で動き、lib は実行エンジンを持たない）。
 
 - **全 `FunctionTool` を govern ラップ**: spec.tools の各 `FunctionTool` の `on_invoke_tool` を govern ラップ版へ
-  差し替える（`dataclasses.replace` による非破壊置換・元実装の第 1 引数注釈は SDK のコンテキスト型選択の
-  ため引き継ぐ）。実行時はツール呼び出し直前にポリシーを評価し、許可なら実関数を実行、違反なら実関数を
+  差し替える（`dataclasses.replace` による非破壊置換）。ラップは元の `on_invoke_tool` の種類で 2 経路に
+  分かれる。SDK の失敗ハンドラ付き invoker（`@function_tool` 由来）は、その invoker のサブクラス
+  `_GovernedInvoker` で包み、コンテキスト型は基底と同じ `ToolContext[Any]` 注釈から解決される（元関数の印も
+  写すので `__wrapped__` は govern なしと同じ元関数を返す）。それ以外（利用者が `FunctionTool` を直接組んだ
+  場合等）は素の async 関数で包み、元実装の第 1 引数注釈を SDK のコンテキスト型選択のため引き継ぐ。
+  2 経路は評価・記録の手順を共有する。実行時はツール呼び出し直前にポリシーを評価し、許可なら実関数を実行、違反なら実関数を
   実行せず拒否する。拒否例外は SDK `Runner` 経由では SDK 例外にラップされ得るため、利用者は
   `PolicyViolationError` を直接または `exc.__cause__` で捕捉する。引数照合は生ワイヤ JSON・JSON
   正規化文字列・デコード済み文字列スカラの 3 系統へ行い、
@@ -2632,7 +2636,11 @@ registry = AgentRegistry(
   のうち build 時に統治済みの印が無い `FunctionTool`（wire が注入した as_tool 等）だけを govern ラップする。
   `agent.tools` の list を再束縛せず同じ list の要素を置換するため、結線途中で作られた list 共有の clone
   （`Agent.clone` に `tools=` を渡さない既定）にも統治が届く。hooks は build 時に合成済みのため触らない。
-  統治済みの印は `_govern_tool` が作ったラッパ関数との同一性（弱参照の登録簿）で判定する。
+  統治済みの印は弱参照の登録簿に載った実行本体との同一性で判定する。素の関数経路は `_govern_tool` が作った
+  ラッパ関数を登録し、invoker 経路は `_GovernedInvoker` が生成時に自身を登録する（SDK の再束縛が
+  `dataclasses.replace` / `copy` で作る別インスタンスも生成時に登録される。`copy.deepcopy` の複製は登録
+  されず未統治と判定され、再 govern で評価と記録が二重になる fail-closed。
+  `docs/adr/0045-govern-wrapper-sdk-invoker-conformance.md`）。
 - **`factory_agents=True`（factory 経路）**: `govern_agent` が factory の戻り値を clone し、全 `FunctionTool` の
   govern ラップと監査フックの合成を行う（印は見ない）。factory が返した Agent は変更せず、`registry.get` は
   clone を返す。
