@@ -1,6 +1,6 @@
 # 0022: オブザーバビリティ有効化のグローバル結線を build-don't-run の第 3 の例外とする
 
-- Status: accepted
+- Status: accepted (partially superseded by 0047: Confirmation の遅延 import 境界の項（observability 依存が sys.modules に載らないこと）)
 - Date: 2026-08-05
 
 ## Context
