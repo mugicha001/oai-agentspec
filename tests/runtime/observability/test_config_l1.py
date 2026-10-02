@@ -3,8 +3,9 @@
 `Agent365TracingConfig`（トレース連携）と `OtelLoggingConfig`（logging -> OTel Logs 連携）の
 不変性（frozen）・必須フィールド・既定値・bool フィールドの構築時型検証・任意フィールドの値保持を
 pin する。設定型は宣言のみを担い、有効化（グローバル結線）は行わないため、本モジュールの import と
-dataclass 構築が観測系 SDK（`opentelemetry` / `microsoft_agents_a365`）や `agents` をロードしない
-ことも subprocess 隔離で固定する（NFR-1 / ADR 0022）。
+dataclass 構築で、lib が観測系モジュールを新たにロードせず観測系 SDK 本体もロードしないこと、
+および config 自身が `agents` を import しないことも subprocess 隔離で固定する（NFR-1 / 範囲は
+ADR 0047 Decision を正とする）。
 """
 
 from __future__ import annotations
@@ -336,16 +337,20 @@ def test_otel_logging_config_console_json_lines_bool_constructs() -> None:
 
 
 def test_config_module_does_not_load_observability_sdks() -> None:
-    """config モジュールの import と dataclass 構築で観測系 SDK / agents をロードしない。
+    """config の import と設定型構築で観測系モジュールを増やさず SDK 本体もロードしない。
 
-    設定型は宣言のみで有効化（グローバル結線）を行わないため、`opentelemetry` /
-    `microsoft_agents_a365` は一切ロードされてはならない。`agents` はコア依存として
-    `import oai_agentspec` の時点で既に載るため、ベースライン（本体 import 直後）からの差分に
-    `agents.*` が現れないことで「config 自身が SDK を import しない」ことを検証する。
-    他テストの副作用を排除するためクリーンな子プロセスで確認する。
+    設定型は宣言のみで有効化（グローバル結線）を行わない。保証は判定 A（`import agents`
+    直後の baseline から、config の import / 構築で観測系ルートが新たに増えていないこと）と
+    判定 B（観測系 SDK 本体が baseline の有無を問わず存在しないこと）の 2 つで検査する
+    （ADR 0047 Decision 1）。あわせて、`agents` はコア依存として `import oai_agentspec` の
+    時点で既に載るため、本体 import 直後からの差分に `agents.*` が現れないことで「config
+    自身が agents を import しない」ことも検証する。他テストの副作用を排除するためクリーンな
+    子プロセスで確認する。
     """
     probe = (
         "import sys\n"
+        "import agents\n"
+        "sdk_baseline = set(sys.modules)\n"
         "import oai_agentspec\n"
         "baseline = set(sys.modules)\n"
         "from oai_agentspec.runtime.observability.config import (\n"
@@ -356,12 +361,16 @@ def test_config_module_does_not_load_observability_sdks() -> None:
         "OtelLoggingConfig()\n"
         "added = sorted(m for m in set(sys.modules) - baseline "
         "if m == 'agents' or m.startswith('agents.'))\n"
-        "forbidden = sorted(\n"
-        "    m for m in sys.modules\n"
-        "    if m == 'opentelemetry' or m.startswith('opentelemetry.')\n"
-        "    or m == 'microsoft_agents_a365' or m.startswith('microsoft_agents_a365')\n"
-        ")\n"
-        "print(','.join(added + forbidden))\n"
+        "def _match(m, names):\n"
+        "    return any(m == p or m.startswith(p + '.') for p in names)\n"
+        # roots / sdk_body は ADR 0047 Decision 2 と tests/test_extra_isolation.py の
+        # _OBSERVABILITY_ROOTS / _OBSERVABILITY_SDK_BODY に同期する。
+        "roots = ['opentelemetry', 'microsoft_agents_a365']\n"
+        "sdk_body = ['opentelemetry.sdk', 'opentelemetry.exporter', 'microsoft_agents_a365']\n"
+        "added_by_lib = [m for m in set(sys.modules) - sdk_baseline if _match(m, roots)]\n"
+        "sdk_body_loaded = [m for m in sys.modules if _match(m, sdk_body)]\n"
+        "violations = sorted(set(added) | set(added_by_lib) | set(sdk_body_loaded))\n"
+        "print(','.join(violations))\n"
     )
     env = dict(os.environ)
     existing = env.get("PYTHONPATH", "")
@@ -374,4 +383,7 @@ def test_config_module_does_not_load_observability_sdks() -> None:
         env=env,
     )
     loaded = [m for m in result.stdout.strip().split(",") if m]
-    assert loaded == [], f"observability 設定型の import / 構築で SDK がロードされました: {loaded}"
+    assert loaded == [], (
+        "observability 設定型の import / 構築で観測系モジュールまたは agents が"
+        f"ロードされました: {loaded}"
+    )

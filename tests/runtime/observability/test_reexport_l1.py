@@ -2,9 +2,10 @@
 
 オブザーバビリティ連携の公開窓口が、設定 2 型（`_adapters` を経由しない plain dataclass）と
 有効化関数 2 つ（`_adapters/observability.py` の実体）を**再エクスポートするだけ**の薄い窓口で
-あることを固定する。加えて、窓口の import が観測系 SDK（`opentelemetry` /
-`microsoft_agents_a365`）を一切ロードしないこと（有効化関数を呼ぶまで遅延する = extra 未導入
-耐性・ADR 0022 Confirmation）を clean subprocess で担保する。
+あることを固定する。加えて、窓口の import が観測系モジュール（`opentelemetry` /
+`microsoft_agents_a365`）を新たにロードしないこと（判定 A）、および観測系 SDK 本体をロードしない
+こと（判定 B。有効化関数を呼ぶまで遅延する = extra 未導入耐性）を clean subprocess で担保する
+（範囲は ADR 0047 Decision を正とする）。
 
 subprocess ヘルパーは `tests/runtime/deterministic/test_init_l1.py` の `_run_in_clean_subprocess`
 と同型で当該ファイル内に複製する（`tests/_helpers/` へは切り出さない）。
@@ -96,26 +97,35 @@ def test_init_module_has_no_own_definitions() -> None:
 
 
 def test_importing_window_does_not_load_observability_sdks() -> None:
-    """窓口 import では観測系 SDK をロードしない（有効化関数を呼ぶまで遅延する）。
+    """窓口 import で観測系モジュールを新たに増やさず SDK 本体もロードしない。
 
-    ADR 0022 Confirmation が名指す不変条件のうち「窓口経由の import」側を担保する
-    （`import oai_agentspec` 側は `tests/test_extra_isolation.py` が担保する）。他テストの
-    副作用を排除するためクリーンな子プロセスで確認する。
+    観測系の import は有効化関数を呼ぶまで遅延する。不変条件のうち「窓口経由の import」側を
+    担保する（`import oai_agentspec` 側は `tests/test_extra_isolation.py` が担保する）。
+    判定 A（`import agents` 直後の baseline から、窓口 import で観測系ルートが新たに増えて
+    いないこと）と判定 B（観測系 SDK 本体が baseline の有無を問わず存在しないこと）の 2 つで
+    検査する（ADR 0047 Decision 1）。他テストの副作用を排除するためクリーンな子プロセスで
+    確認する。
     """
     probe = (
         "import sys\n"
+        "import agents\n"
+        "sdk_baseline = set(sys.modules)\n"
         "import oai_agentspec.runtime.observability\n"
-        "loaded = sorted(\n"
-        "    m for m in sys.modules\n"
-        "    if m == 'opentelemetry' or m.startswith('opentelemetry.')\n"
-        "    or m == 'microsoft_agents_a365' or m.startswith('microsoft_agents_a365')\n"
-        ")\n"
-        "print(','.join(loaded))\n"
+        "def _match(m, names):\n"
+        "    return any(m == p or m.startswith(p + '.') for p in names)\n"
+        # roots / sdk_body は ADR 0047 Decision 2 と tests/test_extra_isolation.py の
+        # _OBSERVABILITY_ROOTS / _OBSERVABILITY_SDK_BODY に同期する。
+        "roots = ['opentelemetry', 'microsoft_agents_a365']\n"
+        "sdk_body = ['opentelemetry.sdk', 'opentelemetry.exporter', 'microsoft_agents_a365']\n"
+        "added_by_lib = [m for m in set(sys.modules) - sdk_baseline if _match(m, roots)]\n"
+        "sdk_body_loaded = [m for m in sys.modules if _match(m, sdk_body)]\n"
+        "violations = sorted(set(added_by_lib) | set(sdk_body_loaded))\n"
+        "print(','.join(violations))\n"
     )
     out = _run_in_clean_subprocess(probe)
     loaded = [m for m in out.split(",") if m]
 
-    assert loaded == [], f"窓口 import で観測系 SDK がロードされました: {loaded}"
+    assert loaded == [], f"窓口 import で観測系モジュールがロードされました: {loaded}"
 
 
 def test_window_symbols_are_importable_in_clean_subprocess() -> None:
