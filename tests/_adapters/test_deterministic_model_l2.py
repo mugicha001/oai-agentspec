@@ -28,13 +28,26 @@ pin する契約:
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib
+import json
+import re
 from collections.abc import Callable
 from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from agents import Agent, ModelSettings, Runner, function_tool
+from agents import (
+    Agent,
+    HandoffCallItem,
+    ModelSettings,
+    RunConfig,
+    Runner,
+    ToolCallItem,
+    function_tool,
+    handoff,
+)
+from agents.extensions.handoff_filters import remove_all_tools
 from openai.types.responses import ResponseCompletedEvent, ResponseTextDeltaEvent
 
 if TYPE_CHECKING:
@@ -750,3 +763,467 @@ async def test_hosted_tool_の_item_が挟まっても_1_応答は_1_ターン�
     # allowlist（assistant 由来を function_call / reasoning / role==assistant で列挙）だと
     # web_search_call が境界と誤判定されてグループが 2 つに割れ、turn == 2 になる。
     assert recorder.requests[0].turn == 1
+
+
+# ---------------------------------------------------------------------------
+# 既定 call_id の導出（ADR-0044）
+# ---------------------------------------------------------------------------
+_DERIVED_CALL_ID = re.compile(r"^call_deterministic_[0-9a-f]{24}$")
+
+
+def _expected_call_id(
+    instructions: str | None, input_items: list[Any], index: int, name: str, arguments: str
+) -> str:
+    """ADR-0044 の材料と直列化規則から期待する導出 call_id を組む（実装と独立に計算する）。
+
+    Args:
+        instructions: 要求の system_instructions。
+        input_items: 正規化後の入力 item 列。
+        index: 応答 output 内の位置。
+        name: tool 名。
+        arguments: tool 引数の文字列。
+
+    Returns:
+        `call_deterministic_` + SHA-256 16 進表記の先頭 24 文字。
+    """
+    material = {
+        "instructions": instructions,
+        "input": input_items,
+        "index": index,
+        "name": name,
+        "arguments": arguments,
+    }
+    serialized = json.dumps(material, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return "call_deterministic_" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:24]
+
+
+def _run_call_ids(result: Any) -> list[str]:
+    """run の `new_items` から ToolCall / HandoffCall の call_id を出現順に取り出す。
+
+    Args:
+        result: `Runner.run` / `Runner.run_streamed` の結果。
+
+    Returns:
+        function_call の call_id 列。
+    """
+    return [
+        _call_id_of(item.raw_item)
+        for item in result.new_items
+        if isinstance(item, (ToolCallItem, HandoffCallItem))
+    ]
+
+
+def _model_call_ids(result: Any) -> list[str]:
+    """run 中のモデル応答（`raw_responses`）から function_call の call_id を出現順に取り出す。
+
+    handoff の `input_filter` は run 結果の `new_items` からも tool item を除くため、
+    モデルが実際に返した call_id を数えるにはモデル応答側を見る。
+
+    Args:
+        result: `Runner.run` の結果。
+
+    Returns:
+        function_call の call_id 列。
+    """
+    return [
+        item.call_id
+        for response in result.raw_responses
+        for item in response.output
+        if getattr(item, "type", None) == "function_call"
+    ]
+
+
+def _assert_unique_derived(call_ids: list[str], *, minimum: int) -> None:
+    """call_id 列がすべて導出値の形式で、互いに異なることを検査する。
+
+    Args:
+        call_ids: 検査する call_id 列。
+        minimum: 最低限含まれるべき件数（シナリオが想定どおり tool を呼んだことの確認）。
+    """
+    assert len(call_ids) >= minimum, call_ids
+    assert "call_deterministic" not in call_ids
+    assert all(_DERIVED_CALL_ID.match(call_id) for call_id in call_ids), call_ids
+    assert len(set(call_ids)) == len(call_ids), call_ids
+
+
+def _two_different_tool_calls(request: ModelRequest) -> Any:
+    """既定 call_id のまま異なる引数で add_one を 2 回呼び、両方の結果が揃ったらテキストを返す。
+
+    `turn` ではなく入力中の tool 結果で分岐する。`turn` は入力履歴から数える値で、履歴の
+    重複除去・刈り込みの扱いが SDK の版で変わると進み方が変わるため、tool 結果の値で分岐する
+    （既定 item id `fc_deterministic` の重複をどう扱うかも SDK の版に依存する）。
+    """
+    module = _deterministic()
+    outputs = [_output_of(item) for item in request.tool_outputs]
+    if "3" in outputs:
+        return module.text_response("done")
+    if "2" in outputs:
+        return module.tool_call_response("add_one", '{"x": 2}')
+    return module.tool_call_response("add_one", '{"x": 1}')
+
+
+async def test_既定_call_id_のまま異なる引数で_2_回_tool_call_すると導出値で一意になる() -> None:
+    """1 run で既定 call_id の tool call を 2 回行うと、観測される call_id がすべて異なる。
+
+    SDK 0.20.0 以降は同じ run 内で call_id が同じで指紋が違う呼び出しを拒否する（ADR-0043）。
+    いずれも既定値そのもの（`call_deterministic`）ではなく、`call_deterministic_` +
+    24 桁 16 進の導出値であることを固定する（ADR-0044 Decision 3）。
+    """
+    model = _deterministic().DeterministicResponseModel(_two_different_tool_calls)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+
+    result = await Runner.run(agent, input="hello", max_turns=3)
+
+    assert result.final_output == "done"
+    _assert_unique_derived(_run_call_ids(result), minimum=2)
+
+
+async def test_同じ引数の_tool_call_を_2_ターン続けても_call_id_が異なる() -> None:
+    """tool 名・引数が同じでも入力（前ターンの tool 結果）が違うので call_id は分かれる。
+
+    分岐は `tool_outputs` の件数で行う（`turn` を使わない理由は `_two_different_tool_calls`）。
+    call_id が共有されると SDK が同じ呼び出しとして扱い（再利用の拒否か、実行の省略）、
+    tool 結果の件数が増えずに失敗する。
+    """
+
+    def rule(request: ModelRequest) -> Any:
+        module = _deterministic()
+        if len(request.tool_outputs) < 2:
+            return module.tool_call_response("add_one", '{"x": 1}')
+        return module.text_response("done")
+
+    model = _deterministic().DeterministicResponseModel(rule)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+
+    result = await Runner.run(agent, input="hello", max_turns=3)
+
+    assert result.final_output == "done"
+    _assert_unique_derived(_run_call_ids(result), minimum=2)
+
+
+async def test_call_model_input_filter_で入力を刈り込んでも_call_id_は_run_内で一意() -> None:
+    """モデルへ渡る入力を直近 2 item へ刈り込む構成でも call_id が衝突しない。
+
+    ターン番号や tool 出力件数から数える方式は刈り込みで値が巻き戻り衝突する（ADR-0043 の
+    実測）。ルール関数は刈り込み後の入力に残る tool 結果の値で分岐する。
+    """
+
+    def keep_last_two(data: Any) -> Any:
+        model_data = data.model_data
+        return dataclasses.replace(model_data, input=list(model_data.input)[-2:])
+
+    def rule(request: ModelRequest) -> Any:
+        module = _deterministic()
+        outputs = [_output_of(item) for item in request.tool_outputs]
+        if not outputs:
+            return module.tool_call_response("add_one", '{"x": 1}')
+        if outputs[-1] == "2":
+            return module.tool_call_response("add_one", '{"x": 2}')
+        return module.text_response("done")
+
+    model = _deterministic().DeterministicResponseModel(rule)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+
+    result = await Runner.run(
+        agent,
+        input="hello",
+        max_turns=3,
+        run_config=RunConfig(call_model_input_filter=keep_last_two),
+    )
+
+    assert result.final_output == "done"
+    _assert_unique_derived(_run_call_ids(result), minimum=2)
+
+
+def _handoff_rule(request: ModelRequest) -> Any:
+    """a は tool 実行後に b へ handoff し、b は tool を 1 回呼んでからテキストを返す。"""
+    module = _deterministic()
+    if request.system_instructions == "a エージェント":
+        if not request.tool_outputs:
+            return module.tool_call_response("add_one", '{"x": 1}')
+        return module.tool_call_response("transfer_to_b")
+    if not request.tool_outputs:
+        return module.tool_call_response("add_one", '{"x": 1}')
+    return module.text_response("b done")
+
+
+async def test_handoff_の_input_filter_で履歴を刈り込んでも_call_id_は_run_内で一意() -> None:
+    """handoff 先へ渡す履歴から tool item を除く構成でも call_id が衝突しない。
+
+    handoff 先は刈り込まれた入力から同じ tool を同じ引数で呼ぶため、入力だけでは材料が
+    重なりうる。instructions を材料に含むことで a / b の呼び出しが分かれる。
+    """
+    model = _deterministic().DeterministicResponseModel(_handoff_rule)
+    target = Agent(name="b", instructions="b エージェント", model=model, tools=[add_one])
+    source = Agent(
+        name="a",
+        instructions="a エージェント",
+        model=model,
+        tools=[add_one],
+        handoffs=[handoff(target, input_filter=remove_all_tools)],
+    )
+
+    result = await Runner.run(source, input="hello", max_turns=5)
+
+    assert result.last_agent.name == "b"
+    assert result.final_output == "b done"
+    # input_filter は run 結果の new_items も刈り込むため、モデル応答（raw_responses）から数える。
+    _assert_unique_derived(_model_call_ids(result), minimum=3)
+
+
+async def test_nest_handoff_history_で履歴を畳んでも_call_id_は_run_内で一意() -> None:
+    """handoff 時に履歴を 1 メッセージへ畳む構成でも call_id が衝突しない。"""
+    model = _deterministic().DeterministicResponseModel(_handoff_rule)
+    target = Agent(name="b", instructions="b エージェント", model=model, tools=[add_one])
+    source = Agent(
+        name="a", instructions="a エージェント", model=model, tools=[add_one], handoffs=[target]
+    )
+
+    result = await Runner.run(
+        source,
+        input="hello",
+        max_turns=5,
+        run_config=RunConfig(nest_handoff_history=True),
+    )
+
+    assert result.last_agent.name == "b"
+    assert result.final_output == "b done"
+    _assert_unique_derived(_model_call_ids(result), minimum=3)
+
+
+async def test_導出_call_id_は同一インスタンスでも別インスタンスでも同じ列になる() -> None:
+    """材料は要求と応答だけなので、再実行・別インスタンスで call_id の列が一致する（決定性）。
+
+    インスタンスの状態（カウンタ等）を材料に混ぜると同一インスタンスの 2 回目で値がずれる。
+    """
+    module = _deterministic()
+    model = module.DeterministicResponseModel(_two_different_tool_calls)
+    other = module.DeterministicResponseModel(_two_different_tool_calls)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+    other_agent = Agent(name="a", instructions="指示文", model=other, tools=[add_one])
+
+    first = _run_call_ids(await Runner.run(agent, input="hello", max_turns=3))
+    second = _run_call_ids(await Runner.run(agent, input="hello", max_turns=3))
+    third = _run_call_ids(await Runner.run(other_agent, input="hello", max_turns=3))
+
+    _assert_unique_derived(first, minimum=2)
+    assert first == second == third
+
+
+async def test_導出_call_id_は材料から計算した期待値と一致する() -> None:
+    """導出値を、instructions・正規化入力・index・name・arguments の材料から独立に計算して照合する。
+
+    材料を 1 つ落とす・別の値へ差し替える・直列化の規則を変えると不一致になる。item id と
+    name / arguments は置換で変わらない。
+    """
+    module = _deterministic()
+    model = module.DeterministicResponseModel(
+        lambda request: module.tool_call_response("add_one", '{"x": 1}')
+    )
+    model_input = [{"role": "user", "content": "hello"}]
+
+    response = await model.get_response(system_instructions="指示文", input=model_input)
+
+    call = response.output[0]
+    assert call.call_id == _expected_call_id("指示文", model_input, 0, "add_one", '{"x": 1}')
+    assert call.id == "fc_deterministic"
+    assert (call.name, call.arguments) == ("add_one", '{"x": 1}')
+
+
+@pytest.mark.parametrize(
+    ("instructions", "model_input", "tool_name", "arguments"),
+    [
+        pytest.param("別の指示文", "hello", "add_one", '{"x": 1}', id="instructions"),
+        pytest.param("指示文", "bye", "add_one", '{"x": 1}', id="input"),
+        pytest.param("指示文", "hello", "other_tool", '{"x": 1}', id="name"),
+        pytest.param("指示文", "hello", "add_one", '{"x": 2}', id="arguments"),
+    ],
+)
+async def test_導出_call_id_は材料を_1_つ変えると変わる(
+    instructions: str, model_input: str, tool_name: str, arguments: str
+) -> None:
+    """instructions・入力・tool 名・引数のいずれか 1 つだけを変えても call_id が変わる。"""
+    module = _deterministic()
+
+    async def derive(instr: str, text: str, name: str, args: str) -> str:
+        model = module.DeterministicResponseModel(
+            lambda request: module.tool_call_response(name, args)
+        )
+        response = await model.get_response(system_instructions=instr, input=text)
+        return response.output[0].call_id
+
+    base = await derive("指示文", "hello", "add_one", '{"x": 1}')
+    changed = await derive(instructions, model_input, tool_name, arguments)
+
+    assert _DERIVED_CALL_ID.match(base), base
+    assert _DERIVED_CALL_ID.match(changed), changed
+    assert changed != base
+
+
+async def test_明示した_call_id_は置換されない() -> None:
+    """ビルダで明示した call_id（単一 / 複数）はそのまま返る（修正前から緑の回帰 pin）。"""
+    module = _deterministic()
+    single = module.DeterministicResponseModel(
+        lambda request: module.tool_call_response("add_one", "{}", call_id="c1")
+    )
+    multi = module.DeterministicResponseModel(
+        lambda request: module.multi_tool_call_response(
+            [("add_one", "{}", "c2"), ("add_one", "{}", "c3")]
+        )
+    )
+
+    single_response = await single.get_response(system_instructions="指示文", input="hello")
+    multi_response = await multi.get_response(system_instructions="指示文", input="hello")
+
+    assert single_response.output[0].call_id == "c1"
+    assert [item.call_id for item in multi_response.output] == ["c2", "c3"]
+
+
+async def test_使い回す定数応答は置換後も変更されない() -> None:
+    """ルール関数がモジュール定数の応答を返しても、定数側の item は既定 call_id のまま残る。
+
+    元の応答・item を書き換えると、次の呼び出しで既定値でなくなった call_id が置換対象から
+    外れ、前の要求の導出値が漏れる（ステートレス契約違反）。
+    """
+    module = _deterministic()
+    constant = module.tool_call_response("add_one", '{"x": 1}')
+
+    def rule(request: ModelRequest) -> Any:
+        if request.turn == 0:
+            return constant
+        return module.text_response("done")
+
+    model = module.DeterministicResponseModel(rule)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+
+    first = await Runner.run(agent, input="hello", max_turns=2)
+    second = await Runner.run(agent, input="bye", max_turns=2)
+
+    first_ids, second_ids = _run_call_ids(first), _run_call_ids(second)
+    _assert_unique_derived(first_ids, minimum=1)
+    _assert_unique_derived(second_ids, minimum=1)
+    assert first_ids != second_ids
+    assert constant.output[0].call_id == "call_deterministic"
+    assert constant.output[0].id == "fc_deterministic"
+
+
+async def test_1_応答に既定_call_id_の_tool_call_が_2_つあると_index_で分かれる() -> None:
+    """`output` を連結して同名・同引数の既定 call_id を 2 つ並べても、位置が材料なので異なる。"""
+    module = _deterministic()
+    single = module.tool_call_response("add_one", '{"x": 1}')
+    doubled = dataclasses.replace(single, output=[*single.output, *single.output])
+    model = module.DeterministicResponseModel(lambda request: doubled)
+    model_input = [{"role": "user", "content": "hello"}]
+
+    response = await model.get_response(system_instructions="指示文", input=model_input)
+
+    call_ids = [item.call_id for item in response.output]
+    assert call_ids == [
+        _expected_call_id("指示文", model_input, 0, "add_one", '{"x": 1}'),
+        _expected_call_id("指示文", model_input, 1, "add_one", '{"x": 1}'),
+    ]
+    assert call_ids[0] != call_ids[1]
+
+
+async def test_run_streamed_経路でも既定_call_id_が導出値へ置換される() -> None:
+    """`stream_response` は `get_response` を経由するので、ストリーム経路でも置換が効く。"""
+    model = _deterministic().DeterministicResponseModel(_two_different_tool_calls)
+    agent = Agent(name="a", instructions="指示文", model=model, tools=[add_one])
+
+    streamed = Runner.run_streamed(agent, input="hello", max_turns=3)
+    events = [event async for event in streamed.stream_events()]
+
+    completed = [e for e in _raw_events(events) if isinstance(e, ResponseCompletedEvent)]
+    streamed_ids = [
+        item.call_id
+        for event in completed
+        for item in event.response.output
+        if getattr(item, "type", None) == "function_call"
+    ]
+    assert streamed.final_output == "done"
+    _assert_unique_derived(_run_call_ids(streamed), minimum=2)
+    assert streamed_ids == _run_call_ids(streamed)
+
+
+async def test_JSON_化できない入力と既定_call_id_の組み合わせは_TypeError_になる() -> None:
+    """bytes を含む入力では導出できないため、call_id の明示を促す TypeError で fail-fast する。
+
+    `str` / `repr` へ落とすとアドレスを含みうる値でプロセスごとに call_id が変わり、決定性を
+    壊す（ADR-0044 Decision 4）。
+    """
+    module = _deterministic()
+    model = module.DeterministicResponseModel(
+        lambda request: module.tool_call_response("add_one", '{"x": 1}')
+    )
+
+    with pytest.raises(TypeError, match="call_id"):
+        await model.get_response(
+            system_instructions="指示文",
+            input=[{"role": "user", "content": "hello", "extra": b"x"}],
+        )
+
+
+async def test_JSON_化できない入力でも明示_call_id_やテキスト応答なら_TypeError_にならない() -> (
+    None
+):
+    """既定 call_id の item が無い応答では材料を直列化しない（修正前から緑の回帰 pin）。"""
+    module = _deterministic()
+    model_input = [{"role": "user", "content": "hello", "extra": b"x"}]
+    explicit = module.DeterministicResponseModel(
+        lambda request: module.tool_call_response("add_one", '{"x": 1}', call_id="c1")
+    )
+    text_only = module.DeterministicResponseModel(lambda request: module.text_response("ok"))
+
+    explicit_response = await explicit.get_response(system_instructions="指示文", input=model_input)
+    text_response = await text_only.get_response(system_instructions="指示文", input=model_input)
+
+    assert explicit_response.output[0].call_id == "c1"
+    assert text_response.output[0].content[0].text == "ok"
+
+
+async def test_単独サロゲートを含む入力でも既定_call_id_を決定的に導出する() -> None:
+    """文字列は JSON 化できる値なので、単独サロゲートを含んでも導出は失敗しない（ADR-0044）。
+
+    `ensure_ascii=False` の直列化結果には単独サロゲートがそのまま残るため、ハッシュ前の UTF-8
+    符号化は `surrogatepass` で行う。厳格な符号化だと `UnicodeEncodeError` になり、修正前は
+    通っていた run が既定 call_id の応答のときだけ失敗する。
+    """
+    module = _deterministic()
+    model = module.DeterministicResponseModel(
+        lambda request: module.tool_call_response("add_one", '{"x": 1}')
+    )
+
+    first = await model.get_response(system_instructions="指示文", input="a\ud800b")
+    second = await model.get_response(system_instructions="指示文", input="a\ud800b")
+
+    call_id = first.output[0].call_id
+    assert re.fullmatch(rf"{module.DEFAULT_CALL_ID}_[0-9a-f]{{24}}", call_id)
+    assert second.output[0].call_id == call_id
+
+
+async def test_function_call_以外の_item_は既定_call_id_と同じ値でも置換しない() -> None:
+    """置換対象は `type == "function_call"` の item だけ（ADR-0044 Decision 2）。
+
+    call_id を持つ別種の item（custom tool call）が既定値 `call_deterministic` を持っていても
+    置換せず、同じ応答に並ぶ function_call だけを導出値へ置換する。type の判定を外すと
+    custom tool call も置換対象になり（`arguments` を持たないため導出で失敗するか値が変わる）、
+    この pin が落ちる。
+    """
+    from openai.types.responses import ResponseCustomToolCall
+
+    module = _deterministic()
+    custom = ResponseCustomToolCall(
+        call_id=module.DEFAULT_CALL_ID, input="payload", name="custom_tool", type="custom_tool_call"
+    )
+
+    def rule(request: Any) -> Any:
+        base = module.tool_call_response("add_one", '{"x": 1}')
+        return dataclasses.replace(base, output=[custom, *base.output])
+
+    model = module.DeterministicResponseModel(rule)
+
+    response = await model.get_response(system_instructions="指示文", input="hello")
+
+    assert response.output[0] is custom
+    assert response.output[0].call_id == module.DEFAULT_CALL_ID
+    assert response.output[1].call_id.startswith(f"{module.DEFAULT_CALL_ID}_")

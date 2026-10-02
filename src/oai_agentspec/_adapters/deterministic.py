@@ -13,12 +13,16 @@ SDK Responses item とストリームイベントの構築は `responses` モジ
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import inspect
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 from agents import ItemHelpers, Model, Usage
 from agents.items import ModelResponse
+from pydantic import BaseModel
 
 from .responses import (
     _completed_event,
@@ -32,6 +36,8 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Sequence
 
 # 公開経路の既定 id（値そのものが公開契約。SDK の id 接頭辞慣行に従う）。
+# `DEFAULT_CALL_ID` はビルダの戻り値としての契約で、`DeterministicResponseModel` 経由の応答では
+# 呼び出しごとの導出値（`DEFAULT_CALL_ID` + `_` + 16 進 24 桁）へ置換される（ADR-0044）。
 DEFAULT_MESSAGE_ID: Final[str] = "msg_deterministic"
 DEFAULT_TOOL_CALL_ITEM_ID: Final[str] = "fc_deterministic"
 DEFAULT_CALL_ID: Final[str] = "call_deterministic"
@@ -46,6 +52,12 @@ _BOUNDARY_ITEM_TYPE_SUFFIX: Final[str] = "_output"
 
 # tool 実行結果アイテムの type（`ModelRequest.tool_outputs` の抽出条件）。
 _TOOL_OUTPUT_ITEM_TYPE: Final[str] = "function_call_output"
+
+# 既定 call_id の置換対象となる応答 item の type。
+_FUNCTION_CALL_ITEM_TYPE: Final[str] = "function_call"
+
+# 既定 call_id の導出値に使う SHA-256 16 進表記の桁数。
+_DERIVED_CALL_ID_HASH_LENGTH: Final[int] = 24
 
 # user メッセージの content パートのうちテキストとして扱う type。
 _USER_TEXT_PART_TYPES: Final[frozenset[str]] = frozenset({"input_text", "text"})
@@ -73,7 +85,8 @@ def text_response_with_usage(text: str, *, total_tokens: int, requests: int = 1)
     Args:
         text: メッセージ本文。
         total_tokens: この応答の累積対象トークン数。
-        requests: この応答の requests 数（usage 欠損検知の回避に 1 以上を既定とする）。
+        requests: この応答の requests 数（SDK の累積 usage の requests と整合させるため
+            1 を既定とする。usage 欠損の判定は requests を見ない）。
 
     Returns:
         usage を持つ単一テキストメッセージの ModelResponse。
@@ -99,13 +112,11 @@ def tool_call_response(
         arguments: tool 引数の JSON 文字列。`json.dumps()` で生成すること。
             `ModelRequest` 由来の値を文字列連結・f-string で埋め込むと、入力に含まれる
             引用符で JSON を脱出して実 tool へ想定外のキーを渡せる。
-        call_id: tool_call と tool_result を対応づける id。既定値 `DEFAULT_CALL_ID` は
-            全呼び出しで共有される固定値のため、1 つのルール関数で tool 実行と
-            `transfer_to_*`（handoff）の双方を発行する場合は呼び出しごとに一意な
-            `call_id` を指定すること（既定のままだと両者の `function_call_output` が
-            同じ `call_id` を持ち、`call_id` による絞り込みが判別できなくなる）。
-            `multi_tool_call_response` / `mixed_response` は `call_id` が必須引数なので
-            この落とし穴はない。
+        call_id: tool_call と tool_result を対応づける id。ビルダが返す既定値は
+            `DEFAULT_CALL_ID`（`call_deterministic`）で、`DeterministicResponseModel` 経由では
+            呼び出しごとに要求と応答から導出した値へ置換される。値を固定したい場合や、
+            `call_id` で tool 結果を探したい場合（tool 実行と `transfer_to_*` を同じルール関数で
+            発行する等）は明示すること。
 
     Returns:
         単一の function ToolCall を持つ ModelResponse。
@@ -156,8 +167,8 @@ def mixed_response(
             f-string で埋め込むと引用符で JSON を脱出できる）。
         total_tokens: この応答の累積対象トークン数。
         requests: この応答の requests 数。既定の 0 は「usage を指定していない」を意味する
-            （`text_response` と整合）。usage を指定する場合は `requests` も 1 以上を
-            指定すること（`requests=0` かつ `total_tokens>0` は usage 欠損検知の対象になる）。
+            （`text_response` と整合）。usage を指定する場合はトークン数を 1 以上にすること
+            （トークンがすべて 0 の応答は usage 欠損として扱われる）。
 
     Returns:
         テキストメッセージの後ろに ToolCall を並べた ModelResponse。
@@ -384,6 +395,91 @@ def _collect_tool_outputs(items: list[Any]) -> tuple[Any, ...]:
     return tuple(item for item in items if _item_fields(item)[1] == _TOOL_OUTPUT_ITEM_TYPE)
 
 
+def _canonical(value: Any) -> Any:
+    """既定 call_id の材料を直列化する `json.dumps` の `default`（JSON 化できない値の扱い）。
+
+    pydantic の `BaseModel` は `model_dump(mode="json")` にする。SDK の入力変換
+    （`ItemHelpers.input_to_new_input_list`）は `BaseModel` を先に list 化するため現行の SDK では
+    到達しないが、SDK がその list 化をやめた場合への防御として残す。それ以外は `str` / `repr` へ
+    落とさず `TypeError` にする（アドレスを含みうる表現はプロセスごとに変わり、決定性を壊すため）。
+
+    Args:
+        value: `json.dumps` が標準では直列化できなかった値。
+
+    Returns:
+        JSON 化できる値。
+
+    Raises:
+        TypeError: `BaseModel` 以外の JSON 化できない値の場合。
+    """
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    raise TypeError(
+        f"既定 call_id を導出できない入力です（JSON 化できない {type(value).__name__} を含む）。"
+        "ビルダの call_id 引数で call_id を明示すること"
+    )
+
+
+def _derived_call_id(
+    instructions: str | None, input_items: list[Any], index: int, call: Any
+) -> str:
+    """要求と当該 tool call の内容から既定 call_id の置換値を導出する（ADR-0044）。
+
+    Args:
+        instructions: 要求の system_instructions。
+        input_items: 要求の input を `_input_items` で正規化した item 列。
+        index: 応答 `output` 内の当該 item の位置。
+        call: 置換対象の function_call item。
+
+    Returns:
+        `DEFAULT_CALL_ID` + `_` + 材料の SHA-256 16 進表記の先頭 24 文字。
+    """
+    material = {
+        "instructions": instructions,
+        "input": input_items,
+        "index": index,
+        "name": call.name,
+        "arguments": call.arguments,
+    }
+    canonical = json.dumps(
+        material, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=_canonical
+    )
+    # 単独サロゲートは JSON 化できる文字列だが厳格な UTF-8 符号化では失敗するため surrogatepass で
+    # 符号化する（決定的で、直列化の規則は変えない）。
+    encoded = canonical.encode("utf-8", "surrogatepass")
+    digest = hashlib.sha256(encoded).hexdigest()[:_DERIVED_CALL_ID_HASH_LENGTH]
+    return f"{DEFAULT_CALL_ID}_{digest}"
+
+
+def _derive_default_call_ids(response: ModelResponse, request: ModelRequest) -> ModelResponse:
+    """応答中の既定 call_id の function_call を導出値へ置換した新しい応答を返す（純関数）。
+
+    元の応答と item は変更しない（ルール関数が使い回す定数応答へ値が漏れないようにするため）。
+    item id は変えない。既定 call_id の item が無ければ材料を組まずに元の応答をそのまま返す。
+
+    Args:
+        response: ルール関数が返した応答。
+        request: 当該呼び出しの ModelRequest。
+
+    Returns:
+        置換後の応答（置換対象が無ければ `response` 自身）。
+    """
+    output = list(response.output)
+    input_items: list[Any] | None = None
+    for index, item in enumerate(output):
+        if (
+            getattr(item, "type", None) == _FUNCTION_CALL_ITEM_TYPE
+            and getattr(item, "call_id", None) == DEFAULT_CALL_ID
+        ):
+            if input_items is None:
+                input_items = _input_items(request.input)
+            derived = _derived_call_id(request.system_instructions, input_items, index, item)
+            output[index] = item.model_copy(update={"call_id": derived})
+    if input_items is None:
+        return response
+    return dataclasses.replace(response, output=output)
+
+
 class DeterministicResponseModel(Model):
     """入力からルール関数が応答を決めるステートレス Model（実 API を呼ばない）。
 
@@ -393,6 +489,8 @@ class DeterministicResponseModel(Model):
     ルール関数へ渡し、戻り値が awaitable なら await して解決する（同期 / async の双方を受理）。
     `None` は空テキスト応答として扱い、`ModelResponse` でも `None` でもない戻り値は
     `TypeError` で弾く。ルール関数自身の例外は握り潰さず伝播させる。
+    応答中の既定 call_id（`DEFAULT_CALL_ID`）の function_call は、要求と当該 tool call の内容
+    だけから導出した値へ置換した複製で返す（インスタンスの状態を使わずステートレス契約は維持）。
     `stream_response` は応答を確定させてから流す post-execution streaming
     （`WorkflowModel` と同型）。SDK `Model` ABC（get_response / stream_response）へ結合する。
 
@@ -424,7 +522,8 @@ class DeterministicResponseModel(Model):
         `handoffs` / `tracing` の順）。`tracing` 以降は `ModelRequest` へ渡さない。
 
         Returns:
-            ルール関数が返した ModelResponse（`None` を返した場合は空テキスト応答）。
+            ルール関数が返した ModelResponse（`None` を返した場合は空テキスト応答）。既定 call_id の
+            function_call を含む場合は、導出値へ置換した複製を返す（ADR-0044）。
 
         Raises:
             TypeError: ルール関数（awaitable なら解決後）の戻り値が `ModelResponse` でも
@@ -442,7 +541,7 @@ class DeterministicResponseModel(Model):
                 "ルール関数は応答ビルダ（text_response 等）の戻り値か None を返すこと: "
                 f"{type(response).__name__} が返されました"
             )
-        return response
+        return _derive_default_call_ids(response, request)
 
     async def stream_response(self, *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         """応答を確定させてから text-delta + completed イベントで流す（run_streamed 対応）。

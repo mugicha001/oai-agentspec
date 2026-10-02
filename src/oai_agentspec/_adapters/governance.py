@@ -26,7 +26,7 @@ import os
 import re
 import warnings
 import weakref
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import MISSING as _MISSING
 from dataclasses import fields as _dataclass_fields
 from dataclasses import replace as _dataclass_replace
@@ -47,8 +47,19 @@ from agents.run_context import RunContextWrapper  # noqa: F401
 
 # `get_function_tool_origin` は `agents` トップレベルに export されていないためサブモジュールから
 # import する（`_AuditAgentHooks.on_tool_start` の MCP origin 判定用）。
-from agents.tool import get_function_tool_origin
-from agents.tool_context import ToolContext  # noqa: F401
+# 以下の 3 つは SDK 非公開要素。`_FailureHandlingFunctionToolInvoker` は `_GovernedInvoker` の
+# 継承元で承認強化の型判定の対象、`_SYNC_FUNCTION_TOOL_MARKER` は timeout 設定の検証が参照する
+# 印（いずれも ADR-0045 Decision 3）。`_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER` は `@function_tool`
+# が実行関数へ付ける元関数の印で、govern 済みツールの `FunctionTool.__wrapped__` が govern なしと
+# 同じ元関数を返すよう実行本体へ写す（SDK はこの印を `__wrapped__` の解決にだけ使い実行経路では
+# 読まない。参照箇所は SDK バージョン耐性トリップワイヤのテストで検査する）。
+from agents.tool import (
+    _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,
+    _SYNC_FUNCTION_TOOL_MARKER,
+    _FailureHandlingFunctionToolInvoker,
+    get_function_tool_origin,
+)
+from agents.tool_context import ToolContext
 
 if TYPE_CHECKING:
     from ..spec import AgentSpec
@@ -70,20 +81,22 @@ _BENIGN_POLICY_FIELDS = frozenset({"name"})
 # policy オブジェクトに必須の評価メソッド（build 時に存在を検証する）。
 _REQUIRED_POLICY_METHODS = ("check_tool", "check_content")
 
-# govern ラップ済みの実行本体（`_govern_tool` のラッパ関数）の登録簿（id -> 弱参照）。
-# 判定は登録した関数との同一性（`is`）で行うため、`dataclasses.replace` / `copy` を経ても
-# 同じ関数を指す tool は統治済みと判定される。弱参照のためラッパが GC されるとエントリも消える。
+# govern ラップ済みの実行本体（`_govern_tool` のラッパ関数、または生成時に自身を登録する
+# `_GovernedInvoker`）の登録簿（id -> 弱参照）。判定は登録したオブジェクトとの同一性（`is`）で
+# 行う。ラッパ関数の経路は `dataclasses.replace` / `copy` を経ても同じ関数を指し、invoker の経路は
+# SDK の再束縛が作る別インスタンスも生成時に登録されるため、どちらも統治済みと判定される。
+# 弱参照のためラッパが GC されるとエントリも消える。
 _GOVERNED_WRAPPERS: dict[int, weakref.ref[Callable[..., Any]]] = {}
 
 
 def _register_governed(fn: Callable[..., Any]) -> None:
-    """`_govern_tool` が作ったラッパ関数を統治済みとして `_GOVERNED_WRAPPERS` へ登録する。
+    """govern ラップ済みの実行本体を統治済みとして `_GOVERNED_WRAPPERS` へ登録する。
 
     弱参照のコールバックは、同じ id で後から登録された別のエントリを消さない（自分が
     登録したエントリのときだけ削除する）。
 
     Args:
-        fn: 登録するラッパ関数。
+        fn: 登録する実行本体（`_govern_tool` のラッパ関数、または `_GovernedInvoker`）。
     """
     fn_id = id(fn)
 
@@ -585,6 +598,166 @@ def _deny_tool_call(
     )
 
 
+async def _governed_invoke(
+    call: Callable[[Any, str], Awaitable[Any]],
+    ctx: Any,
+    input_json: str,
+    *,
+    policy: Any,
+    sink: Any,
+    denied_exc: Any,
+    agent_name: str,
+    tool_name: str,
+) -> Any:
+    """ツール呼び出しをポリシーで評価し、許可なら記録して `call` を実行する（govern の実行手順）。
+
+    invoker 経路（`_GovernedInvoker`）と素の関数経路（`_govern_tool` のラッパ）が共有する唯一の
+    実行手順。違反なら "deny" を記録して `denied_exc` を送出し `call` を実行しない。許可なら
+    "allow" を記録してから `call` を await する。2 経路で評価・記録の順序と監査の形式を揃える
+    （ADR-0045 Decision 1）。
+
+    Args:
+        call: 評価後に実行する元の実行本体（SDK の invoker か素の `on_invoke_tool`）。
+        ctx: SDK が渡すツールコンテキスト。
+        input_json: ツール引数の生 JSON 文字列（評価と記録はこの文字列で行う）。
+        policy: AGT ポリシーオブジェクト。
+        sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
+        denied_exc: ポリシー違反時に送出する例外クラス（AGT `PolicyViolationError`）。
+        agent_name: 監査記録に使うエージェント名（`spec.name`）。
+        tool_name: 評価・記録に使うツールの公開名。
+
+    Returns:
+        `call` の実行結果。
+    """
+    reason = _evaluate_tool(policy, tool_name, input_json)
+    if reason is not None:
+        _deny_tool_call(
+            sink=sink,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            reason=reason,
+            arguments=input_json,
+            denied_exc=denied_exc,
+        )
+    sink.record(
+        agent_id=agent_name,
+        action=f"tool:{tool_name}",
+        decision="allow",
+        details={"arguments": input_json},
+    )
+    return await call(ctx, input_json)
+
+
+class _GovernedInvoker(_FailureHandlingFunctionToolInvoker):
+    """SDK の失敗ハンドラ付き invoker に準拠した govern ラップ（ADR-0045）。
+
+    SDK は `on_invoke_tool` が失敗ハンドラ付き invoker のインスタンスのときだけ、callable な
+    `needs_approval` の前に引数を入力モデルで事前検証する。本クラスはその型判定を満たし、govern
+    済みツールの承認判定を govern なしと揃える。
+
+    - 基底へ渡す実行本体（`_invoke_tool_impl`）そのものを統治済みの関数にする。SDK が `__call__` を
+      通らず `_invoke_tool_impl` を直接呼んでも評価を迂回できない。
+    - `__call__` は基底の失敗処理を通さない。deny の例外が `failure_error_function` に吸われず
+      伝播し、失敗処理は元の invoker（`inner`）が担う。
+    - 事前検証の材料（`__agents_prepare_arguments__`）と元関数の印は `inner` の実装関数から写す。
+    - 統治済みの印は `__init__` で登録する。SDK の再束縛（`dataclasses.replace` / `copy` 時の
+      `__agents_bind_function_tool__`）が作る別インスタンスも生成時に登録される。
+    - policy / sink 等はインスタンス属性に置かずクロージャに閉じる（理由は `__init__` 内の注記）。
+    """
+
+    def __init__(
+        self,
+        inner: _FailureHandlingFunctionToolInvoker,
+        *,
+        policy: Any,
+        sink: Any,
+        denied_exc: Any,
+        agent_name: str,
+        tool_name: str,
+        function_tool: FunctionTool | None,
+    ) -> None:
+        """統治済みの実行本体を組み、基底を初期化して統治済みとして登録する。
+
+        Args:
+            inner: 元の `on_invoke_tool`（SDK の失敗ハンドラ付き invoker）。
+            policy: AGT ポリシーオブジェクト。
+            sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
+            denied_exc: ポリシー違反時に送出する例外クラス（AGT `PolicyViolationError`）。
+            agent_name: 監査記録に使うエージェント名（`spec.name`）。
+            tool_name: 評価・記録に使うツールの公開名。
+            function_tool: 束縛先の `FunctionTool`（未束縛なら None）。
+        """
+
+        async def governed_impl(ctx: ToolContext[Any], input_json: str) -> Any:
+            return await _governed_invoke(
+                inner,
+                ctx,
+                input_json,
+                policy=policy,
+                sink=sink,
+                denied_exc=denied_exc,
+                agent_name=agent_name,
+                tool_name=tool_name,
+            )
+
+        # SDK の承認の事前検証は材料（`__agents_prepare_arguments__`）を `_invoke_tool_impl` の
+        # 関数属性から辿るため、inner の実装関数が持つものを写す（写さないと govern 済みツールだけ
+        # 事前検証が効かない。ADR-0045 Decision 4）。元関数の印も写し、`__wrapped__` を
+        # govern なしと揃える（`__wrapped__` は未統治の元関数を返す。govern なしと同じ公開面）。
+        inner_impl = inner._invoke_tool_impl
+        for attr in ("__agents_prepare_arguments__", _FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER):
+            if hasattr(inner_impl, attr):
+                setattr(governed_impl, attr, getattr(inner_impl, attr))
+
+        # policy / sink 等はインスタンス属性に置かずクロージャに閉じる。属性に置くと、SDK の
+        # エージェント同一性シグネチャが dataclass の Model 経由で invoker を deepcopy する際、
+        # sink が持つロックで pickle に失敗する。
+        def rebind(function_tool: FunctionTool) -> _GovernedInvoker:
+            return _GovernedInvoker(
+                inner.__agents_bind_function_tool__(function_tool),
+                policy=policy,
+                sink=sink,
+                denied_exc=denied_exc,
+                agent_name=agent_name,
+                tool_name=tool_name,
+                function_tool=function_tool,
+            )
+
+        super().__init__(governed_impl, inner._on_handled_error, function_tool=function_tool)
+        self._rebind = rebind
+        if getattr(inner, _SYNC_FUNCTION_TOOL_MARKER, False):
+            setattr(self, _SYNC_FUNCTION_TOOL_MARKER, True)
+        _register_governed(self)
+
+    async def __call__(self, ctx: ToolContext[Any], input_json: str) -> Any:
+        """統治済みの実行本体を基底の失敗処理を通さずに実行する。
+
+        Args:
+            ctx: SDK が渡すツールコンテキスト（注釈は基底と同じ。SDK はこの注釈で型を選ぶ）。
+            input_json: ツール引数の生 JSON 文字列。
+
+        Returns:
+            ツールの実行結果（失敗処理は `inner` が担う）。
+        """
+        return await self._invoke_tool_impl(ctx, input_json)
+
+    def __agents_bind_function_tool__(self, function_tool: FunctionTool) -> _GovernedInvoker:
+        """`function_tool` へ束縛した invoker を返す（SDK の再束縛プロトコル）。
+
+        基底の再束縛は基底クラスのインスタンスを作り、上書きした `__call__` と登録が失われる
+        ため使わない。
+
+        Args:
+            function_tool: 束縛先の `FunctionTool`。
+
+        Returns:
+            束縛先が同じなら self。違えば `inner` を再束縛した新しい `_GovernedInvoker`。
+        """
+        if self._function_tool is function_tool:
+            return self
+        return self._rebind(function_tool)
+
+
 def _govern_tool(
     tool: FunctionTool,
     *,
@@ -600,10 +773,15 @@ def _govern_tool(
     を送出する。`name` / `description` / `params_json_schema` / `needs_approval` 等の宣言メタは維持
     し、差し替えるのは実行本体のみ（`mock_spec_tools` / `attach_tool_guardrails` と同型の非破壊）。
 
-    元 `on_invoke_tool` の第 1 引数注釈はラッパーへ引き継ぐ。SDK は本注釈で渡すコンテキスト型
-    （full `ToolContext` か縮約 `RunContextWrapper` か）を選ぶため、注釈を `Any` のままにすると
-    `RunContextWrapper` 契約のツールに full `ToolContext` が渡り、SDK の縮約（実行時メタの漏えい
-    防止）が無効化される。
+    ラップは元 `on_invoke_tool` の種類で 2 経路に分かれる（ADR-0045）。
+
+    - SDK の失敗ハンドラ付き invoker のとき: `_GovernedInvoker` で包む。SDK の承認の事前検証が
+      govern なしと同じく効く。コンテキスト型は基底と同じ `ToolContext[Any]` 注釈から解決される。
+    - それ以外（利用者が `FunctionTool` を直接組んだ場合等）: 素の async 関数で包み、元
+      `on_invoke_tool` の第 1 引数注釈をラッパーへ引き継ぐ。SDK は本注釈で渡すコンテキスト型
+      （full `ToolContext` か縮約 `RunContextWrapper` か）を選ぶため、注釈を `Any` のままにすると
+      `RunContextWrapper` 契約のツールに full `ToolContext` が渡り、SDK の縮約（実行時メタの
+      漏えい防止）が無効化される。
 
     Args:
         tool: ラップ対象の `FunctionTool`。
@@ -618,24 +796,31 @@ def _govern_tool(
     original = tool.on_invoke_tool
     tool_name = tool.name
 
-    async def _on_invoke_tool(ctx: Any, input_json: str) -> Any:
-        reason = _evaluate_tool(policy, tool_name, input_json)
-        if reason is not None:
-            _deny_tool_call(
-                sink=sink,
-                agent_name=agent_name,
-                tool_name=tool_name,
-                reason=reason,
-                arguments=input_json,
-                denied_exc=denied_exc,
-            )
-        sink.record(
-            agent_id=agent_name,
-            action=f"tool:{tool_name}",
-            decision="allow",
-            details={"arguments": input_json},
+    if isinstance(original, _FailureHandlingFunctionToolInvoker):
+        # replace の `__post_init__` が再束縛を呼び、新しい tool へ束縛した別インスタンス（生成時に
+        # 登録済み）が on_invoke_tool になる。
+        governed = _GovernedInvoker(
+            original,
+            policy=policy,
+            sink=sink,
+            denied_exc=denied_exc,
+            agent_name=agent_name,
+            tool_name=tool_name,
+            function_tool=None,
         )
-        return await original(ctx, input_json)
+        return _dataclass_replace(tool, on_invoke_tool=governed)
+
+    async def _on_invoke_tool(ctx: Any, input_json: str) -> Any:
+        return await _governed_invoke(
+            original,
+            ctx,
+            input_json,
+            policy=policy,
+            sink=sink,
+            denied_exc=denied_exc,
+            agent_name=agent_name,
+            tool_name=tool_name,
+        )
 
     try:
         first = next(iter(inspect.signature(original).parameters.values()))
@@ -649,19 +834,21 @@ def _govern_tool(
 
 
 def _is_governed(tool: FunctionTool) -> bool:
-    """`tool` の実行本体が `_GOVERNED_WRAPPERS` に登録されたラッパ関数そのものかを返す。
+    """`tool` の実行本体が `_GOVERNED_WRAPPERS` に登録された実行本体そのものかを返す。
 
-    判定は登録したラッパ関数との同一性（`is`）で行い、hash / eq に依存しない。このため
+    判定は登録したオブジェクトとの同一性（`is`）で行い、hash / eq に依存しない。このため
     関数属性の手付け・`functools.wraps` によるコピー・hash / eq を参照先へ委譲するプロキシは
     統治済みと判定されない（未統治として扱う = fail-closed）。ラッパが GC されるとエントリは
     消える。統治済みの印は「いずれかのポリシーで統治済み」を示し、どのエージェント・どの
-    ポリシーで統治したかは区別しない。
+    ポリシーで統治したかは区別しない。`_GovernedInvoker` を `copy.deepcopy` した複製は
+    `__init__` を通らず登録されないため未統治と判定される（再 govern で評価と記録が二重になる
+    fail-closed。`dataclasses.replace` / `copy.copy` は SDK の再束縛で登録される）。
 
     Args:
         tool: 判定対象の `FunctionTool`。
 
     Returns:
-        `_govern_tool` が作ったラッパ関数を実行本体に持つなら True。
+        `_govern_tool` が作った（登録済みの）実行本体を持つなら True。
     """
     fn = tool.on_invoke_tool
     ref = _GOVERNED_WRAPPERS.get(id(fn))
@@ -831,8 +1018,9 @@ def govern_spec(
     発生しない、(2) HITL 承認（`needs_approval`）は `on_tool_start` より前に走るため MCP 経路でも
     「承認後に deny」になり得る、(3) deny は raise で合成チェーンを中断するため利用者の
     `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny では実行本体のラップで弾く
-    ため到達する非対称。`RunHooks.on_tool_start` は SDK が `asyncio.gather` で並行実行するため
-    deny 時も開始済みになり得る）、(4) `AGENT_AS_TOOL` origin（`sub_agents` の as_tool）は対象外
+    ため到達する非対称。`RunHooks.on_tool_start` は SDK が並行実行するため deny 時も開始済みに
+    なり得る（開始後は最初の await で取り消されうる））、(4) `AGENT_AS_TOOL` origin（`sub_agents`
+    の as_tool）は対象外
     （機構上は同じフックで評価しうるが、既存 `allowed_tools` 宣言の意味を変えるため評価しない。
     オプトイン時の as_tool はフックでなく実行本体のラップで評価する）、
     (5) `tool:` 行の `agent_id` は宣言時の `spec.name`（build 時捕獲）で、`tool_start:` 行の

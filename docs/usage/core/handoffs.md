@@ -75,6 +75,18 @@ print(graph.mermaid())
 | `description` | `str \| None` | `None` | tool 説明 |
 | `on_handoff` / `input_type` / `input_filter` / `is_enabled` / `options` | 上表と同じ | 上表と同じ | 静的 `edge` と同意 |
 
+### `input_type` のスキーマ制約（strict schema）
+
+`input_type` のスキーマは OpenAI の strict 形式へ変換され、変換できない型は build 時に SDK の `UserError` になります。静的経路（`edge` / SDK の `handoff()`）は strict 変換を無効化できないため、スキーマの形を変えて回避します。動的経路（`dynamic_edge`）は `options={"strict_json_schema": False}` で strict 変換を無効化することもできます。
+
+| `UserError` になる型 | 静的経路（`edge` / SDK の `handoff()`）の回避 | 動的経路（`dynamic_edge`）の回避 |
+|---|---|---|
+| ルートがユニオン（`Optional[M]`・`A \| B`） | 1 フィールドのモデルで包む（例: `class Wrap(BaseModel): value: M \| None = None`） | 静的経路と同じ、または `options={"strict_json_schema": False}` |
+| `json_schema_extra` で `additionalProperties: {}` を明示 | 明示を外す、または `model_config = ConfigDict(extra="forbid")` | 静的経路と同じ、または `options={"strict_json_schema": False}` |
+| 制約の兄弟キー（`minProperties` 等）を持つ `$ref`（例: 入れ子モデルのフィールドに `Field(json_schema_extra={"minProperties": 1})` を付けたもの） | 制約を内側モデルの `model_config` の `json_schema_extra` へ移す | 静的経路と同じ、または `options={"strict_json_schema": False}` |
+
+`$ref` の兄弟キーでも `description` / `default` / `title` / `examples` 等の注釈的なキーは問題ありません。
+
 ### `from_specs(specs, entry=None)`
 
 | パラメータ | 型 | 既定 | 説明 |

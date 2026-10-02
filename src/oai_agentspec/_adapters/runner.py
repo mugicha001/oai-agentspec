@@ -4,6 +4,12 @@
 SDK 結果を plain 統一表現へ変換する `_extract_pending` / `_outcome_from_result` を提供する。SDK
 結合（`agents` の `Runner` / `RunContextWrapper`）は本モジュール内に閉じ、外へは plain な値のみを
 渡す。
+
+SDK `Usage` の欠損（未取得）を判定する述語 `usage_is_missing` も本モジュールに置き、
+resilience の予算フックと intent の usage 詰め替えの両方から使う（ADR-0046）。
+SDK のモデル呼び出しのタイムアウト例外（`ModelTimeoutError`）の型を判定する述語
+`is_model_timeout_error` も本モジュールに置き、会話層が SDK 例外型を import せずに
+実行エラーへ分類できるようにする。
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from agents import Runner
+from agents.exceptions import ModelTimeoutError
 
 from .run_context import unwrap_run_context
 
@@ -55,6 +62,41 @@ class ApplyResult:
     applied: list[str] = field(default_factory=list)
     unknown: list[str] = field(default_factory=list)
     already_resolved: list[str] = field(default_factory=list)
+
+
+def usage_is_missing(usage: Any) -> bool:
+    """SDK `Usage` が欠損（未取得）かを判定する（ADR-0046）。
+
+    SDK の `Usage` は非 Optional で既定値が 0 のため、0 と未取得を型で区別できない。
+    `input_tokens` / `output_tokens` / `total_tokens` がすべて 0 のときだけ欠損とみなす。
+    `requests` の数え方はモデル実装・SDK の版・経路で変わるため判定に使わない。
+
+    Args:
+        usage: SDK `Usage` 相当（属性アクセスで判定する。欠けた属性は 0 として扱う）。
+
+    Returns:
+        トークン 3 項目がすべて 0 なら True。
+    """
+    return (
+        getattr(usage, "input_tokens", 0) == 0
+        and getattr(usage, "output_tokens", 0) == 0
+        and getattr(usage, "total_tokens", 0) == 0
+    )
+
+
+def is_model_timeout_error(exc: BaseException) -> bool:
+    """例外が SDK のモデル呼び出しのタイムアウト（`ModelTimeoutError`）かを型で判定する。
+
+    会話層（`runtime/conversation`）は SDK 例外型を import しないため、型判定を本述語に閉じる
+    （NFR-1）。
+
+    Args:
+        exc: 判定対象の例外。
+
+    Returns:
+        `ModelTimeoutError` のインスタンスなら True。
+    """
+    return isinstance(exc, ModelTimeoutError)
 
 
 def _pending_agent_name(item: Any) -> str:

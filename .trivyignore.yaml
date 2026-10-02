@@ -40,3 +40,66 @@ vulnerabilities:
       cryptography>=50.0.0 が必要だが agent-governance-toolkit-core は最新 5.0.0 でも
       cryptography<50.0 を課すため到達不能。core 側の上限緩和待ち。
     expired_at: 2026-11-06
+
+  # litellm を修正版（1.83.7 / 1.83.10 / 1.83.14 / 1.84.0 以降）へ上げれば解消するが、openai 3 と
+  # 両立する litellm が 1.83.0 しか無い。openai-agents 0.22.x への追随（openai 3 必須）で、lock の
+  # litellm は 1.92.1（下記 9 件を修正済み）から 1.83.0 へ下がった（退行）:
+  #   oai-agentspec の core 依存 openai-agents 0.22.x -> openai >=3.0.0,<4
+  #   oai-agentspec[lightning] -> agentlightning[apo] 0.3.0 -> litellm[proxy]（agentlightning の基本依存）
+  #     litellm 1.83.0 は openai>=2.8.0（上限なし）、1.83.1〜1.83.7 は openai==2.30.0、
+  #     1.83.8〜1.83.14 は openai==2.24.0、1.84.0 以降は openai<3.0.0 を要求する
+  #     （`uv pip compile` で 1.83.1 以降が openai 3 と両立しないことを確認）。
+  #   同じ経路の litellm-enterprise / fastapi-sso / soundfile / uvloop も版が下がったが、Trivy の
+  #   HIGH / CRITICAL は無い。
+  # 9 件とも litellm の proxy サーバが公開する HTTP エンドポイント・認証層の脆弱性である（Trivy DB の
+  # 記述で確認）。lightning 機能の利用時は agentlightning 経由で litellm（proxy_server モジュールを
+  # 含む）がプロセスに読み込まれるが、lib は LLMProxy を構成・起動しない（Trainer に llm_proxy を
+  # 渡さない）。影響は利用者が agentlightning の LLM proxy（サーバ）を起動した場合に限られる。
+  # 解除条件: litellm が openai 3 を許容し、かつ下記の修正を含む版を公開した時点。
+  # 検知経路: litellm は推移依存で Dependabot の更新 PR が出た実績が無い（本 ignore 登録時点で
+  # 0 件）。解除の契機は `expired_at` による再浮上時の手動確認とする。
+  - id: CVE-2026-37004
+    statement: >-
+      litellm 1.83.7 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-42208
+    statement: >-
+      litellm 1.83.7 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-42203
+    statement: >-
+      litellm 1.83.7 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-42271
+    statement: >-
+      litellm 1.83.7 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-40217
+    statement: >-
+      litellm 1.83.10 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-47102
+    statement: >-
+      litellm 1.83.10 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-47101
+    statement: >-
+      litellm 1.83.14 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-49468
+    statement: >-
+      litellm 1.84.0 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30
+  - id: CVE-2026-59822
+    statement: >-
+      litellm 1.84.0 以上が必要だが、openai 3 と両立する litellm は 1.83.0 のみ（lightning extra
+      の proxy 経路）。openai 3 対応の修正版 litellm 待ち。
+    expired_at: 2026-12-30

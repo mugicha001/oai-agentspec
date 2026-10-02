@@ -71,6 +71,7 @@ start_server(registry, host="127.0.0.1", port=8000)
 - `serve` は localhost・認証なし。**本番運用の想定外**
 - env 参照は CLI 境界に閉じる。サーバ / `ConversationService` 本体は env 非依存
 - `oai-agentspec chat` は entry（登録順の先頭）エージェント起点。切り替えたい場合はサーバ側 registry 側で調整
+- SDK のモデル呼び出しのタイムアウト（`ModelTimeoutError`。`ModelSettings.timeout` 指定時に送出）は、例外の型で判定して 500 `execution_error` になる（503 `model_not_configured` ではない）。それ以外の例外は文言から推定して分類する（文言に `api_key` / `api key` / `model` を含むと 503 `model_not_configured`、含まなければ 500 `execution_error`）。Responses API が failed / incomplete を返したときの `ModelBehaviorError` も文言で分類されるため、通常は 500 だが、API が返したエラーの詳細に `model` を含むと 503 になる
 
 ## 参照
 

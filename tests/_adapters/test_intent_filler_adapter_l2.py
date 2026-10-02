@@ -309,7 +309,7 @@ async def test_usage_を取得できた場合は件数とトークンを詰め�
 
 
 async def test_usage_未取得なら_tokens_は_None_で_model_calls_は残る() -> None:
-    """`requests==0` かつ `total_tokens==0` は未取得と判定しトークンを None にする。
+    """トークン 3 項目（in / out / total）がすべて 0 なら未取得と判定しトークンを None にする。
 
     SDK の `Usage` は全フィールド非 Optional・既定 0 で 0 と未取得を型で区別できないため、
     件数（`len(raw_responses)`）だけは usage の内容に依存せず実測値を残す。
@@ -347,8 +347,8 @@ async def test_複数応答の_tokens_は合算され_model_calls_は件数に�
 async def test_一部の応答だけ_usage_を持つ場合は未取得としない(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """未取得判定は「全応答が `requests==0` かつ `total_tokens==0`」なので、
-    片方だけ 0 の場合は合算値を返す（None にしない）。
+    """未取得判定は「全応答のトークン 3 項目がすべて 0」なので、
+    一部の応答だけトークンを持つ場合は合算値を返す（None にしない）。
     """
     responses = [
         _usage_response("A", Usage()),
@@ -367,7 +367,7 @@ async def test_一部の応答だけ_usage_を持つ場合は未取得としな�
 async def test_requests_が_0_でも_total_tokens_があれば未取得としない(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """未取得判定は `requests` 単独ではなく `total_tokens` も見る。
+    """未取得判定は `requests` を見ず、トークン 3 項目で決まる。
 
     `requests == 0` でもトークンが載っている応答はトークンを取得できているため、
     None へ倒さず合算値を返す（`requests` だけを見る実装はここで落ちる）。
@@ -383,6 +383,22 @@ async def test_requests_が_0_でも_total_tokens_があれば未取得としな
     _text, usage = await run_filler_prompt(agent, (), "fill me")
 
     assert usage == AgentRunUsage(model_calls=1, input_tokens=5, output_tokens=6)
+
+
+async def test_requests_が_1_でもトークンがすべて_0_なら未取得として_None_にする() -> None:
+    """全応答が `Usage(requests=1)`（トークンがすべて 0）なら tokens は None。
+
+    SDK 組み込みモデルは usage の欠けた応答でも requests を 1 と数えるため、未取得判定は
+    requests を見ずトークン 3 項目がすべて 0 かで行う（ADR-0046）。件数は応答件数のまま残る。
+    """
+    model = FakeModel()
+    model.responses.append(_usage_response("RESP", Usage(requests=1)))
+    agent = _filler_agent(model)
+
+    text, usage = await run_filler_prompt(agent, (), "fill me")
+
+    assert text == "RESP"
+    assert usage == AgentRunUsage(model_calls=1, input_tokens=None, output_tokens=None)
 
 
 def test_AgentRunUsage_は_frozen_な値型() -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "oai-agentspec"
-version = "0.3.0"
+version = "0.4.0"
 description = "Unofficial declarative agent / prompt / handoff management library on top of openai-agents (not affiliated with OpenAI)"
 readme = "README.md"
 authors = [
@@ -19,7 +19,8 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "openai-agents>=0.17.4",
+    # 宣言範囲は 1 つの minor に閉じ、下限は lock 構成で全件緑を実測した版にする（ADR-0043）。
+    "openai-agents>=0.22.3,<0.23",
     "pyyaml>=6.0.3",
 ]
 
@@ -58,9 +59,9 @@ lightning = [
 finetune = [
     # openai-agents の推移依存として既に入っているが、runtime/finetune/ 配下（段階的に
     # `client.fine_tuning.jobs.*` を呼ぶ `_adapters`）が直接依存する意図で明示宣言する。
-    # 範囲は openai-agents 0.17.4 の `Requires-Dist: openai<3,>=2.36.0` と一致させる
+    # 範囲は openai-agents 0.22.x の `Requires-Dist: openai<4,>=3.0.0` と一致させる
     # （`fine_tuning.jobs.create` の `method` パラメータ = DPO 指定はこの下限で利用できる）。
-    "openai>=2.36.0,<3",
+    "openai>=3.0.0,<4",
 ]
 governance = [
     # ツール単位ポリシー強制 (`govern`) + 監査ログ + openai-agents 連携アダプタを使う。

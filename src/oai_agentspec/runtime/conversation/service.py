@@ -492,6 +492,9 @@ class ConversationService:
         例外として現れるので、メッセージ文字列一致（`api_key` / `model`）で `MODEL_NOT_CONFIGURED`
         を**ベストエフォートで推定**する。**既知の限界**: 文字列一致はヒューリスティックで、
         `model` を含む無関係なエラーを誤分類しうる。判別が曖昧な場合は `EXECUTION_ERROR` に倒す。
+        SDK のモデル呼び出しのタイムアウト（`ModelTimeoutError`）は文言に `model` を含むが、
+        型で判定して文字列一致による `MODEL_NOT_CONFIGURED` から除外し、`EXECUTION_ERROR` に
+        分類する。
 
         Args:
             exc: 変換元の例外。
@@ -504,7 +507,9 @@ class ConversationService:
         message = str(exc)
         lowered = message.lower()
         # fallback ヒューリスティック（誤分類しうる既知の限界・上記 docstring 参照）。
-        if "api_key" in lowered or "api key" in lowered or "model" in lowered:
+        # モデル呼び出しのタイムアウトは型で除外し、末尾の EXECUTION_ERROR へ落とす。
+        looks_unconfigured = "api_key" in lowered or "api key" in lowered or "model" in lowered
+        if looks_unconfigured and not _adapters.is_model_timeout_error(exc):
             return ConversationError(
                 ConversationErrorCode.MODEL_NOT_CONFIGURED,
                 f"モデルが構成されていない可能性があります: {message}",

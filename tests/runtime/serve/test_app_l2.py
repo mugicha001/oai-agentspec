@@ -14,6 +14,7 @@ import pytest
 
 pytest.importorskip("fastapi")
 
+from agents.exceptions import ModelTimeoutError  # noqa: E402
 from agents.items import ModelResponse  # noqa: E402
 from agents.models.interface import Model  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -289,6 +290,47 @@ def test_send_model_not_configured_returns_503() -> None:
     )
     assert resp.status_code == 503
     assert resp.json()["code"] == "model_not_configured"
+
+
+class _ModelTimeoutModel(Model):
+    """get_response / stream_response で SDK の ModelTimeoutError を送出する Model。
+
+    例外は SDK の送出箇所（run_internal/model_retry.py）と同じコンストラクタで作る。文言
+    （"Model call timed out after 30 seconds."）は 'model' を含むが、型判定で
+    `execution_error` へ分類されることを検証する。
+    """
+
+    async def get_response(self, system_instructions=None, input=None, *a, **k) -> ModelResponse:  # type: ignore[override]  # noqa: A002,E501
+        raise ModelTimeoutError(30.0)
+
+    async def stream_response(
+        self, system_instructions=None, input=None, *a, **k
+    ) -> AsyncIterator[Any]:  # type: ignore[override]  # noqa: A002,E501
+        raise ModelTimeoutError(30.0)
+        yield  # pragma: no cover - 到達しない（型のため）
+
+
+def test_send_model_timeout_returns_500_execution_error() -> None:
+    """モデル呼び出しタイムアウトの会話送信は 500 + execution_error を返す（503 にしない）。"""
+    client = _client(_ModelTimeoutModel())
+    cid = client.post("/conversations", json={}).json()["conversation_id"]
+    resp = client.post(
+        f"/conversations/{cid}/messages",
+        json={"agent_name": "bot", "text": "hi"},
+    )
+    assert resp.status_code == 500
+    assert resp.json()["code"] == "execution_error"
+
+
+def test_ws_model_timeout_sends_execution_error() -> None:
+    """WS のモデル呼び出しタイムアウトは error(code=execution_error) を返す。"""
+    client = _client(_ModelTimeoutModel())
+    cid = client.post("/conversations", json={}).json()["conversation_id"]
+    with client.websocket_connect("/ws") as ws:
+        ws.send_json({"type": "turn", "agent_name": "bot", "conversation_id": cid, "text": "x"})
+        msg = ws.receive_json()
+    assert msg["type"] == "error"
+    assert msg["code"] == "execution_error"
 
 
 def test_create_duplicate_conversation_returns_409() -> None:

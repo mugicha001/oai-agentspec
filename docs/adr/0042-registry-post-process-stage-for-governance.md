@@ -1,6 +1,6 @@
 # 0042: registry に第 3 段 post-process を追加し、sub_agents の as_tool と factory Agent をオプトインで統治する
 
-- Status: accepted
+- Status: accepted (partially superseded by 0045: 6 の複製時の同一性保持と、SDK 複製が包み直さないことへの依存)
 - Date: 2026-09-29
 
 ## Context

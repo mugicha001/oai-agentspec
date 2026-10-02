@@ -34,6 +34,8 @@ import dataclasses
 import inspect
 import re
 import warnings
+import weakref
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -50,6 +52,7 @@ from agents import Agent, FunctionTool, Runner, ToolOrigin, ToolOriginType, User
 from agents.lifecycle import AgentHooksBase, RunHooksBase  # noqa: E402
 from agents.mcp import MCPServer  # noqa: E402
 from agents.mcp.util import MCPUtil  # noqa: E402
+from agents.run_context import RunContextWrapper  # noqa: E402
 from agents.tool import get_function_tool_origin  # noqa: E402
 from agents.tool_context import ToolContext  # noqa: E402
 from mcp.types import CallToolResult, GetPromptResult, ListPromptsResult  # noqa: E402
@@ -1977,12 +1980,17 @@ async def test_factory_returning_governed_agent_is_evaluated_by_both_policies() 
 
 
 def test_governed_registration_survives_replace_and_copy_tripwire() -> None:
-    """`_govern_tool` の統治済み判定は `dataclasses.replace` / `copy.copy` を経ても保たれる。
+    """govern 済みの実行本体は SDK の失敗ハンドラ付き invoker で、複製後も統治済みと判定される。
 
-    判定は実行本体（`on_invoke_tool`）のラッパ関数そのものの同一性で行うため、SDK の
-    `FunctionTool.__post_init__` / `__copy__` が実行本体を包み直すと判定が外れる。外れると
-    第 3 段が build 時統治済みの tool を再ラップし、`tool:` レコードが 2 行になる
-    （fail-closed だが記録が変わる）。
+    ADR-0045: `@function_tool` 由来の tool を govern すると、`on_invoke_tool` は
+    `agents.tool._FailureHandlingFunctionToolInvoker` のサブクラス（`_GovernedInvoker`）になる
+    （SDK 0.22.x の承認の事前検証はこの型判定で有効になる）。SDK の `FunctionTool.__post_init__` /
+    `__copy__` は `__agents_bind_function_tool__` で invoker を新しい tool へ束縛し直し、複製ごとに
+    別インスタンスを作る。そのため統治済みの印は「登録済みの同一オブジェクトを指し続けること」では
+    なく「再束縛で作られた別インスタンスが生成時に登録されること」で保つ。印が外れると第 3 段が
+    build 時統治済みの tool を再ラップし、`tool:` レコードが 2 行になる（fail-closed だが記録が
+    変わる）。弱参照の登録簿（`_GOVERNED_WRAPPERS`）に載せるため invoker は弱参照可能である
+    （基底が `__slots__` を持たないこと）。
     """
     tool = _make_tool([])
     governed = _govern_tool(
@@ -1994,13 +2002,74 @@ def test_governed_registration_survives_replace_and_copy_tripwire() -> None:
     )
     assert _is_governed(governed) is True
     assert _is_governed(tool) is False
+    invoker = governed.on_invoke_tool
+    assert isinstance(invoker, sdk_tool._FailureHandlingFunctionToolInvoker)
+    assert weakref.ref(invoker)() is invoker
 
     for derived in (dataclasses.replace(governed, name="renamed"), copy.copy(governed)):
         assert derived is not governed
+        assert isinstance(derived.on_invoke_tool, sdk_tool._FailureHandlingFunctionToolInvoker)
+        # 再束縛で新しい tool へ束縛した別インスタンスになる（SDK の複製契約）。
+        assert derived.on_invoke_tool._function_tool is derived
         assert _is_governed(derived) is True, (
-            "SDK の FunctionTool 複製が on_invoke_tool を包み直すようになった。"
-            "_adapters/governance.py の統治済み判定（_is_governed）の方法を見直すこと。"
+            "SDK の FunctionTool 複製で再束縛された govern 済み invoker が統治済みと判定されない。"
+            "_adapters/governance.py の _GovernedInvoker の再束縛と生成時登録を見直すこと。"
         )
+
+
+async def test_governed_copy_rebinds_inner_invoker_to_the_copied_tool() -> None:
+    """複製した govern 済み tool の失敗処理は、複製側の tool の設定で行われる（ADR-0045）。
+
+    SDK は失敗時の文言を invoker が束縛している tool（`_function_tool`）から解決する。
+    `_GovernedInvoker` の再束縛が内側の invoker まで束縛し直さないと、複製で失敗時の関数を
+    差し替えても複製前の tool の設定が使われる。
+    """
+
+    @function_tool(name_override="boom")
+    def _boom(text: str) -> str:
+        """常に失敗する。"""
+        raise ValueError("boom")
+
+    governed = _govern_tool(
+        _boom,
+        policy=GovernancePolicy(name="p"),
+        sink=AuditLog(),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+
+    def _custom(ctx: Any, error: Exception) -> str:
+        return f"custom:{error}"
+
+    derived = dataclasses.replace(
+        governed, _failure_error_function=_custom, _use_default_failure_error_function=False
+    )
+
+    result = await derived.on_invoke_tool(_tool_ctx("boom", '{"text": "x"}'), '{"text": "x"}')
+
+    assert derived.on_invoke_tool._function_tool is derived
+    assert result == "custom:boom"
+
+
+def test_governed_tool_exposes_same_wrapped_callable_as_ungoverned() -> None:
+    """govern 済み tool の `__wrapped__` は govern なしと同じ元関数を返す（公開面の parity）。
+
+    SDK の `FunctionTool.__wrapped__` は invoker の実行本体に付いた印から元関数を辿る。
+    govern の実行本体へ印を写さないと、govern 済みだけ AttributeError になる。返るのは未統治の
+    元関数であり、SDK が実行経路でこの印を読まないことはトリップワイヤ
+    （`test_sdk_function_tool_invoker_private_symbols_tripwire`）が検査する。
+    """
+    tool = _make_tool([])
+    governed = _govern_tool(
+        tool,
+        policy=GovernancePolicy(name="p"),
+        sink=AuditLog(),
+        denied_exc=PolicyViolationError,
+        agent_name="bot",
+    )
+
+    assert governed.__wrapped__ is tool.__wrapped__
+    assert copy.copy(governed).__wrapped__ is tool.__wrapped__
 
 
 # ----------------------------------------------------------------------
@@ -2097,3 +2166,593 @@ async def test_nested_builder_opt_in_uses_explicit_post_processor_policy(source:
         (e.agent_id, e.decision, e.details["arguments"])
         for e in _tool_records(inner_sink, "tool:researcher")
     ] == expected_inner
+
+
+# ----------------------------------------------------------------------
+# govern 済み実行本体の SDK invoker 準拠（ADR-0045）
+#
+# govern は `@function_tool` 由来の実行本体を SDK の失敗ハンドラ付き invoker のサブクラスで
+# 置き換える。SDK 0.22.x の承認の事前検証（callable な `needs_approval` の前に引数を入力モデルで
+# 検証し、値が変わる引数は判定関数を呼ばずに承認必須にする）は invoker の型判定で有効になるため、
+# 素の関数で置き換えると govern 済みツールだけ事前検証が外れ、引数の表現を変えるだけで条件付き
+# 承認をすり抜けられる。
+# ----------------------------------------------------------------------
+
+
+def _derive(tool: FunctionTool, how: str) -> FunctionTool:
+    """SDK の複製経路（`dataclasses.replace` / `copy.copy`）で tool を派生させる。"""
+    if how == "replace":
+        return dataclasses.replace(tool, description="derived")
+    if how == "copy":
+        return copy.copy(tool)
+    return tool
+
+
+def _approval_tools(seen: list[dict[str, Any]], ran: list[Any]) -> dict[str, FunctionTool]:
+    """条件付き承認（callable な `needs_approval`）を持つ実 `function_tool` 一式を作る。
+
+    判定関数は生の型に敏感（`type(v) is int` / `is True`）にしてある。SDK の事前検証を経ずに
+    生の引数が判定関数へ届くと、型変換される入力では承認を要求しない（ADR-0043 のすり抜け実測と
+    同じ形）。判定関数へ渡った引数は `seen` に、ツール本体が受け取った値は `ran` に積む。
+    """
+
+    async def needs_big(ctx: Any, args: dict[str, Any], call_id: str) -> bool:
+        seen.append(dict(args))
+        amount = args.get("amount")
+        return type(amount) is int and amount > 1000
+
+    async def needs_execute(ctx: Any, args: dict[str, Any], call_id: str) -> bool:
+        seen.append(dict(args))
+        return args.get("execute") is True
+
+    @function_tool(needs_approval=needs_big)
+    def pay(amount: int) -> str:
+        """支払う（既定値なし）。"""
+        ran.append(amount)
+        return f"paid {amount}"
+
+    @function_tool(needs_approval=needs_big)
+    def pay_memo(amount: int, memo: str = "") -> str:
+        """メモ付きで支払う（既定値あり）。"""
+        ran.append(amount)
+        return f"paid {amount}"
+
+    @function_tool(needs_approval=needs_execute)
+    def launch(execute: bool) -> str:
+        """実行フラグ付きで起動する。"""
+        ran.append(execute)
+        return f"launched {execute}"
+
+    return {"pay": pay, "pay_memo": pay_memo, "launch": launch}
+
+
+@dataclasses.dataclass
+class _ApprovalRun:
+    """条件付き承認ツールを 1 回走らせた結果（再開用の agent と観測点を含む）。"""
+
+    result: Any
+    agent: Agent
+    seen: list[dict[str, Any]]
+    ran: list[Any]
+    sink: AuditLog
+
+
+async def _run_approval_case(tool_name: str, args_json: str, *, governed: bool) -> _ApprovalRun:
+    """`tool_name` を 1 回呼ぶ run を govern あり / なしの registry で実行する。"""
+    seen: list[dict[str, Any]] = []
+    ran: list[Any] = []
+    tool = _approval_tools(seen, ran)[tool_name]
+    sink = AuditLog()
+    if governed:
+        registry = AgentRegistry(
+            agent_builder=GovernedAgentBuilder(
+                policy=GovernancePolicy(name="p", allowed_tools=[tool_name]), audit_sink=sink
+            )
+        )
+    else:
+        registry = AgentRegistry()
+    model = FakeModel().queue_tool_call(tool_name, args_json).queue_text("done")
+    registry.register(AgentSpec(name="bot", instructions="i", model=model, tools=[tool]))
+    agent = registry.get("bot")
+    result = await Runner.run(agent, input="go")
+    return _ApprovalRun(result=result, agent=agent, seen=seen, ran=ran, sink=sink)
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args_json", "expected_interruptions"),
+    [
+        pytest.param("pay", '{"amount": "5000"}', 1, id="int-as-string"),
+        pytest.param("pay", '{"amount": 5000.0}', 1, id="int-as-float"),
+        pytest.param("launch", '{"execute": "yes"}', 1, id="bool-as-string"),
+        pytest.param("pay_memo", '{"amount": 500}', 1, id="default-completion"),
+        pytest.param("pay", '{"amount": 5000}', 1, id="control-int-over-limit"),
+        pytest.param("pay", '{"amount": 500}', 0, id="control-int-under-limit"),
+        pytest.param("launch", '{"execute": true}', 1, id="control-bool"),
+    ],
+)
+async def test_governed_conditional_approval_matches_ungoverned(
+    tool_name: str, args_json: str, expected_interruptions: int
+) -> None:
+    """govern 済み / なしの同じツールで、承認要求の有無と判定関数へ渡る引数が一致する（ADR-0045）。
+
+    型変換される入力（数値の文字列表現・小数表現・真偽値の文字列表現）と既定値の補完が起きる入力
+    では、SDK 0.22.x の事前検証が判定関数を呼ばずに承認を必須にする。govern 済みツールの実行本体が
+    SDK の失敗ハンドラ付き invoker でないと事前検証が外れ、生の型に敏感な判定関数が承認不要と
+    判定して本体が承認なしで実行される（govern を足すと承認が弱くなる逆転）。対照の整数入力では
+    両者とも判定関数が呼ばれる。`expected_interruptions` は govern なしの SDK 既定の挙動の前提確認
+    である。
+    """
+    plain = await _run_approval_case(tool_name, args_json, governed=False)
+    gov = await _run_approval_case(tool_name, args_json, governed=True)
+
+    assert len(plain.result.interruptions) == expected_interruptions  # 前提: SDK 既定の判定
+    assert len(gov.result.interruptions) == len(plain.result.interruptions), (
+        f"govern 済みだけ承認要求が変わった: {args_json} "
+        f"(govern なし={len(plain.result.interruptions)}, "
+        f"govern 済み={len(gov.result.interruptions)})"
+    )
+    assert gov.seen == plain.seen
+    assert gov.ran == plain.ran
+
+
+async def test_governed_approval_resume_runs_with_validated_arguments_and_records_allow() -> None:
+    """型変換される入力で承認待ちになった govern 済みツールは、承認後の再開で検証済みの値で動く。
+
+    `{"amount": "5000"}` は事前検証で承認必須になり、承認前は本体も `tool:` 記録も無い。承認して
+    再開すると本体は int の 5000 を受け取り（SDK が準備した引数が govern の実行本体を経て届く）、
+    監査には allow がモデルの送った生の引数付きで 1 行残る（ADR-0045 Decision 5）。
+    """
+    run = await _run_approval_case("pay", '{"amount": "5000"}', governed=True)
+
+    assert len(run.result.interruptions) == 1, "govern 済みツールが承認待ちにならず実行された"
+    assert run.ran == []
+    assert _tool_records(run.sink, "tool:pay") == []
+
+    state = run.result.to_state()
+    for item in run.result.interruptions:
+        state.approve(item)
+    resumed = await Runner.run(run.agent, state)
+
+    assert resumed.final_output == "done"
+    assert run.ran == [5000]
+    assert type(run.ran[0]) is int
+    assert [
+        (e.agent_id, e.decision, e.details["arguments"])
+        for e in _tool_records(run.sink, "tool:pay")
+    ] == [("bot", "allow", '{"amount": "5000"}')]
+
+
+@pytest.mark.parametrize("derive", ["original", "replace", "copy"])
+async def test_governed_invoker_copy_records_single_tool_entry_per_run(derive: str) -> None:
+    """govern 済み tool（複製後を含む）は第 3 段で再ラップされず、1 回の実行で `tool:` が 1 行。
+
+    複製で SDK が再束縛した invoker が統治済みと判定されないと、`govern_ungoverned_tools` が
+    再ラップして `tool:` レコードが 2 行になる。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+    policy = GovernancePolicy(name="p", allowed_tools=["echo"])
+    governed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+        policy=policy,
+        audit_sink=sink,
+    ).tools[0]
+    model = FakeModel().queue_tool_call("echo", '{"text": "hi"}').queue_text("done")
+    agent = Agent(name="bot", instructions="i", model=model, tools=[_derive(governed, derive)])
+    govern_ungoverned_tools(agent, policy=policy, audit_sink=sink, agent_name="bot")
+
+    result = await Runner.run(agent, input="go")
+
+    assert result.final_output == "done"
+    assert calls == ["hi"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == [
+        ("bot", "allow")
+    ]
+
+
+async def test_deepcopied_governed_tool_is_ungoverned_and_regoverned_fail_closed() -> None:
+    """govern 済み tool を `copy.deepcopy` した複製は統治済みの印を保たない（fail-closed）。
+
+    deepcopy は `__init__` を通らないため `_GovernedInvoker` の複製は登録されず、`_is_governed` は
+    偽になる。第 3 段（`govern_ungoverned_tools`）で再び govern され、1 回の実行で評価と `tool:`
+    記録が 2 回ずつになる（評価が抜けるのではなく二重になる方向）。複製の実行本体は元の評価を
+    保つので、deny ポリシーでは本体が実行されない。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+    policy = GovernancePolicy(name="p", allowed_tools=["echo"])
+    governed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+        policy=policy,
+        audit_sink=sink,
+    ).tools[0]
+    cloned = copy.deepcopy(governed)
+
+    assert _is_governed(governed) is True
+    assert _is_governed(cloned) is False
+
+    model = FakeModel().queue_tool_call("echo", '{"text": "hi"}').queue_text("done")
+    agent = Agent(name="bot", instructions="i", model=model, tools=[cloned])
+    govern_ungoverned_tools(agent, policy=policy, audit_sink=sink, agent_name="bot")
+
+    result = await Runner.run(agent, input="go")
+
+    assert result.final_output == "done"
+    assert calls == ["hi"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == [
+        ("bot", "allow"),
+        ("bot", "allow"),
+    ]
+
+    deny_sink = AuditLog()
+    denied = copy.deepcopy(
+        govern_spec(
+            AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+            policy=GovernancePolicy(name="deny", allowed_tools=["other"]),
+            audit_sink=deny_sink,
+        ).tools[0]
+    )
+    with pytest.raises(PolicyViolationError):
+        await denied.on_invoke_tool(_tool_ctx("echo", '{"text": "no"}'), '{"text": "no"}')
+    assert calls == ["hi"]
+
+
+async def test_governed_deny_propagates_without_failure_error_function_message() -> None:
+    """deny は `PolicyViolationError` で run を止め、`failure_error_function` の文言を返さない。
+
+    govern 済みの実行本体を SDK の失敗ハンドラ付き invoker にしても、deny を失敗ハンドラに吸わせない
+    （ADR-0045 Decision 5: deny の着地は不変）。吸われると失敗文言がツール出力としてモデルへ返り、
+    run が続行する。
+    """
+    calls: list[str] = []
+
+    @function_tool(name_override="echo", failure_error_function=lambda ctx, err: "TOOL FAILED")
+    def _tool(text: str) -> str:
+        """テキストを記録してエコーする。"""
+        calls.append(text)
+        return text
+
+    sink = AuditLog()
+    registry = AgentRegistry(
+        agent_builder=GovernedAgentBuilder(
+            policy=GovernancePolicy(name="p", allowed_tools=[]), audit_sink=sink
+        )
+    )
+    model = FakeModel().queue_tool_call("echo", '{"text": "x"}').queue_text("unreached")
+    registry.register(AgentSpec(name="bot", instructions="i", model=model, tools=[_tool]))
+
+    await _assert_run_raises_policy_violation(registry.get("bot"))
+
+    assert calls == []
+    assert len(model.calls) == 1  # 失敗文言を載せた 2 回目のモデル呼び出しが無い
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == [("bot", "deny")]
+
+
+async def test_governed_allow_keeps_failure_error_function_for_tool_errors() -> None:
+    """allow 後の本体の失敗は、govern なしと同じく `failure_error_function` の文言がモデルへ返る。
+
+    失敗処理は govern の内側（元の SDK invoker）が担う。
+    """
+
+    @function_tool(name_override="boom", failure_error_function=lambda ctx, err: "TOOL FAILED")
+    def _tool(text: str) -> str:
+        """常に失敗する。"""
+        raise RuntimeError("kaboom")
+
+    sink = AuditLog()
+    registry = AgentRegistry(
+        agent_builder=GovernedAgentBuilder(
+            policy=GovernancePolicy(name="p", allowed_tools=["boom"]), audit_sink=sink
+        )
+    )
+    model = FakeModel().queue_tool_call("boom", '{"text": "x"}').queue_text("done")
+    registry.register(AgentSpec(name="bot", instructions="i", model=model, tools=[_tool]))
+
+    result = await Runner.run(registry.get("bot"), input="go")
+
+    assert result.final_output == "done"
+    assert len(model.calls) == 2
+    assert "TOOL FAILED" in str(model.calls[1].input)
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:boom")] == [
+        ("bot", "allow")
+    ]
+
+
+def _timeout_validation_outcome(tool: FunctionTool) -> str | None:
+    """`timeout_seconds` を設定した複製を作り、SDK の timeout 設定検証のエラー文言を返す。"""
+    try:
+        dataclasses.replace(tool, timeout_seconds=1.0)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+@pytest.mark.parametrize("sync", [True, False], ids=["sync", "async"])
+def test_governed_function_tool_sync_marker_and_timeout_validation_match_ungoverned(
+    sync: bool,
+) -> None:
+    """同期関数ツールのマーカーと timeout 設定の検証結果が govern あり / なしで一致する。
+
+    SDK は同期関数ツールの invoker に `__agents_sync_function_tool__` を付け、timeout 設定を
+    拒否する（同期関数は timeout で打ち切れないため）。govern 済みの実行本体がマーカーを
+    引き継がないと、同期関数ツールに timeout を設定できてしまう（ADR-0045 Decision 1）。
+    """
+    if sync:
+
+        @function_tool(name_override="echo")
+        def _tool(text: str) -> str:
+            """同期関数ツール。"""
+            return text
+
+    else:
+
+        @function_tool(name_override="echo")
+        async def _tool(text: str) -> str:
+            """非同期関数ツール。"""
+            return text
+
+    governed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_tool]),
+        policy=GovernancePolicy(name="p"),
+        audit_sink=AuditLog(),
+    ).tools[0]
+    marker = sdk_tool._SYNC_FUNCTION_TOOL_MARKER
+
+    assert getattr(_tool.on_invoke_tool, marker, False) is sync  # 前提: SDK の付与規則
+    assert getattr(governed.on_invoke_tool, marker, False) is sync
+    assert (_timeout_validation_outcome(_tool) is not None) is sync  # 前提: SDK の検証
+    assert _timeout_validation_outcome(governed) == _timeout_validation_outcome(_tool)
+
+
+async def test_bare_function_tool_governed_by_plain_wrapper_allow_and_deny() -> None:
+    """実行本体が invoker でない `FunctionTool` は従来の素の関数ラップで統治される（allow / deny）。
+
+    利用者が `FunctionTool` を直接組んだ場合は govern なしでも SDK の事前検証が効かないため、
+    invoker 化せず従来のラップを使う（ADR-0045 Decision 2）。統治済みの印は複製後も保たれる。
+    """
+    calls: list[str] = []
+
+    async def _on_invoke(ctx: Any, input_json: str) -> str:
+        calls.append(input_json)
+        return "ok"
+
+    def _bare() -> FunctionTool:
+        return FunctionTool(
+            name="bare",
+            description="bare tool",
+            params_json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            on_invoke_tool=_on_invoke,
+        )
+
+    allow_sink = AuditLog()
+    allowed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_bare()]),
+        policy=GovernancePolicy(name="p", allowed_tools=["bare"]),
+        audit_sink=allow_sink,
+    ).tools[0]
+    assert not isinstance(allowed.on_invoke_tool, sdk_tool._FailureHandlingFunctionToolInvoker)
+    for derived in (allowed, dataclasses.replace(allowed, description="d"), copy.copy(allowed)):
+        assert _is_governed(derived) is True
+    assert await allowed.on_invoke_tool(_tool_ctx("bare", "{}"), "{}") == "ok"
+    assert calls == ["{}"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(allow_sink, "tool:bare")] == [
+        ("bot", "allow")
+    ]
+
+    deny_sink = AuditLog()
+    denied = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_bare()]),
+        policy=GovernancePolicy(name="p", allowed_tools=[]),
+        audit_sink=deny_sink,
+    ).tools[0]
+    with pytest.raises(PolicyViolationError, match="bare"):
+        await denied.on_invoke_tool(_tool_ctx("bare", "{}"), "{}")
+    assert calls == ["{}"]
+    assert [(e.agent_id, e.decision) for e in _tool_records(deny_sink, "tool:bare")] == [
+        ("bot", "deny")
+    ]
+
+
+# SDK（openai-agents 0.22.x）内で実行本体と元関数の印を参照する既知の箇所（ファイル, 行の中身）。
+# 行番号は patch 更新でずれるため中身で照合する。
+_SDK_INVOKER_REFERENCES = [
+    (
+        "tool.py",
+        '_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER = "__agents_function_tool_wrapped_callable__"',
+    ),
+    ("tool.py", "wrapped_callable = instance.on_invoke_tool._get_wrapped_callable()"),
+    ("tool.py", 'raise AttributeError("FunctionTool.__wrapped__ is read-only")'),
+    ("tool.py", "__wrapped__ = _FunctionToolWrappedCallableDescriptor()"),
+    ("tool.py", "self._invoke_tool_impl = invoke_tool_impl"),
+    ("tool.py", "def _get_wrapped_callable(self) -> object:"),
+    ("tool.py", "self._invoke_tool_impl,"),
+    ("tool.py", "_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,"),
+    ("tool.py", "self._invoke_tool_impl,"),
+    ("tool.py", 'prepare = getattr(self._invoke_tool_impl, "__agents_prepare_arguments__", None)'),
+    ("tool.py", "return await self._invoke_tool_impl(ctx, input)"),
+    ("tool.py", 'inspect.getattr_static(func, "__wrapped__", missing) is not missing'),
+    ("tool.py", 'or hasattr(call_descriptor, "__wrapped__")'),
+    ("tool.py", "_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER,"),
+]
+
+
+def test_sdk_function_tool_invoker_private_symbols_tripwire() -> None:
+    """govern の invoker 準拠が依存する SDK 非公開要素の存在を検査する（ADR-0045 Decision 3・4）。
+
+    依存点:
+    - `agents.tool._FailureHandlingFunctionToolInvoker`（継承元。承認の事前検証の型判定の対象）と
+      コンストラクタ引数 `(invoke_tool_impl, on_handled_error, *, function_tool)`・内部属性
+      `_invoke_tool_impl` / `_on_handled_error` / `_function_tool`・`__slots__` を持たないこと
+      （インスタンスを弱参照の登録簿へ載せるため）
+    - 再束縛プロトコル `__agents_bind_function_tool__`（`FunctionTool.__post_init__` / `__copy__` が
+      呼び、束縛先が違えば別インスタンスを返す）
+    - 同期関数ツールのマーカー `_SYNC_FUNCTION_TOOL_MARKER`（= `__agents_sync_function_tool__`）
+    - 事前検証の材料 `__agents_prepare_arguments__` と `__agents_function_tool_wrapped_callable__`
+      （`@function_tool` が `_invoke_tool_impl` の関数属性として付与する。govern は統治済みの実行
+      本体へ写す）と、それを参照する `prepare_arguments`
+    - SDK 内で実行本体（`_invoke_tool_impl`）と元関数の印（`_get_wrapped_callable` /
+      `__wrapped__` / `_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER`）を参照する箇所が、下の既知の集合と
+      完全に一致すること。呼び出しの字面に限らず、変数への代入・`getattr`・定義を含む全参照を単語
+      境界で列挙する。govern は `__call__` と `_invoke_tool_impl` の両方に評価を置き、元関数の印を
+      実行本体へ写す（`__wrapped__` は未統治の元関数を返す）ため、SDK がこれらを新しい経路で参照・
+      実行するとポリシー評価を迂回しうる。参照が増減したら SDK の差分を読み、迂回にならないことを
+      確かめてから既知の集合を更新する
+    """
+    invoker_cls = sdk_tool._FailureHandlingFunctionToolInvoker
+    params = inspect.signature(invoker_cls.__init__).parameters
+    assert list(params) == ["self", "invoke_tool_impl", "on_handled_error", "function_tool"]
+    assert params["function_tool"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert "__slots__" not in vars(invoker_cls)
+    assert sdk_tool._SYNC_FUNCTION_TOOL_MARKER == "__agents_sync_function_tool__"
+
+    tool = _make_tool([])
+    invoker = tool.on_invoke_tool
+    assert isinstance(invoker, invoker_cls)
+    assert invoker._function_tool is tool
+    assert callable(invoker._on_handled_error)
+    assert callable(invoker.prepare_arguments)
+    assert callable(invoker.__agents_bind_function_tool__)
+    impl = invoker._invoke_tool_impl
+    assert callable(getattr(impl, "__agents_prepare_arguments__", None))
+    assert hasattr(impl, "__agents_function_tool_wrapped_callable__")
+    copied = copy.copy(tool)
+    assert copied.on_invoke_tool is not invoker
+    assert copied.on_invoke_tool._function_tool is copied
+
+    reference = re.compile(
+        r"\b(_invoke_tool_impl|_get_wrapped_callable|__wrapped__|_FUNCTION_TOOL_WRAPPED_CALLABLE_MARKER"
+        r"|__agents_function_tool_wrapped_callable__)\b"
+    )
+    sdk_root = Path(inspect.getfile(sdk_tool)).parent
+    references = sorted(
+        (str(path.relative_to(sdk_root)), line.strip())
+        for path in sdk_root.rglob("*.py")
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if reference.search(line)
+    )
+    assert references == sorted(_SDK_INVOKER_REFERENCES), (
+        "SDK 内で実行本体（_invoke_tool_impl）か元関数の印（__wrapped__ 等）を参照する箇所が"
+        "増減した。新しい参照がポリシー評価を通らずに実行本体・元関数を呼ぶ経路でないかを SDK の"
+        "差分で確かめ、迂回にならない場合だけ _SDK_INVOKER_REFERENCES を更新すること"
+        "（ADR-0045 Decision 3・4）。"
+    )
+
+
+@pytest.mark.parametrize("derive", ["original", "replace", "copy"])
+async def test_governed_invoke_tool_impl_direct_call_still_denies(derive: str) -> None:
+    """govern 済みの `on_invoke_tool._invoke_tool_impl` の直接呼び出しでも deny される（迂回防止）。
+
+    基底 invoker へ渡す実行本体は統治済みのもの（ADR-0045 Decision 1）で、元の実行本体を渡すと
+    `_invoke_tool_impl` の直接呼び出しで評価を迂回できる。複製で再束縛されたインスタンスでも同じ。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+    governed = govern_spec(
+        AgentSpec(name="bot", instructions="i", tools=[_make_tool(calls)]),
+        policy=GovernancePolicy(name="p", allowed_tools=[]),
+        audit_sink=sink,
+    ).tools[0]
+    target = _derive(governed, derive)
+    impl = target.on_invoke_tool._invoke_tool_impl
+
+    with pytest.raises(PolicyViolationError, match="echo"):
+        await impl(_tool_ctx("echo", '{"text": "x"}'), '{"text": "x"}')
+
+    assert calls == []
+    assert [
+        (e.agent_id, e.decision, e.details["arguments"]) for e in _tool_records(sink, "tool:echo")
+    ] == [("bot", "deny", '{"text": "x"}')]
+
+
+@pytest.mark.parametrize("derive", ["original", "replace", "copy"])
+@pytest.mark.parametrize(
+    ("deny_side", "expected"),
+    [
+        pytest.param("none", [("outer", "allow"), ("inner", "allow")], id="both-allow"),
+        pytest.param("outer", [("outer", "deny")], id="outer-deny"),
+        pytest.param("inner", [("outer", "allow"), ("inner", "deny")], id="inner-deny"),
+    ],
+)
+async def test_regoverned_tool_is_evaluated_by_outer_and_inner(
+    derive: str, deny_side: str, expected: list[tuple[str, str]]
+) -> None:
+    """統治済みツールの再 govern は外側・内側の両方で評価・記録され、片方の deny で止まる。
+
+    再度の govern では内側の実行本体が govern 済み invoker になる。外側の再束縛は内側も連鎖して
+    作り直す（ADR-0045 Consequences）。複製後も同じ評価・記録になる。
+    """
+    calls: list[str] = []
+    sink = AuditLog()
+
+    def _policy(side: str) -> GovernancePolicy:
+        return GovernancePolicy(name=side, allowed_tools=[] if deny_side == side else ["echo"])
+
+    inner_tool = govern_spec(
+        AgentSpec(name="inner", instructions="i", tools=[_make_tool(calls)]),
+        policy=_policy("inner"),
+        audit_sink=sink,
+    ).tools[0]
+    outer_tool = govern_spec(
+        AgentSpec(name="outer", instructions="i", tools=[inner_tool]),
+        policy=_policy("outer"),
+        audit_sink=sink,
+    ).tools[0]
+    target = _derive(outer_tool, derive)
+
+    if deny_side == "none":
+        out = await target.on_invoke_tool(_tool_ctx("echo", '{"text": "x"}'), '{"text": "x"}')
+        assert out == "echo:x"
+        assert calls == ["x"]
+    else:
+        with pytest.raises(PolicyViolationError, match="echo"):
+            await target.on_invoke_tool(_tool_ctx("echo", '{"text": "x"}'), '{"text": "x"}')
+        assert calls == []
+    assert [(e.agent_id, e.decision) for e in _tool_records(sink, "tool:echo")] == expected
+
+
+async def _received_context_type(annotation: str, *, governed: bool) -> type:
+    """第 1 引数の注釈が `annotation` の関数ツールを run し、本体が受け取った文脈の型を返す。"""
+    received: list[type] = []
+    if annotation == "run_context_wrapper":
+
+        @function_tool(name_override="probe")
+        def _tool(ctx: RunContextWrapper[Any], text: str) -> str:
+            """受け取ったコンテキストの型を記録する。"""
+            received.append(type(ctx))
+            return text
+
+    else:
+
+        @function_tool(name_override="probe")
+        def _tool(ctx: ToolContext[Any], text: str) -> str:
+            """受け取ったコンテキストの型を記録する。"""
+            received.append(type(ctx))
+            return text
+
+    if governed:
+        registry = AgentRegistry(
+            agent_builder=GovernedAgentBuilder(
+                policy=GovernancePolicy(name="p", allowed_tools=["probe"]), audit_sink=AuditLog()
+            )
+        )
+    else:
+        registry = AgentRegistry()
+    model = FakeModel().queue_tool_call("probe", '{"text": "x"}').queue_text("done")
+    registry.register(AgentSpec(name="bot", instructions="i", model=model, tools=[_tool]))
+    await Runner.run(registry.get("bot"), input="go")
+    assert len(received) == 1
+    return received[0]
+
+
+@pytest.mark.parametrize("annotation", ["run_context_wrapper", "tool_context"])
+async def test_governed_tool_receives_same_context_type_as_ungoverned(annotation: str) -> None:
+    """内側関数のコンテキスト注釈によらず、govern 済み / なしで受け取るコンテキスト型が一致する。
+
+    SDK は `on_invoke_tool` の第 1 引数の注釈で渡すコンテキスト型を選ぶ。govern 済みの実行本体の
+    注釈が SDK の invoker と同じ解決経路にならないと、ツールが受け取る型が変わる（ADR-0045
+    Decision 1 の `ToolContext[Any]` 注釈）。
+    """
+    plain = await _received_context_type(annotation, governed=False)
+    gov = await _received_context_type(annotation, governed=True)
+
+    assert gov is plain

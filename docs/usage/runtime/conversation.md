@@ -136,6 +136,7 @@ chat = ConversationService(registry, session_policy=policy)
 - `enabled=True` かつ `client` 欠落は構築時 `ValueError`（暗黙有効化しない）
 - `CompactionConfig.enabled` / `SessionPolicy.persist` に bool 以外（`None` / 文字列 / int の `0` `1`）を渡すと構築時 `ValueError`。`enabled` の型検証は `client` 整合の検証より先に走るため、`enabled="true"` は client 欠落の指摘ではなく型エラーになる
 - 未解決の承認待ちがある間は `send` / `stream` が新ターンを開始しない（P1・安全性）
+- 永続化した承認待ち状態（SDK の `RunState`）の互換は前方向のみ。保存時より新しい SDK では復元できるが、保存時より古い SDK では復元できない（復元失敗は `ConversationError`）。SDK を下げる場合は承認待ちを解決してから下げる
 
 ## 参照
 

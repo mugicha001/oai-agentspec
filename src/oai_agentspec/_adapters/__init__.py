@@ -135,6 +135,7 @@ from .runner import (
     ApplyResult,
     DefaultRunnerAdapter,
     RunOutcome,
+    is_model_timeout_error,
 )
 from .serialization import (
     StreamTextDelta,
@@ -196,6 +197,7 @@ __all__ = [
     "StreamTextDone",
     "RunOutcome",
     "ApplyResult",
+    "is_model_timeout_error",
     "apply_approvals",
     "unresolved_pending",
     "resume_outcome",

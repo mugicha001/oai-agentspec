@@ -21,8 +21,10 @@ class AgentRunUsage:
 
     Attributes:
         model_calls: モデル応答の件数（`raw_responses` の実測値）。
-        input_tokens: 入力トークン合計。usage を取得できない場合は None。
-        output_tokens: 出力トークン合計。usage を取得できない場合は None。
+        input_tokens: 入力トークン合計。usage を取得できない場合（全応答で入力・出力・合計の
+            トークンがすべて 0）は None。
+        output_tokens: 出力トークン合計。usage を取得できない場合（全応答で入力・出力・合計の
+            トークンがすべて 0）は None。
     """
 
     model_calls: int
@@ -88,8 +90,9 @@ def _collect_usage(raw_responses: Iterable[Any]) -> AgentRunUsage:
     """モデル応答列から `AgentRunUsage` を組み立てる。
 
     SDK の `Usage` は全フィールド非 Optional かつ既定 0 のため、0 と未取得を型で区別できない。
-    全応答が `requests == 0` かつ `total_tokens == 0` の場合のみ未取得と判定し、トークンを
-    None にする。件数は usage の内容に依存せず常に実測値を残す。
+    全応答で `input_tokens` / `output_tokens` / `total_tokens` がすべて 0 の場合のみ未取得と
+    判定し（`requests` は見ない・ADR-0046）、トークンを None にする。件数は usage の内容に
+    依存せず常に実測値を残す。
 
     Args:
         raw_responses: `RunResult.raw_responses` 相当のモデル応答列。
@@ -97,13 +100,15 @@ def _collect_usage(raw_responses: Iterable[Any]) -> AgentRunUsage:
     Returns:
         件数とトークン合計（未取得なら None）を載せた `AgentRunUsage`。
     """
+    from .runner import usage_is_missing
+
     responses = list(raw_responses)
     input_total = 0
     output_total = 0
     measured = False
     for response in responses:
         usage = response.usage
-        if usage.requests or usage.total_tokens:
+        if not usage_is_missing(usage):
             measured = True
         input_total += usage.input_tokens
         output_total += usage.output_tokens

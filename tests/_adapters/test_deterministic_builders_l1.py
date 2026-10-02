@@ -131,7 +131,7 @@ def test_text_response_with_usage_は指定した_usage_を反映する() -> Non
 
 
 def test_text_response_with_usage_の_requests_既定値は_1() -> None:
-    """`requests` 省略時は 1（usage 欠損検知の回避）で、他のトークン項目は 0 のまま。"""
+    """`requests` 省略時は 1（SDK の累積 usage と整合）で、他のトークン項目は 0 のまま。"""
     response = _builders().text_response_with_usage("ok", total_tokens=7)
 
     assert response.usage.requests == 1

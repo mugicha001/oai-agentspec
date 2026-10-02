@@ -70,7 +70,8 @@ cd oai-agentspec
 uv sync --all-extras
 ```
 
-要件: Python 3.12+ / `openai-agents>=0.17.4`
+要件: Python 3.12+ / `openai-agents>=0.22.3,<0.23`（openai 3 系が必須。finetune extra も `openai>=3.0.0,<4`）
+openai 3 の HTTP 層は httpx2 のため、`AsyncOpenAI(http_client=...)` に渡すクライアントは httpx2 のものにする
 
 extra は実行寄り層でのみ必要。コアの宣言 API（`AgentSpec` / `AgentRegistry` / `HandoffGraph` /
 `WorkflowGraph` / `ConversationService` の in-process 利用）は extra なしで動く。`serve` = FastAPI
@@ -532,7 +533,7 @@ make secrets       # gitleaks（git 履歴 + 作業ツリー）
 
 ## プロジェクトステータス
 
-Alpha（0.2.x）。公開契約は `oai_agentspec.__all__` のシンボルのみで、バージョニングは SemVer に従う。
+Alpha（0.4.x）。公開契約は `oai_agentspec.__all__` のシンボルのみで、バージョニングは SemVer に従う。
 API は安定化に向け変更される可能性がある。
 
 ## ライセンス
