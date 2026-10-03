@@ -2478,7 +2478,7 @@ MCP ツールの評価点は、サーバに統治ガードレールを付けた�
   `on_tool_start` より前）で評価する。ガードレールは `data.agent.hooks` を根に lib の監査フック
   （`_AuditAgentHooks`）を辿り、各監査フックのポリシー・監査 sink・`spec.name` で評価する。ポリシーを持つ
   `_AuditAgentHooks` は評価対象に加えて中を辿らず、`_ChainedAgentHooks` は要素列を宣言順に辿り、それ以外
-  （`None`・利用者フック・duck-typed のラッパ）はそこで止まる（規則の正本は ADR-0048）。評価対象は宣言順に評価し、
+  （`None`・利用者フック・duck-typed のラッパ・ポリシーを持たない監査フック）はそこで止まる。評価対象は宣言順に評価し、
   deny は `tool:` deny を記録してから `PolicyViolationError` を送出する（SDK が `UserError` の `__cause__` に
   載せるため着地は他経路と同じ）。allow は `tool:` allow を記録し、評価した監査フックの印
   （`weakref.WeakKeyDictionary[ToolContext, str]`）に当該 `ToolContext` と評価したツール名を記録して `allow` を
@@ -2490,15 +2490,10 @@ MCP ツールの評価点は、サーバに統治ガードレールを付けた�
   差し替えた場合等）・評価名がずれた場合も統治は外れず、失敗時に倒れる先は二重評価（`tool:` が 2 行）の側である。
   監査フックの `__deepcopy__` は self を返し、統治済みの Agent を深くコピーしてもコピーは同じ監査フックを共有する。
 
-統治ガードレールを付けたサーバでは、監査列は `tool:` が `tool_start:` より先に来て、deny では `tool_start:` が
-残らない。`tool:` はポリシー判定の記録であり、後ろの内容検査が reject した呼び出しや、
-`RunConfig.tool_execution.pre_approval_tool_input_guardrails` 下で承認が却下された呼び出しは、`tool:` allow が
-残っても実行されない（実行の有無は `tool_start:` / `tool_end:` で判別する）。pre_approval を真にすると統治の
-deny が承認要求より前に出る一方、allow は承認後に再評価され `tool:` allow が 2 行残りうる。
-`RunResult.tool_input_guardrail_results` には統治ガードレールの allow も載る。ガードレールは tool の origin を
-知らないため、`spec.tools` へ付けると build 時ラップとの二重評価になる（`MCPServer` にだけ付ける）。lib は
-並び順を検査しないため、先頭以外に置いた場合に前の内容検査が reject した呼び出しは統治の評価も記録も受けない。
-利用者向けの使い方は `docs/usage/safety/governance.md` が SoT。
+統治ガードレールを付けたサーバでは評価点が `on_tool_start` より前へ移るため、監査列は `tool:` が `tool_start:` より
+先に来る。`tool:` はポリシー判定の記録であり、実行の有無は `tool_start:` / `tool_end:` で判別する。ガードレールは
+tool の origin も並び順も検査しない。利用者向けの使い方と注意（並び順・付ける対象・監査列・pre_approval 下の
+挙動・`tool_input_guardrail_results` の読み方）は `docs/usage/safety/governance.md` が SoT（本節では再掲しない）。
 
 既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため、既定では per-call の
 allow / deny 評価・決定記録の対象外（監査フックの tool_start / tool_end 記録のみ。サブエージェント自身の
@@ -2516,8 +2511,8 @@ client-side MCP = `spec.mcp_servers` 経由のみ）。同じ理由で、MCP サ
 評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けずモデル文脈へ入る
 （`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモートのサーバであることが多く、
 許可した MCP ツールの戻り値が間接プロンプトインジェクションの主経路になりうる。信頼境界の外に置く場合は
-SDK の出力ガードレール（`MCPServer` のコンストラクタの `tool_output_guardrails` / `output_guardrails`）を
-併用する（「内容ガードレール」節の適用境界を参照）。
+SDK の出力ガードレール（MCP ツールの戻り値には `MCPServer` のコンストラクタの `tool_output_guardrails`、
+最終出力には `Agent` の `output_guardrails`）を併用する（「内容ガードレール」節の適用境界を参照）。
 
 MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）: MCP の deny は `on_tool_start` からの送出で
 合成チェーンを中断するため、利用者の `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は

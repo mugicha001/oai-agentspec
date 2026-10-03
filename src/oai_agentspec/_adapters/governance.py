@@ -1096,9 +1096,9 @@ async def _mcp_governance_guardrail_function(data: Any) -> ToolGuardrailFunction
 
     評価は宣言順に行い、最初の deny で `tool:` deny を記録して拒否例外を送出する（後続は評価
     しない。SDK は `UserError` で包み `__cause__` に原例外を載せる）。allow は `tool:` allow
-    （`details.arguments`）を記録し、その監査フックの評価済みの印として `data.context` に
-    評価に使ったツール名（`context.tool_name`）を記録する（`on_tool_start` は自身が評価に使う
-    名前と一致するときだけ再評価を省く）。対象が無ければ記録せずに allow する。
+    （`details.arguments`）を記録し、その監査フックの評価済みの印（`_evaluated`）に `data.context`
+    をキーとして評価に使ったツール名（`context.tool_name`）を記録する（`on_tool_start` は
+    自身が評価に使う名前と一致するときだけ再評価を省く）。対象が無ければ記録せずに allow する。
     `reject_content` / `raise_exception` は使わない。
 
     Args:
