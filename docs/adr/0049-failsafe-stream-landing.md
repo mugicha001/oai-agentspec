@@ -89,9 +89,10 @@ openai-agents 0.22.3 の `RunResultStreaming.stream_events()` は、run loop で
    終了として扱い着地させない。
 4. **`aclose` の転送**: `finally` で source の `aclose` があれば await する。ラッパを挟んでも、1 要素以上を要求
    した後の明示 `aclose()`（`contextlib.aclosing` 経由を含む）が source へ届き、素の `stream_events()` を直接閉じた
-   場合と同じ決定的な解放を保つ。反復を始める前の `aclose()` と GC では、async generator の本体が実行されない
-   ため転送しない（`aiter(source)` は呼び出し時点で済んでいるため、source の `__aiter__` で確保した資源は利用者側
-   で解放する）。`aclose()` 自身の例外は着地させずに伝播する。lib は `RunResultStreaming.cancel()` を代行
+   場合と同じ決定的な解放を保つ。反復を始める前の `aclose()` と反復前の GC では、async generator の本体が
+   実行されないため転送しない（`aiter(source)` は呼び出し時点で済んでいるため、source の `__aiter__` で確保した
+   資源は利用者側で解放する）。反復開始後の GC では、イベントループの async generator finalizer 経由で転送される
+   （タイミングは決まらない）。`aclose()` 自身の例外は着地させずに伝播する。lib は `RunResultStreaming.cancel()` を代行
    しない。
 5. **`handlers` が空のとき**: 専用分岐を置かず透過する。例外はそのまま伝播し、監査は発火せず、`__cause__` は
    付かない（`failsafe_call` の空分岐と観測上同一）。`aiter()` の fail-fast は `handlers` の有無に関わらず同じ
@@ -143,6 +144,8 @@ openai-agents 0.22.3 の `RunResultStreaming.stream_events()` は、run loop で
 - `aclose` の転送: `::test_failsafe_stream_明示acloseはsourceのfinallyへ転送され着地しない` /
   `::test_failsafe_stream_反復開始後の終了経路ではsourceのacloseへ1回転送する` /
   `::test_failsafe_stream_反復前のacloseはsourceのacloseへ転送しない`
+- `aclose()` 自身の例外は着地せず伝播する: `::test_failsafe_stream_aclose自身の例外は着地せず同一インスタンスで伝播する` /
+  `::test_failsafe_stream_未宣言例外の伝播中のaclose例外は元の例外を__context__に残す`
 - SDK の `stream_events()` との統合（上記「依拠する SDK の前提」の変化も検知する）:
   `tests/_adapters/test_resilience_integration_l2.py::test_B2_failsafe_streamはstream_events中の予算超過を既配信の末尾へ着地させる`
 - `_match_handler` / `_land` を抽出しても `failsafe_call` の挙動が変わらないこと: 既存の

@@ -3456,7 +3456,8 @@ streaming は `failsafe_stream`）で着地値へ丸める機構。
      yield して終了する。0 件転送後でも N 件転送後でも同じ形で、既配信要素は上書きしない。着地後は source を
      読まない
   5. 反復開始後の終了時（正常終了・着地・例外・明示 `aclose()`）に、`finally` で source が `aclose` を持てば
-     await する（反復を始める前の `aclose()` と GC では本体が実行されないため転送されない）。
+     await する（反復を始める前の `aclose()` と反復前の GC では本体が実行されないため転送されない。
+     反復開始後の GC ではイベントループの async generator finalizer 経由で転送される）。
      `aclose()` 自身の例外は着地させずに伝播する
   6. 着地対象は `__anext__` の await 中に起きた `Exception` のみ。`KeyboardInterrupt` / `SystemExit` /
      `asyncio.CancelledError` / `GeneratorExit` は素通しし、利用者の `async for` 本体の例外・`athrow()` で

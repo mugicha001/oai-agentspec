@@ -292,7 +292,7 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 
 ### `failsafe_stream(policy, source)`
 
-`failsafe_stream(policy: FailsafePolicy, source: AsyncIterable[T]) -> AsyncIterator[T | FailsafeResult]`。`source` の要素を同じオブジェクトのまま順に届け、宣言済み例外で着地したときだけ `FailsafeResult` を末尾の 1 要素として届けて終わる。`source` が async iterable でなければ呼び出し時点で `TypeError`。1 要素以上を受け取った後に返したイテレータを明示的に `aclose()`（`contextlib.aclosing` 経由を含む）すると、`source` の `aclose()` も呼ばれる。反復を始める前の `aclose()` と GC では呼ばれない。
+`failsafe_stream(policy: FailsafePolicy, source: AsyncIterable[T]) -> AsyncIterator[T | FailsafeResult]`。`source` の要素を同じオブジェクトのまま順に届け、宣言済み例外で着地したときだけ `FailsafeResult` を末尾の 1 要素として届けて終わる。`source` が async iterable でなければ呼び出し時点で `TypeError`。1 要素以上を受け取った後に返したイテレータを明示的に `aclose()`（`contextlib.aclosing` 経由を含む）すると、`source` の `aclose()` も呼ばれる。反復を始める前の `aclose()` と、反復を始める前に GC で回収された場合は呼ばれない。反復を始めた後に GC で回収された場合は、イベントループの async generator finalizer 経由で呼ばれる（タイミングは決まらないため、解放を決定的にしたい場合は明示的に `aclose()` する）。
 
 ### `FailsafeResult.from_exception(exception, *, final_output, matched_type=None, last_agent=None)`
 

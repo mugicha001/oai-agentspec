@@ -732,8 +732,10 @@ def failsafe_stream[T](
     内容（`TypeError` の宣言有無・空）に関係なく着地しない。
 
     1 要素以上を要求した後の明示 `aclose()`（`contextlib.aclosing` 経由を含む）は
-    `source` の `aclose`（存在する場合）へ転送する。反復を始める前の `aclose()` と GC
-    では転送しない（`source` の `__aiter__` で確保した資源は利用者側で解放する）。
+    `source` の `aclose`（存在する場合）へ転送する。反復を始める前の `aclose()` と、
+    反復を始める前に GC で回収された場合は転送しない（`source` の `__aiter__` で確保した
+    資源は利用者側で解放する）。反復を始めた後に GC で回収された場合は、イベントループの
+    async generator finalizer 経由で転送される（転送のタイミングは決まらない）。
     例外が伝播中に `aclose()` 自身が例外を送出した場合、利用者に届くのはその例外に
     なり、元の例外は `__context__` に残るだけになる。`aclose` は awaitable を返す
     必要があり（async generator のプロトコル）、同期で None を返す callable だと
@@ -765,8 +767,9 @@ async def _relay[T](
 
     `yield` は try / except の外に置き、`GeneratorExit` や `athrow()` の例外を着地の
     判定に入れない。反復を開始した後の終了時（正常終了・着地・例外・`aclose()`）に限り、
-    `iterator` の `aclose` があれば await して転送する（反復前の `aclose()` と GC では
-    転送しない）。例外が伝播中に `aclose()` 自身が例外を送出した場合、利用者に届くのは
+    `iterator` の `aclose` があれば await して転送する（反復前の `aclose()` と反復前の GC
+    では本体が実行されないため転送しない。反復開始後の GC では finalizer 経由で転送
+    される）。例外が伝播中に `aclose()` 自身が例外を送出した場合、利用者に届くのは
     その例外になり、元の例外は `__context__` に残るだけになる。`aclose` は awaitable を
     返す必要があり（async generator のプロトコル）、同期で None を返す callable だと
     `await` が `TypeError` になる。
