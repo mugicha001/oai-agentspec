@@ -2300,7 +2300,9 @@ non_preferred の充足を利用者へ委ねる（lib は品質判定・応答�
   `tool_guardrail(detector, on="input" | "output")` で生成し、`function_tool(tool_input_guardrails=[...],
   tool_output_guardrails=[...])` でツール定義時に宣言する（SDK ネイティブの流儀）。`function_tool` で定義できない
   既存ツール（`as_tool` / ワークフローツール / サードパーティ）へは `guard_tool(tool, input_detector=...,
-  output_detector=...)` で後付け装着する。
+  output_detector=...)` で後付け装着する。run 時に生成される MCP サーバのツールへは、`MCPServer` のコンストラクタの
+  `tool_input_guardrails` / `tool_output_guardrails` へ渡し、SDK がサーバの全ツールへ付ける（出力の
+  `reject_content` は置き換え後の値だけが Session に永続化される）。
 
 ### 設計方針（batteries-included かつ swappable）
 
@@ -2468,6 +2470,36 @@ serve / cli / llmops / lightning / guardrails と同型の責務分割・公開�
 `AgentHooks.on_tool_start` で評価する。宣言は同じ `allowed_tools` / `blocked_patterns` で足り、ポリシー
 宣言の規約は 1 本のまま（判定は `_evaluate_tool` の 1 実装を両経路が共有し、照合の意味論が乖離しない）。
 
+MCP ツールの評価点は、サーバに統治ガードレールを付けたかで分かれる。
+
+- **統治ガードレールを付けたサーバ**: 利用者が `MCPServer` のコンストラクタの `tool_input_guardrails` の先頭に
+  `oai_agentspec.runtime.governance.mcp_governance_guardrail()`（SDK の `ToolInputGuardrail`。name は固定の
+  `"mcp_governance_guardrail"`）を置くと、SDK がサーバの全ツールへ付け、入力ガードレールの位置（内容検査より前・
+  `on_tool_start` より前）で評価する。ガードレールは `data.agent.hooks` を根に lib の監査フック
+  （`_AuditAgentHooks`）を辿り、各監査フックのポリシー・監査 sink・`spec.name` で評価する。ポリシーを持つ
+  `_AuditAgentHooks` は評価対象に加えて中を辿らず、`_ChainedAgentHooks` は要素列を宣言順に辿り、それ以外
+  （`None`・利用者フック・duck-typed のラッパ）はそこで止まる（規則の正本は ADR-0048）。評価対象は宣言順に評価し、
+  deny は `tool:` deny を記録してから `PolicyViolationError` を送出する（SDK が `UserError` の `__cause__` に
+  載せるため着地は他経路と同じ）。allow は `tool:` allow を記録し、評価した監査フックの印
+  （`weakref.WeakKeyDictionary[ToolContext, str]`）に当該 `ToolContext` と評価したツール名を記録して `allow` を
+  返す。辿れる監査フックが無ければ
+  記録せずに素通しする。共有サーバでも各エージェント自身のポリシーで評価され、builder には結び付かない。
+- **付けないサーバ・評価されなかった呼び出し（安全網）**: 監査フックの `on_tool_start` は、ガードレールと同じ
+  `ToolContext` に印があり、その名前が自身の評価に使うツール名（`tool.name`）と一致する場合だけ評価を省き、
+  それ以外は従来どおり評価する。付け忘れ・ガードレールが監査フックへ辿れなかった場合（委譲するラッパへ hooks を
+  差し替えた場合等）・評価名がずれた場合も統治は外れず、失敗時に倒れる先は二重評価（`tool:` が 2 行）の側である。
+  監査フックの `__deepcopy__` は self を返し、統治済みの Agent を深くコピーしてもコピーは同じ監査フックを共有する。
+
+統治ガードレールを付けたサーバでは、監査列は `tool:` が `tool_start:` より先に来て、deny では `tool_start:` が
+残らない。`tool:` はポリシー判定の記録であり、後ろの内容検査が reject した呼び出しや、
+`RunConfig.tool_execution.pre_approval_tool_input_guardrails` 下で承認が却下された呼び出しは、`tool:` allow が
+残っても実行されない（実行の有無は `tool_start:` / `tool_end:` で判別する）。pre_approval を真にすると統治の
+deny が承認要求より前に出る一方、allow は承認後に再評価され `tool:` allow が 2 行残りうる。
+`RunResult.tool_input_guardrail_results` には統治ガードレールの allow も載る。ガードレールは tool の origin を
+知らないため、`spec.tools` へ付けると build 時ラップとの二重評価になる（`MCPServer` にだけ付ける）。lib は
+並び順を検査しないため、先頭以外に置いた場合に前の内容検査が reject した呼び出しは統治の評価も記録も受けない。
+利用者向けの使い方は `docs/usage/safety/governance.md` が SoT。
+
 既知の境界（govern 対象外）: `sub_agents` の as_tool は registry が build 後に注入するため、既定では per-call の
 allow / deny 評価・決定記録の対象外（監査フックの tool_start / tool_end 記録のみ。サブエージェント自身の
 内部 `FunctionTool` は同 builder 経由で govern 済み）。`register_factory` 経路は builder を通らないため
@@ -2484,11 +2516,14 @@ client-side MCP = `spec.mcp_servers` 経由のみ）。同じ理由で、MCP サ
 評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けずモデル文脈へ入る
 （`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモートのサーバであることが多く、
 許可した MCP ツールの戻り値が間接プロンプトインジェクションの主経路になりうる。信頼境界の外に置く場合は
-SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を併用する。
+SDK の出力ガードレール（`MCPServer` のコンストラクタの `tool_output_guardrails` / `output_guardrails`）を
+併用する（「内容ガードレール」節の適用境界を参照）。
 
 MCP 経路と `spec.tools` 経路の非対称（利用者が観測しうる差）: MCP の deny は `on_tool_start` からの送出で
 合成チェーンを中断するため、利用者の `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny は
-実行本体のラップで弾くため到達する）。MCP の deny は run を `UserError` で終了させ、モデルへエラー文字列を
+実行本体のラップで弾くため到達する）。`RunHooks.on_tool_start` は、統治ガードレールを付けないサーバでは SDK が
+`AgentHooks` と並行実行するため deny 時も開始済みになりうる。統治ガードレールを付けたサーバでは deny が
+`on_tool_start` より前に送出されるため開始されない。MCP の deny は run を `UserError` で終了させ、モデルへエラー文字列を
 返して会話を継続する degradation は行わない（MCP ツール自身の実行時例外が
 `mcp_config["failure_error_function"]` でモデルへ返るのとは挙動が違う）。`tool:` レコードの `agent_id` は
 宣言時の `spec.name`（build 時捕獲）で、`tool_start:` は runtime の `agent.name`（`Agent.clone(name=...)`
@@ -2510,7 +2545,8 @@ build 後に `Agent.hooks` を差し替える（`clone(hooks=...)` を含む・�
 呼び出しが既に実行済み / 実行中ならその副作用は残る（deny は per-call でありターン単位のロールバックでは
 ない）。
 
-判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。`sub_agents` の as_tool と
+判断の詳細は `docs/adr/0025-mcp-tool-governance-via-agent-hooks.md` を参照する。MCP の統治ガードレールと
+`on_tool_start` の安全網の判断は `docs/adr/0048-mcp-governance-as-tool-input-guardrail.md` を参照する。`sub_agents` の as_tool と
 `register_factory` の Agent のオプトイン統治の判断は `docs/adr/0042-registry-post-process-stage-for-governance.md`
 を参照する。
 
@@ -2661,7 +2697,8 @@ registry = AgentRegistry(
 ### 配置と隔離
 
 公開窓口は `oai_agentspec.runtime.governance`（他 runtime extra と同型・コア `__all__` には載せない）。
-`agents` / AGT の import は `_adapters/governance.py` に閉じ、SDK 隔離 grep を空に保つ。`runtime/governance` は
+`mcp_governance_guardrail` は `runtime/governance/guardrail.py` に置き、本体（`_adapters/governance.py`）へは
+関数内の遅延 import で委譲する。`agents` / AGT の import は `_adapters/governance.py` に閉じ、SDK 隔離 grep を空に保つ。`runtime/governance` は
 不透明値のみ扱い、`import oai_agentspec` は governance extra 未導入でも壊れない（AGT の import は関数内遅延で、
 未導入時は install hint 付き `ImportError`）。SDK 隔離・単方向依存（`runtime/governance` からコア / `_adapters`
 への一方向）・extra 未導入耐性の規約は既存節（「SDK 隔離と依存性注入（DI）」「会話 Helper（ローカル開発支援）」）が

@@ -71,6 +71,10 @@ registry = AgentRegistry(
 )
 ```
 
+### `mcp_governance_guardrail()`
+
+MCP サーバのツール入力ガードレールとして統治を評価するオブジェクトを返す（引数なし・戻り値は SDK のツール入力ガードレールで不透明値として扱う）。`MCPServer` のコンストラクタの `tool_input_guardrails` の先頭に渡す。ガードレールの name は固定の `"mcp_governance_guardrail"`。import は `from oai_agentspec.runtime.governance import mcp_governance_guardrail`。使い方は「MCP サーバに統治ガードレールを付ける」を参照。
+
 ## 強制点は 2 つ（宣言は共通）
 
 同じ `allowed_tools` / `blocked_patterns` が両方に効きます（ポリシー宣言の規約は 1 本のまま）。
@@ -78,9 +82,34 @@ registry = AgentRegistry(
 | 対象 | 評価位置 | 理由 |
 |---|---|---|
 | `spec.tools` の `FunctionTool` | build 時に実行本体（`on_invoke_tool`）を差し替え | tool オブジェクトが build 時に存在する |
-| `spec.mcp_servers` 経由の MCP ツール | 装着した監査 `AgentHooks.on_tool_start` | SDK が **run 時**（ターンごと）にサーバへ list_tools して `FunctionTool` を生成するため、build 時にラップ対象が無い |
+| `spec.mcp_servers` 経由の MCP ツール | 統治ガードレール（`mcp_governance_guardrail()`）を付けたサーバでは、ツール入力ガードレールの位置（先頭）。付けないサーバでは、装着した監査 `AgentHooks.on_tool_start` | SDK が **run 時**（ターンごと）にサーバへ list_tools して `FunctionTool` を生成するため、build 時にラップ対象が無い。サーバのコンストラクタに渡したガードレールは、SDK が生成する全ツールへ付く |
 
 MCP を使う場合も利用者の記述は変わりません（builder を注入し、`allowed_tools` に MCP ツールの公開名を書くだけ）。実行例は `examples/governance/05_mcp_tool_governance.py` を参照してください。
+
+### MCP サーバに統治ガードレールを付ける
+
+内容検査のガードレール（`tool_guardrail` 等）を MCP サーバに併用する場合は、統治ガードレールを `tool_input_guardrails` の**先頭**に置きます。入力ガードレールは先頭から順に評価され、最初の reject / 送出で止まるため、統治を先に置くと次が成り立ちます。
+
+- ポリシー違反は内容検査の結果に関わらず監査の `tool:` deny に残る
+- deny された呼び出しでは内容検査の検知器が呼ばれない
+
+```python
+from agents.mcp import MCPServerStdio
+from oai_agentspec import AgentRegistry, AgentSpec
+from oai_agentspec.runtime.governance import GovernedAgentBuilder, mcp_governance_guardrail
+from oai_agentspec.runtime.guardrails import tool_guardrail
+
+governed = GovernedAgentBuilder(policy="policy.yaml", audit_sink=my_sink)
+server = MCPServerStdio(
+    params=...,
+    tool_input_guardrails=[mcp_governance_guardrail(), tool_guardrail(d_in, on="input")],  # 統治を先頭に
+    tool_output_guardrails=[tool_guardrail(d_out, on="output")],
+)
+registry = AgentRegistry(agent_builder=governed)
+registry.register(AgentSpec(name="bot", instructions="...", mcp_servers=[server]))
+```
+
+統治ガードレールは、呼び出したエージェント自身に装着された監査フックのポリシー・監査 sink・`spec.name` で評価します。同じサーバを複数のエージェント（別の builder のエージェントを含む）で共有しても、各エージェントのポリシーで評価され、未統治のエージェントは素通しします。付け忘れたサーバ・評価できなかった呼び出しは、従来どおり `on_tool_start` で評価されます（lib の監査フックがエージェントの hooks に装着されている限り統治は外れません。build 後に hooks を差し替える場合の境界は「落とし穴」の `Agent.hooks` の差し替えの項を参照してください）。内容検査と出力の redact の付け方は [guardrails.md](./guardrails.md) の「MCP サーバ単位で掛ける」を参照してください。
 
 ## 判断軸
 
@@ -98,8 +127,14 @@ MCP を使う場合も利用者の記述は変わりません（builder を注�
 - clone された registry は builder を共有する（監査チェーンが混ざる）。系を分けたい場合は builder を別々に注入
 - **hosted MCP**（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。同様に `list_prompts` / `get_prompt` / resources 経由で取得した文面を `instructions` 等へ流し込む使い方はツール呼び出しでないため統治対象外
 - origin が取得できない（MCP 由来かどうか判定できない）ツールも同様に評価も監査もされない（fail-open・無警告）
-- 評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けない。第三者の MCP サーバを使う場合は戻り値が間接プロンプトインジェクションの経路になるため、信頼境界の外に置く MCP サーバには SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を併用する
-- **MCP の deny は利用者の `spec.hooks.on_tool_start` へ到達しない**（`spec.tools` の deny では到達する）。利用者フックで監査・計測している場合は観測が欠ける
+- 評価対象はツール名と引数のみで、ツールの戻り値は評価も content 照合も受けない。第三者の MCP サーバを使う場合は戻り値が間接プロンプトインジェクションの経路になるため、信頼境界の外に置く MCP サーバには出力ガードレールを併用する（付け方は [guardrails.md](./guardrails.md) の「MCP サーバ単位で掛ける」）
+- **MCP の deny は利用者の `spec.hooks.on_tool_start` へ到達しない**（`spec.tools` の deny では到達する）。利用者フックで監査・計測している場合は観測が欠ける。統治ガードレールを付けたサーバでは deny が `on_tool_start` より前に送出されるため、`RunHooks.on_tool_start` も開始されない（付けないサーバでは、SDK が `RunHooks` と `AgentHooks` の `on_tool_start` を並行実行するため、`RunHooks.on_tool_start` は deny 時も開始済みになりうる）
+- 統治ガードレールは `tool_input_guardrails` の**先頭**に置く。内容検査より後ろに置くと、前の内容検査が reject した呼び出しは統治の評価も記録も受けない（`on_tool_start` にも到達しないため安全網も働かない）。lib は並び順を検査しない
+- 統治ガードレールは `MCPServer` にだけ付ける。`function_tool(tool_input_guardrails=[...])` など `spec.tools` に付けると、build 時ラップとの二重評価になる（`tool:` レコードが 2 行残り、どちらかが deny なら deny）
+- 統治ガードレールを付けたサーバでは監査列の順序が変わる。allow は `tool:`（allow）-> `tool_start:` -> `tool_end:` の順になり、deny では `tool_start:` が残らない（`tool:` deny のみ）。付けないサーバでは `tool_start:` -> `tool:` の順。`tool:` レコードの形（`agent_id` = `spec.name`・`details.arguments`）はどちらも同じ
+- `tool:` レコードはポリシー判定の記録であり、実行の記録ではない。統治 allow の後に内容検査が reject した場合と、pre_approval 下で承認前に allow と判定した後に人が承認を却下した場合は、`tool:` allow が残るが呼び出しは実行されない。実行の有無は `tool_start:` / `tool_end:` で判別する
+- 内容検査の結果は `RunResult.tool_input_guardrail_results` で観測する。統治ガードレールの allow も呼び出しごとに載るため、`guardrail.get_name() == "mcp_governance_guardrail"` の行を除いて読む（統治の deny は送出が先に起きるため載らない）
+- `RunConfig(tool_execution=ToolExecutionConfig(pre_approval_tool_input_guardrails=True))` にすると、承認を要する MCP ツールの呼び出しで、統治ガードレールの deny が承認要求より前に出る。allow の場合は承認後にもう一度評価されるため、同じ呼び出しの `tool:` allow が 2 行残りうる
 - MCP の deny は run を `UserError` で終了させる。MCP ツール自身の実行時例外が `mcp_config["failure_error_function"]` でモデルへ返り会話が継続するのとは挙動が違う
 - deny で run が中断すると、stdio 接続の MCP サーバーの切断時に SDK が `Error cleaning up server: unhandled errors in a TaskGroup` を ERROR でログ出力する（非致命的。切断自体は完了し終了コードも変わらない）。deny が起きない実行では出ないため、ログ監視のしきい値設定で誤検知になりうる
 - `mcp_config={"include_server_in_tool_names": True}` にすると公開名は基本形（`mcp_{サーバ名}__{ツール名}`）から SDK が変形を加える場合がある。`allowed_tools` は実際の公開名を確認して宣言する必要がある（未対応なら全 deny になり安全側で顕在化する。詳細は `docs/architecture.md` を参照）
@@ -116,6 +151,7 @@ MCP を使う場合も利用者の記述は変わりません（builder を注�
 
 - 詳細設計: `docs/architecture.md`（AGT ガバナンス節）
 - 検討経緯: `docs/rationale/agt-governance-integration.md`
+- 設計判断（MCP の統治ガードレール）: `docs/adr/0048-mcp-governance-as-tool-input-guardrail.md`
 - 具体例: `examples/governance/01_policy_enforcement.py` 〜 `04_policy_bundle.py`
 
 ## 次

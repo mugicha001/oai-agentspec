@@ -78,6 +78,25 @@ guardrails.tool_guardrail(my_detector, on="output", name="tool_pii")
 guarded = function_tool(_my_func, tool_output_guardrails=[guardrails.get("tool_pii")])
 ```
 
+### MCP サーバ単位で掛ける
+
+MCP サーバのツールは SDK が run 時にターンごとに生成するため、`function_tool` の引数や `guard_tool` では付けられません。`MCPServer` のコンストラクタの `tool_input_guardrails` / `tool_output_guardrails` に渡すと、SDK がそのサーバの全ツールへ付けます。`tool_guardrail(...)` の戻り値をそのまま渡せます。
+
+```python
+from agents.mcp import MCPServerStdio
+from oai_agentspec.runtime.guardrails import tool_guardrail
+
+server = MCPServerStdio(
+    params=...,
+    tool_input_guardrails=[tool_guardrail(d_in, on="input")],
+    tool_output_guardrails=[tool_guardrail(d_out, on="output")],
+)
+```
+
+- 出力ガードレールが `reject_content`（`on_trip="reject"`・既定）で止めると、モデルへ返る値も Session に永続化される値も置き換え後のメッセージ（`Detection.reason`）だけになり、元の出力は残りません。機密を含む出力の redact として使えます。置き換え後のメッセージは残るため、`reason` に機密の断片を入れないでください。
+- 入力ガードレールが reject した呼び出しはツールが実行されず、拒否メッセージがモデルへ返って run が続きます。
+- `GovernedAgentBuilder` の統治と併用する場合は、統治ガードレールを `tool_input_guardrails` の先頭に置きます（使い方は [governance.md](./governance.md) の「MCP サーバに統治ガードレールを付ける」）。
+
 ### セッション単位で入れ直す（カナリア等）
 
 カナリートークンのようにセッション毎に値を入れ替えるものは、共有の登録簿へ固定値として載せず、**セッション毎に登録簿を作り直して run 単位で渡します**。登録簿は宣言の保持に徹しており、登録済みの guardrail を差し替えるメソッドを持ちません（同名の再登録は `ValueError`）。名前は固定のまま、実体の生成だけをセッション境界へ寄せる形になります。
@@ -240,6 +259,7 @@ if canary_detector(CANARY)(webhook_body).triggered:
 - 既知の注入パターン・PII は **静的パターン系 or 外部検知器**で高速に弾く。LLM 判定は最後の砦
 - プロンプト注入対策は **input**、機密漏洩・出力ポリシー違反は **output** 段で検査
 - tool の副作用を止めたいなら **tool_guardrail**（宣言時）or **guard_tool**（既存 tool を後付けラップ）
+- MCP サーバのツールには `tool_guardrail` を `MCPServer` のコンストラクタで渡す（`guard_tool` は run 時生成の MCP ツールに届かない）
 
 ## 落とし穴
 
