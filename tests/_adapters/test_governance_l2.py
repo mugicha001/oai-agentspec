@@ -55,7 +55,6 @@ from agents import (  # noqa: E402
     Runner,
     SQLiteSession,
     ToolExecutionConfig,
-    ToolInputGuardrailTripwireTriggered,
     ToolOrigin,
     ToolOriginType,
     UserError,
@@ -1506,12 +1505,12 @@ async def test_governance_guardrail_deny_precedes_content_check_and_lands_as_use
 
     サーバの入力ガードレールを `[統治, 内容検査]` の順に付け、deny ポリシーで実行する。次をすべて
     固定する: run は `UserError` で終わり `__cause__` は `PolicyViolationError`
-    （`ToolInputGuardrailTripwireTriggered` ではない = reject / raise_exception を使わず統治の
-    例外がそのまま着地する。ADR-0030 の契約）、`__cause__.details` は `tool_name` / `reason` の
-    2 キー、監査列は `agent_start` と `tool:read` deny の 2 行だけ（`tool_start:` が無い = deny が
-    `on_tool_start` より前に送出された）、内容検査の検知器は 0 回、`call_tool` へ到達しない。
-    ガードレールが評価せずに allow を返す変異では、内容検査が呼ばれ `on_tool_start` の安全網が
-    deny するため、監査列と検知器の回数で RED になる。
+    （`pytest.raises(UserError)` と `__cause__` の型で、reject_content / raise_exception を使う
+    変異を検出する。統治の例外がそのまま着地する ADR-0030 の契約）、`__cause__.details` は
+    `tool_name` / `reason` の 2 キー、監査列は `agent_start` と `tool:read` deny の 2 行だけ
+    （`tool_start:` が無い = deny が `on_tool_start` より前に送出された）、内容検査の検知器は
+    0 回、`call_tool` へ到達しない。ガードレールが評価せずに allow を返す変異では、内容検査が
+    呼ばれ `on_tool_start` の安全網が deny するため、監査列と検知器の回数で RED になる。
     """
     detector = _CountingDetector()
     server = _StubMCPServer(
@@ -1526,12 +1525,10 @@ async def test_governance_guardrail_deny_precedes_content_check_and_lands_as_use
     with pytest.raises(UserError) as excinfo:
         await Runner.run(reg.get("bot"), input="go")
 
-    assert not isinstance(excinfo.value, ToolInputGuardrailTripwireTriggered)
     cause = excinfo.value.__cause__
     assert isinstance(cause, PolicyViolationError), (
         f"統治ガードレールの deny が PolicyViolationError として着地しない: {cause!r}"
     )
-    assert not isinstance(cause, ToolInputGuardrailTripwireTriggered)
     assert set(cause.details) == {"tool_name", "reason"}, cause.details
     assert cause.details["tool_name"] == "read"
     assert _audit_rows(sink) == [("agent_start", "allow"), ("tool:read", "deny")]
