@@ -48,14 +48,24 @@ pytest.importorskip(
 pytest.importorskip("mcp", reason="mcp（openai-agents の依存）未導入")
 
 import agents.tool as sdk_tool  # noqa: E402
-from agents import Agent, FunctionTool, Runner, ToolOrigin, ToolOriginType, UserError  # noqa: E402
+from agents import (  # noqa: E402
+    Agent,
+    FunctionTool,
+    RunConfig,
+    Runner,
+    SQLiteSession,
+    ToolExecutionConfig,
+    ToolOrigin,
+    ToolOriginType,
+    UserError,
+)
 from agents.lifecycle import AgentHooksBase, RunHooksBase  # noqa: E402
 from agents.mcp import MCPServer  # noqa: E402
 from agents.mcp.util import MCPUtil  # noqa: E402
 from agents.run_context import RunContextWrapper  # noqa: E402
 from agents.tool import get_function_tool_origin  # noqa: E402
 from agents.tool_context import ToolContext  # noqa: E402
-from mcp.types import CallToolResult, GetPromptResult, ListPromptsResult  # noqa: E402
+from mcp.types import CallToolResult, GetPromptResult, ListPromptsResult, TextContent  # noqa: E402
 from mcp.types import Tool as MCPTool  # noqa: E402
 from openai_agents_trust import AuditLog, GovernancePolicy  # noqa: E402
 
@@ -73,6 +83,7 @@ from oai_agentspec._adapters.governance import (  # noqa: E402
     _make_audit_hooks,
 )
 from oai_agentspec.runtime.governance import GovernedAgentBuilder  # noqa: E402
+from oai_agentspec.runtime.guardrails import Detection, tool_guardrail  # noqa: E402
 
 from _helpers.fake_model import FakeModel  # noqa: E402
 
@@ -773,19 +784,34 @@ class _StubMCPServer(MCPServer):
         *,
         fail_with: Exception | None = None,
         tools: list[MCPTool] | None = None,
+        tool_input_guardrails: list[Any] | None = None,
+        tool_output_guardrails: list[Any] | None = None,
+        result_text: str | None = None,
+        require_approval: Any = None,
     ) -> None:
-        """サーバー名と `call_tool` の失敗挙動 / 公開ツール一覧を設定する。
+        """サーバー名と `call_tool` の失敗挙動 / 公開ツール一覧 / サーバ単位の設定を受ける。
 
         Args:
             name: `ToolOrigin.mcp_server_name` に載るサーバー名。
             fail_with: `call_tool` が送出する例外（None なら空結果を返す）。
             tools: `list_tools` が返す MCP ツール一覧（None なら空。SDK が run 時に
                 `spec.mcp_servers` から解決する経路を通す e2e で指定する）。
+            tool_input_guardrails: SDK 基底 `MCPServer` へそのまま渡すツール入力ガードレール
+                （SDK がサーバの全ツールへ付ける）。
+            tool_output_guardrails: SDK 基底 `MCPServer` へそのまま渡すツール出力ガードレール。
+            result_text: 指定時、`call_tool` はこの文字列 1 件の `TextContent` を返す
+                （None なら空結果）。
+            require_approval: SDK 基底 `MCPServer` へそのまま渡す承認要否設定。
         """
-        super().__init__()
+        super().__init__(
+            require_approval=require_approval,
+            tool_input_guardrails=tool_input_guardrails,
+            tool_output_guardrails=tool_output_guardrails,
+        )
         self._name = name
         self._fail_with = fail_with
         self._tools: list[MCPTool] = list(tools) if tools else []
+        self._result_text = result_text
         self.calls: list[tuple[str, Any]] = []
 
     @property
@@ -810,10 +836,12 @@ class _StubMCPServer(MCPServer):
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any] | None, meta: dict[str, Any] | None = None
     ) -> CallToolResult:
-        """呼び出しを記録し、`fail_with` があれば送出する。"""
+        """呼び出しを記録し、`fail_with` があれば送出する（`result_text` 指定時はそれを返す）。"""
         self.calls.append((tool_name, arguments))
         if self._fail_with is not None:
             raise self._fail_with
+        if self._result_text is not None:
+            return CallToolResult(content=[TextContent(type="text", text=self._result_text)])
         return CallToolResult(content=[])
 
     async def list_prompts(self) -> ListPromptsResult:
@@ -1380,6 +1408,529 @@ async def test_agent_hooks_replacement_drops_mcp_enforcement_not_spec_tools() ->
     assert [(e.agent_id, e.action, e.decision) for e in tool_sink.get_entries()] == [
         ("bot", "tool:echo", "deny"),
     ]
+
+
+# ----------------------------------------------------------------------
+# E 群: 統治ガードレール（`mcp_governance_guardrail()`・ADR-0048）
+#
+# 統治ガードレールを MCPServer の `tool_input_guardrails` の先頭に付けると、統治は内容検査より
+# 前の入力ガードレールの位置で評価される（deny は `tool:` deny を記録してから
+# `PolicyViolationError` を送出し、allow は `tool:` allow を記録して ToolContext に印を付ける）。
+# `on_tool_start` は印のある呼び出しの評価を省き、印の無い呼び出しを従来どおり評価する安全網と
+# して残る。宣言 `spec.mcp_servers` から実 Runner を通して固定する。
+# ----------------------------------------------------------------------
+
+_GOVERNANCE_GUARDRAIL_NAME = "mcp_governance_guardrail"
+
+
+def _governance_guardrail() -> Any:
+    """公開窓口から統治ガードレールを 1 つ作る（未実装の間は import 失敗で RED になる）。"""
+    from oai_agentspec.runtime.governance import mcp_governance_guardrail
+
+    return mcp_governance_guardrail()
+
+
+class _CountingDetector:
+    """呼ばれた入力を記録する内容検査の検知器（`tool_guardrail` へ渡す）。"""
+
+    def __init__(self, *, triggered: bool = False, reason: str = "content rejected") -> None:
+        """検知結果（固定）と呼び出し記録を初期化する。"""
+        self._triggered = triggered
+        self._reason = reason
+        self.calls: list[str] = []
+
+    def __call__(self, text: str) -> Detection:
+        """入力を記録し、固定の検知結果を返す。"""
+        self.calls.append(text)
+        return Detection(triggered=self._triggered, reason=self._reason)
+
+
+class _UserAgentHooks(AgentHooksBase[Any, Any]):
+    """利用者の `spec.hooks`（何もしない AgentHooksBase 派生。hooks を合成形にするために使う）。"""
+
+
+class _DelegatingAgentHooks(AgentHooksBase[Any, Any]):
+    """元の hooks へ全メソッドを委譲する利用者のラッパ（`_ChainedAgentHooks` ではない）。
+
+    lib の合成型ではないため統治ガードレールは中へ辿れない。委譲は全メソッドで行うため、元の
+    監査フックの `on_tool_start`（安全網）はそのまま呼ばれる。
+    """
+
+    def __init__(self, inner: Any) -> None:
+        """委譲先を保持する。"""
+        self._inner = inner
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        await self._inner.on_start(context, agent)
+
+    async def on_end(self, context: Any, agent: Any, output: Any) -> None:
+        await self._inner.on_end(context, agent, output)
+
+    async def on_handoff(self, context: Any, agent: Any, source: Any) -> None:
+        await self._inner.on_handoff(context, agent, source)
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        await self._inner.on_tool_start(context, agent, tool)
+
+    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+        await self._inner.on_tool_end(context, agent, tool, result)
+
+    async def on_llm_start(
+        self, context: Any, agent: Any, system_prompt: Any, input_items: Any
+    ) -> None:
+        await self._inner.on_llm_start(context, agent, system_prompt, input_items)
+
+    async def on_llm_end(self, context: Any, agent: Any, response: Any) -> None:
+        await self._inner.on_llm_end(context, agent, response)
+
+
+def _audit_rows(sink: AuditLog) -> list[tuple[str, str]]:
+    """監査列を `(action, decision)` へ写す。"""
+    return [(e.action, e.decision) for e in sink.get_entries()]
+
+
+def _allow_rows(tool_name: str) -> list[tuple[str, str]]:
+    """統治ガードレールを付けた allow の監査列（`tool:` が `tool_start:` より先に来る）。"""
+    return [
+        ("agent_start", "allow"),
+        (f"tool:{tool_name}", "allow"),
+        (f"tool_start:{tool_name}", "allow"),
+        (f"tool_end:{tool_name}", "allow"),
+        ("agent_end", "allow"),
+    ]
+
+
+async def test_governance_guardrail_deny_precedes_content_check_and_lands_as_user_error() -> None:
+    """T1: 統治ガードレールを先頭に置くと、deny は内容検査より前に記録・送出される。
+
+    サーバの入力ガードレールを `[統治, 内容検査]` の順に付け、deny ポリシーで実行する。次をすべて
+    固定する: run は `UserError` で終わり `__cause__` は `PolicyViolationError`
+    （`pytest.raises(UserError)` と `__cause__` の型で、reject_content / raise_exception を使う
+    変異を検出する。統治の例外がそのまま着地する ADR-0030 の契約）、`__cause__.details` は
+    `tool_name` / `reason` の 2 キー、監査列は `agent_start` と `tool:read` deny の 2 行だけ
+    （`tool_start:` が無い = deny が `on_tool_start` より前に送出された）、内容検査の検知器は
+    0 回、`call_tool` へ到達しない。ガードレールが評価せずに allow を返す変異では、内容検査が
+    呼ばれ `on_tool_start` の安全網が deny するため、監査列と検知器の回数で RED になる。
+    """
+    detector = _CountingDetector()
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")],
+        tool_input_guardrails=[_governance_guardrail(), tool_guardrail(detector, on="input")],
+    )
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), sink)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("unreached")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(reg.get("bot"), input="go")
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, PolicyViolationError), (
+        f"統治ガードレールの deny が PolicyViolationError として着地しない: {cause!r}"
+    )
+    assert set(cause.details) == {"tool_name", "reason"}, cause.details
+    assert cause.details["tool_name"] == "read"
+    assert _audit_rows(sink) == [("agent_start", "allow"), ("tool:read", "deny")]
+    assert detector.calls == [], "deny された呼び出しで後続の内容検査の検知器が呼ばれた"
+    assert server.calls == []
+
+
+@pytest.mark.parametrize(
+    ("hooks_shape", "server_prefixed"),
+    [
+        ("_AuditAgentHooks", False),
+        ("_ChainedAgentHooks", False),
+        ("_AuditAgentHooks", True),
+    ],
+    ids=["root_audit_hooks", "chained_with_user_hooks", "include_server_in_tool_names"],
+)
+async def test_governance_guardrail_allow_records_once_before_tool_start(
+    hooks_shape: str, server_prefixed: bool
+) -> None:
+    """T2: 統治ガードレールの allow は `tool:` を 1 行だけ `tool_start:` より先に残す。
+
+    hooks の 2 形を parametrize する: (i) `spec.hooks` が None で `agent.hooks` が監査フック
+    そのもの（`chain_agent_hooks` の最適化）、(ii) `spec.hooks` を宣言し `agent.hooks` が
+    `_ChainedAgentHooks(監査フック, 利用者フック)`。(iii) は `include_server_in_tool_names=True`
+    で、ガードレールが受ける `ToolContext.tool_name` と `on_tool_start` の `tool.name` がともに
+    SDK の公開名（`mcp_srv__read`）になり、照合と記録がその名前で揃うことを固定する。
+
+    監査列は `agent_start` -> `tool:` allow -> `tool_start:` -> `tool_end:` -> `agent_end` を
+    `==` で比較する。`tool:` 行は `details.arguments` を持ちちょうど 1 件（ガードレールと
+    `on_tool_start` が同じ ToolContext を受け、印によって安全網が評価を省く）。統治の allow は
+    `RunResult.tool_input_guardrail_results` に name `mcp_governance_guardrail` の allow 行として
+    1 件載る。順序が判別の要: ガードレールが監査フックへ辿れない（(i) で根を辿らない / (ii) で合成の
+    中へ辿らない）と、安全網が `tool_start:` の後に評価して `tool:` が後ろへずれるため RED になる。
+    印による省略を外すと `tool:` が 2 件になり RED になる。
+    """
+    tool_name = "mcp_srv__read" if server_prefixed else "read"
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=[tool_name]), sink)
+    model = FakeModel().queue_tool_call(tool_name, '{"q": "x"}').queue_text("done")
+    reg.register(
+        AgentSpec(
+            name="bot",
+            instructions="i",
+            model=model,
+            mcp_servers=[server],
+            hooks=_UserAgentHooks() if hooks_shape == "_ChainedAgentHooks" else None,
+            mcp_config={"include_server_in_tool_names": True} if server_prefixed else {},
+        )
+    )
+    agent = reg.get("bot")
+    assert type(agent.hooks).__name__ == hooks_shape  # 前提: 検証したい hooks の形になっている
+
+    result = await Runner.run(agent, input="go")
+
+    assert result.final_output == "done"
+    assert server.calls == [("read", {"q": "x"})]
+    assert _audit_rows(sink) == _allow_rows(tool_name), (
+        "統治ガードレールの allow の監査列が設計と違う（tool: が tool_start: より後なら"
+        "ガードレールが監査フックへ辿れず安全網が評価した。tool: が 2 件なら二重評価）。"
+    )
+    tool_entries = _tool_records(sink, f"tool:{tool_name}")
+    assert [(e.agent_id, e.details) for e in tool_entries] == [("bot", {"arguments": '{"q": "x"}'})]
+    governance_results = [
+        r
+        for r in result.tool_input_guardrail_results
+        if r.guardrail.get_name() == _GOVERNANCE_GUARDRAIL_NAME
+    ]
+    assert len(governance_results) == 1
+    assert governance_results[0].output.behavior == {"type": "allow"}
+
+
+async def test_governance_guardrail_missing_keeps_on_tool_start_safety_net() -> None:
+    """T3: 統治ガードレールを付け忘れても、`on_tool_start` の安全網が従来どおり評価する。
+
+    サーバには内容検査（素通しする検知器）だけを付け、統治ガードレールは付けない。統治済みの
+    エージェントで deny ポリシーを実行すると、監査列は従来の `agent_start` -> `tool_start:read` ->
+    `tool:read` deny になり（付けない利用者の挙動は不変）、`call_tool` へ到達しない。「入力
+    ガードレールが 1 つでもあれば評価を省く」変異では deny が素通りして RED になる。
+    """
+    detector = _CountingDetector()
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[tool_guardrail(detector, on="input")]
+    )
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), sink)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("unreached")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(reg.get("bot"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert _audit_rows(sink) == [
+        ("agent_start", "allow"),
+        ("tool_start:read", "allow"),
+        ("tool:read", "deny"),
+    ]
+    assert detector.calls == ['{"q": "x"}']  # 内容検査は統治より前に 1 回走る（付け忘れの形）
+    assert server.calls == []
+
+
+@pytest.mark.parametrize("allowed", [False, True], ids=["deny", "allow"])
+async def test_governance_guardrail_untraceable_hooks_fall_back_to_safety_net(
+    allowed: bool,
+) -> None:
+    """T3b: 統治ガードレールを付けたが hooks を辿れない場合も、安全網が評価する。
+
+    統治ガードレールを先頭に付けたうえで、`agent.hooks` を元の監査フックへ全メソッドを委譲する
+    利用者のラッパ（lib の合成型ではない AgentHooksBase 派生）へ差し替える。ガードレールは中へ
+    辿れないため評価も印付けもせず allow し、`on_tool_start` の安全網が評価する。deny は監査列
+    `agent_start` -> `tool_start:read` -> `tool:read` deny で止まり、allow は `tool:` がちょうど
+    1 件で `tool_start:read` の後に来る（安全網由来）。「`tool.tool_input_guardrails` に統治
+    ガードレールがあれば評価を省く」変異では deny が素通りして RED になる。
+    """
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    sink = AuditLog()
+    reg = _governed_registry(
+        GovernancePolicy(name="p", allowed_tools=["read"] if allowed else ["nothing"]), sink
+    )
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+    agent = reg.get("bot")
+    agent.hooks = _DelegatingAgentHooks(agent.hooks)  # 利用者による委譲ラッパへの差し替え
+
+    if allowed:
+        await Runner.run(agent, input="go")
+        assert _audit_rows(sink) == [
+            ("agent_start", "allow"),
+            ("tool_start:read", "allow"),
+            ("tool:read", "allow"),
+            ("tool_end:read", "allow"),
+            ("agent_end", "allow"),
+        ]
+        assert len(_tool_records(sink, "tool:read")) == 1
+        assert server.calls == [("read", {"q": "x"})]
+    else:
+        with pytest.raises(UserError) as excinfo:
+            await Runner.run(agent, input="go")
+        assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+        assert _audit_rows(sink) == [
+            ("agent_start", "allow"),
+            ("tool_start:read", "allow"),
+            ("tool:read", "deny"),
+        ], "付けたが辿れない統治ガードレールの下で、安全網が評価しなかった（統治の抜け）"
+        assert server.calls == []
+
+
+async def test_governance_guardrail_shared_server_evaluates_per_agent_policy() -> None:
+    """T4: 1 つのサーバを共有するエージェントは、それぞれ自身のポリシーと spec.name で評価される。
+
+    既定ポリシーを deny、override で `a` だけ allow にした builder の registry に `a` / `b` を
+    登録し、同じサーバを統治されない素の Agent `c` にも渡す。`a` は `tool:` allow（agent_id
+    `a`）、`b` は deny（agent_id `b`）、`c` は監査記録 0 件で `call_tool` に到達する。
+    ガードレールが最初に見つけたポリシーや既定ポリシーで評価する変異では `a` が deny になり
+    RED になる。
+    """
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    sink = AuditLog()
+    reg = AgentRegistry(
+        agent_builder=GovernedAgentBuilder(
+            policy=GovernancePolicy(name="default", allowed_tools=["nothing"]),
+            audit_sink=sink,
+            overrides={"a": GovernancePolicy(name="a", allowed_tools=["read"])},
+        )
+    )
+    model_a = FakeModel().queue_tool_call("read", '{"q": "a"}').queue_text("a-done")
+    model_b = FakeModel().queue_tool_call("read", '{"q": "b"}').queue_text("unreached")
+    model_c = FakeModel().queue_tool_call("read", '{"q": "c"}').queue_text("c-done")
+    reg.register(AgentSpec(name="a", instructions="i", model=model_a, mcp_servers=[server]))
+    reg.register(AgentSpec(name="b", instructions="i", model=model_b, mcp_servers=[server]))
+    agent_c = Agent(name="c", instructions="i", model=model_c, mcp_servers=[server])
+
+    await Runner.run(reg.get("a"), input="go")
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(reg.get("b"), input="go")
+    await Runner.run(agent_c, input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert [(e.agent_id, e.action, e.decision) for e in sink.get_entries()] == [
+        ("a", "agent_start", "allow"),
+        ("a", "tool:read", "allow"),
+        ("a", "tool_start:read", "allow"),
+        ("a", "tool_end:read", "allow"),
+        ("a", "agent_end", "allow"),
+        ("b", "agent_start", "allow"),
+        ("b", "tool:read", "deny"),
+    ]
+    assert server.calls == [("read", {"q": "a"}), ("read", {"q": "c"})]
+
+
+async def test_governance_guardrail_follows_clone_hooks() -> None:
+    """T5: `clone()` は hooks を保つので統治され、`clone(hooks=None)` は未統治になる。
+
+    `clone(name="x")` は deny ポリシーで `agent_start`（agent_id は clone の名前 `x`）->
+    `tool:read` deny（agent_id は元の spec.name `bot`）で止まる。ガードレールの位置で評価されて
+    いることは `tool_start:` が無いことで判別する（エージェントの同一性で判定する変異では clone が
+    ガードレールで評価されず、安全網が `tool_start:` の後に評価して RED になる）。
+    `clone(hooks=None)` は辿る先が無いため素通しし、記録 0 件で `call_tool` に到達する（hooks の
+    差し替えで統治が外れる既存の境界と同じ）。
+    """
+    deny_server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    deny_sink = AuditLog()
+    deny_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), deny_sink)
+    deny_model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("unreached")
+    deny_reg.register(
+        AgentSpec(name="bot", instructions="i", model=deny_model, mcp_servers=[deny_server])
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(deny_reg.get("bot").clone(name="x"), input="go")
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert [(e.agent_id, e.action, e.decision) for e in deny_sink.get_entries()] == [
+        ("x", "agent_start", "allow"),
+        ("bot", "tool:read", "deny"),
+    ]
+    assert deny_server.calls == []
+
+    bare_server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    bare_sink = AuditLog()
+    bare_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), bare_sink)
+    bare_model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    bare_reg.register(
+        AgentSpec(name="bot", instructions="i", model=bare_model, mcp_servers=[bare_server])
+    )
+
+    result = await Runner.run(bare_reg.get("bot").clone(hooks=None), input="go")
+
+    assert result.final_output == "done"
+    assert bare_sink.get_entries() == []
+    assert bare_server.calls == [("read", {"q": "x"})]
+
+
+@pytest.mark.parametrize("outer_allows", [False, True], ids=["outer_deny", "both_allow"])
+async def test_governance_guardrail_descends_nested_chained_hooks(outer_allows: bool) -> None:
+    """T6: 入れ子の `GovernedAgentBuilder` では、入れ子の合成 hooks の中まで辿って両方で評価する。
+
+    `spec.hooks` を宣言すると hooks は `_ChainedAgentHooks(内の監査, _ChainedAgentHooks(外の監査,
+    利用者フック))` の入れ子になる（外 = 最上位の builder。前提として形を確認する）。内を allow に
+    して、外を deny にすると deny で止まり、外の sink には `tool:read` deny が `tool_start:` 無しで
+    残る（内の sink は allow）。両方 allow なら `tool:` は sink ごとに 1 件（計 2 件）で、どちらも
+    `tool_start:` より先に来る。辿るのを最上位の合成の直下だけにする変異では、外の監査フックが
+    ガードレールで評価されず安全網が `tool_start:` の後に評価するため、外の sink の列で RED になる。
+    """
+    outer_sink = AuditLog()
+    inner_sink = AuditLog()
+    builder = GovernedAgentBuilder(
+        policy=GovernancePolicy(name="outer", allowed_tools=["read"] if outer_allows else []),
+        audit_sink=outer_sink,
+        inner=GovernedAgentBuilder(
+            policy=GovernancePolicy(name="inner", allowed_tools=["read"]), audit_sink=inner_sink
+        ),
+    )
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")], tool_input_guardrails=[_governance_guardrail()]
+    )
+    reg = AgentRegistry(agent_builder=builder)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    reg.register(
+        AgentSpec(
+            name="bot", instructions="i", model=model, mcp_servers=[server], hooks=_UserAgentHooks()
+        )
+    )
+    agent = reg.get("bot")
+    # 前提: 外の監査フックは 2 段目の合成の中にある。
+    assert type(agent.hooks).__name__ == "_ChainedAgentHooks"
+    assert [type(h).__name__ for h in agent.hooks._hooks] == [
+        "_AuditAgentHooks",
+        "_ChainedAgentHooks",
+    ]
+
+    if outer_allows:
+        await Runner.run(agent, input="go")
+        assert _audit_rows(inner_sink) == _allow_rows("read")
+        assert _audit_rows(outer_sink) == _allow_rows("read")
+        assert server.calls == [("read", {"q": "x"})]
+    else:
+        with pytest.raises(UserError) as excinfo:
+            await Runner.run(agent, input="go")
+        assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+        assert _audit_rows(inner_sink) == [("agent_start", "allow"), ("tool:read", "allow")]
+        assert _audit_rows(outer_sink) == [("agent_start", "allow"), ("tool:read", "deny")]
+        assert server.calls == []
+
+
+async def test_governance_guardrail_pre_approval_denies_before_interruption() -> None:
+    """T7: 承認前の入力ガードレール実行を有効にすると、統治の deny は承認要求より前に止まる。
+
+    サーバを `require_approval="always"` にし、`RunConfig(tool_execution=ToolExecutionConfig(
+    pre_approval_tool_input_guardrails=True))` で実行する。deny は承認要求（interruption）を
+    返さずに `UserError`（`__cause__` は `PolicyViolationError`）で run を終え、監査列は
+    `agent_start` と `tool:read` deny の 2 行、`call_tool` へ到達しない。allow は承認待ちで止まった
+    時点で `tool:` allow が 1 行あり（承認前の評価）、承認して再開すると承認後の評価でもう 1 行
+    増えて計 2 行になる（承認の前後で ToolContext が別オブジェクトになるため重複を受け入れる）。
+    ガードレールが評価せずに allow を返す変異では、deny で interruption が返って RED になる。
+    """
+    run_config = RunConfig(
+        tool_execution=ToolExecutionConfig(pre_approval_tool_input_guardrails=True)
+    )
+
+    deny_server = _StubMCPServer(
+        tools=[_mcp_tool("read")],
+        tool_input_guardrails=[_governance_guardrail()],
+        require_approval="always",
+    )
+    deny_sink = AuditLog()
+    deny_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["nothing"]), deny_sink)
+    deny_model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("unreached")
+    deny_reg.register(
+        AgentSpec(name="bot", instructions="i", model=deny_model, mcp_servers=[deny_server])
+    )
+
+    with pytest.raises(UserError) as excinfo:
+        await Runner.run(deny_reg.get("bot"), input="go", run_config=run_config)
+
+    assert isinstance(excinfo.value.__cause__, PolicyViolationError)
+    assert _audit_rows(deny_sink) == [("agent_start", "allow"), ("tool:read", "deny")]
+    assert deny_server.calls == []
+
+    allow_server = _StubMCPServer(
+        tools=[_mcp_tool("read")],
+        tool_input_guardrails=[_governance_guardrail()],
+        require_approval="always",
+    )
+    allow_sink = AuditLog()
+    allow_reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["read"]), allow_sink)
+    allow_model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    allow_reg.register(
+        AgentSpec(name="bot", instructions="i", model=allow_model, mcp_servers=[allow_server])
+    )
+    agent = allow_reg.get("bot")
+
+    first = await Runner.run(agent, input="go", run_config=run_config)
+
+    assert len(first.interruptions) == 1
+    assert [e.decision for e in _tool_records(allow_sink, "tool:read")] == ["allow"]
+    assert allow_server.calls == []
+
+    state = first.to_state()
+    for item in first.interruptions:
+        state.approve(item)
+    resumed = await Runner.run(agent, state, run_config=run_config)
+
+    assert resumed.final_output == "done"
+    assert allow_server.calls == [("read", {"q": "x"})]
+    assert [e.decision for e in _tool_records(allow_sink, "tool:read")] == ["allow", "allow"]
+
+
+async def test_mcp_output_guardrail_reject_persists_only_replacement_in_session() -> None:
+    """T10: MCPServer の出力ガードレールの reject は、置き換え後の値だけを Session に残す。
+
+    SDK の性質のトリップワイヤ（guardrails.md の「出力の reject を redact として使える」案内の
+    前提）。統治ガードレールを先頭に付け、allow ポリシー・機密を含む `call_tool` の出力・出力に
+    機密があれば reject する出力ガードレールで実行する。SQLiteSession の `function_call_output` は
+    reject の理由文だけで、Session の全 item に元の出力文字列が含まれない。`call_tool` は 1 回
+    走り、監査列は付けた場合の allow の 5 行のまま（出力 reject は監査列を変えない）。スタブが
+    `tool_output_guardrails` を基底へ渡さない変異では元の出力が Session に残り RED になる。
+    """
+    secret = "data SECRET-123"
+    seen_outputs: list[str] = []
+
+    def _detect_secret(text: str) -> Detection:
+        seen_outputs.append(text)
+        return Detection(triggered="SECRET" in text, reason="redacted")
+
+    server = _StubMCPServer(
+        tools=[_mcp_tool("read")],
+        tool_input_guardrails=[_governance_guardrail()],
+        tool_output_guardrails=[tool_guardrail(_detect_secret, on="output")],
+        result_text=secret,
+    )
+    sink = AuditLog()
+    reg = _governed_registry(GovernancePolicy(name="p", allowed_tools=["read"]), sink)
+    model = FakeModel().queue_tool_call("read", '{"q": "x"}').queue_text("done")
+    reg.register(AgentSpec(name="bot", instructions="i", model=model, mcp_servers=[server]))
+    session = SQLiteSession("t10-redact")
+
+    result = await Runner.run(reg.get("bot"), input="go", session=session)
+
+    assert result.final_output == "done"
+    items = await session.get_items()
+    outputs = [
+        item.get("output")
+        for item in items
+        if isinstance(item, dict) and item.get("type") == "function_call_output"
+    ]
+    assert outputs == ["redacted"]
+    assert "SECRET-123" not in repr(items), "出力ガードレールの reject 前の値が Session に残った"
+    assert len(seen_outputs) == 1 and "SECRET-123" in seen_outputs[0]  # 前提: 元の出力を検査した
+    assert server.calls == [("read", {"q": "x"})]
+    assert _audit_rows(sink) == _allow_rows("read")
 
 
 # ----------------------------------------------------------------------

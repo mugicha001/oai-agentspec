@@ -135,8 +135,9 @@ class AgentSpec:
             出力は信頼境界の外側から model context へ入るため、必要なら
             `oai_agentspec.runtime.guardrails` を併用する。ここで宣言したサーバのツールは
             `tools` に載らず SDK が run 時（ターンごと）に解決するため build 時のポリシー検証
-            対象外で、`GovernedAgentBuilder` を注入した場合の評価は実行時のフック
-            （`AgentHooks.on_tool_start`）で行われる。
+            対象外で、`GovernedAgentBuilder` を注入した場合の評価は実行時に行われる（サーバの
+            `tool_input_guardrails` の先頭に `mcp_governance_guardrail()` を付けた場合は入力
+            ガードレールの位置、付けていない場合はフック `AgentHooks.on_tool_start`）。
         mcp_config: `Agent.mcp_config`。MCP 設定（`convert_schemas_to_strict` /
             `include_server_in_tool_names` / `failure_error_function`）。未指定（None）の場合は
             build 時に kwargs へ積まず SDK の既定（空 dict）に委ねる。SDK の `MCPConfig` に無い

@@ -37,8 +37,11 @@ class GovernedAgentBuilder:
 
     強制点は 2 つある。`spec.tools` の `FunctionTool` は build 時に実行本体
     （`on_invoke_tool`）をラップして評価する。`spec.mcp_servers` 経由の MCP ツールは SDK が
-    **run 時**に解決するため build 時のラップ対象が存在せず、装着した `AgentHooks.on_tool_start`
-    で評価する（宣言は同じ `allowed_tools` / `blocked_patterns` で足り、規約は 1 本のまま）。
+    **run 時**に解決するため build 時のラップ対象が存在せず、MCPServer の
+    `tool_input_guardrails` の先頭に `mcp_governance_guardrail()` を付けた場合は入力ガードレールの
+    位置で、付けていない場合は装着した `AgentHooks.on_tool_start` で評価する（付けたが評価され
+    なかった呼び出しも `on_tool_start` が評価する安全網。宣言は同じ `allowed_tools` /
+    `blocked_patterns` で足り、規約は 1 本のまま）。
 
     既知の境界（govern 対象外）:
         - `sub_agents` の as_tool は registry が build 後に注入するため、既定では per-call の
@@ -52,6 +55,8 @@ class GovernedAgentBuilder:
           factory Agent を clone して統治する（`registry.get` は clone を返し identity が変わる）。
         - SDK の HITL 承認（`needs_approval`）はツール実行前の承認フローとして govern ラップより
           先に走るため、ポリシーが拒否する呼び出しでも承認要求は先に発生し得る（承認後に deny）。
+          MCP ツールは、統治ガードレールを付けて `RunConfig.tool_execution` の
+          `pre_approval_tool_input_guardrails` を真にすると承認前に deny できる。
         - hosted MCP（Responses API のサーバ側 MCP・`HostedMCPTool`）はモデルプロバイダ側で実行
           されるため評価も監査も発生しない。統治されるのは client-side MCP（`spec.mcp_servers`）
           のみ。`RealtimeAgentSpec` の `mcp_servers` も別 builder 経路のため対象外。MCP について
@@ -59,7 +64,8 @@ class GovernedAgentBuilder:
           文面は対象外。
         - 評価対象はツール名と引数のみで、**ツールの戻り値は評価されない**（許可した呼び出しの
           結果は素通しでモデル文脈へ入る）。第三者の MCP サーバを使う場合、戻り値が間接プロンプト
-          インジェクションの経路になるため SDK の出力ガードレールを併用する。
+          インジェクションの経路になるため SDK の出力ガードレールを併用する（MCP ツールには
+          MCPServer のコンストラクタの `tool_output_guardrails` で付ける）。
 
     オプトイン（registry 第 3 段の統治）の使い方と境界は `post_processor()` を参照する。
 

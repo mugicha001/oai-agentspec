@@ -33,7 +33,13 @@ from dataclasses import replace as _dataclass_replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
-from agents import AgentHooks, FunctionTool, ToolOriginType
+from agents import (
+    AgentHooks,
+    FunctionTool,
+    ToolGuardrailFunctionOutput,
+    ToolInputGuardrail,
+    ToolOriginType,
+)
 
 # `AgentHooksBase` は `agents` トップレベルに export されていないためサブモジュールから import する
 # （`_make_audit_hooks` の戻り値注釈用。`agents.AgentHooks` は `TAgent = Agent` を主張するが、
@@ -80,6 +86,12 @@ _BENIGN_POLICY_FIELDS = frozenset({"name"})
 
 # policy オブジェクトに必須の評価メソッド（build 時に存在を検証する）。
 _REQUIRED_POLICY_METHODS = ("check_tool", "check_content")
+
+# MCP 由来ツールの引数が str として取れず評価不能なときの拒否理由（fail-closed の固定文言）。
+_ARGUMENTS_UNAVAILABLE_REASON = "tool arguments unavailable for policy evaluation"
+
+# 統治ガードレールの name（`RunResult.tool_input_guardrail_results` で内容検査の行と区別する）。
+_MCP_GOVERNANCE_GUARDRAIL_NAME = "mcp_governance_guardrail"
 
 # govern ラップ済みの実行本体（`_govern_tool` のラッパ関数、または生成時に自身を登録する
 # `_GovernedInvoker`）の登録簿（id -> 弱参照）。判定は登録したオブジェクトとの同一性（`is`）で
@@ -855,6 +867,151 @@ def _is_governed(tool: FunctionTool) -> bool:
     return ref is not None and ref() is fn
 
 
+class _AuditAgentHooks(AgentHooks[Any]):
+    """監査記録と MCP 由来ツール評価（`policy` 指定時）を行う `AgentHooks`。
+
+    既存フックへの委譲は `chain_agent_hooks` が担う。`policy` が None のときは監査記録のみを
+    行う。統治ガードレール（`mcp_governance_guardrail`）が `data.agent.hooks` から本クラスの
+    インスタンスを辿って同じポリシー・sink・`agent_name` で評価できるよう、モジュール水準に置き
+    状態をインスタンス属性に持つ。ガードレールで評価済みの呼び出しは `_evaluated` に
+    評価したツール名が印として記録され、`on_tool_start` は印の名前が自身の評価に使う名前と
+    一致する呼び出しだけ評価を省く（印が無い・名前が一致しない場合は従来どおり評価する安全網。
+    倒れる先は二重評価の側）。
+    """
+
+    def __init__(
+        self,
+        *,
+        sink: Any,
+        policy: Any,
+        denied_exc: Any,
+        agent_name: str | None,
+    ) -> None:
+        """監査 sink とポリシー評価の材料を保持する新規インスタンスを初期化する。
+
+        Args:
+            sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
+            policy: AGT ポリシーオブジェクト。None なら MCP 由来ツールを評価しない。
+            denied_exc: ポリシー違反時に送出する例外クラス（AGT `PolicyViolationError`）。
+            agent_name: `tool:` レコードの `agent_id` に使うエージェント名（`spec.name`）。
+        """
+        super().__init__()
+        self._sink = sink
+        self._policy = policy
+        self._denied_exc = denied_exc
+        self._agent_name = agent_name
+        # 統治ガードレールで評価済みの `ToolContext` -> ガードレールが評価に使ったツール名
+        # （キーは同一性で判定・呼び出し終了後は GC で消える）。
+        self._evaluated: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> _AuditAgentHooks:
+        """自身を返す（深いコピーで sink を複製しない）。
+
+        SDK のエージェント同一性シグネチャ（`agents/_run_state_agent_identity.py`）は hooks を
+        `_normalize_capability_identity_value` で正規化し deepcopy しない。ただし `model` 等の
+        フィールドが dataclass で、そこから Agent へ参照が届く場合は `dataclasses.asdict` が
+        Agent ごと深くコピーし、その過程で本フックも deepcopy される（同ファイルの invoker 側の
+        注記と同じ経路）。利用者が `copy.deepcopy(agent)` した場合も同じく到達する。AuditLog の
+        ロックは複製できず、監査の記録先も複製してはならないため、self を返す。以前の形（関数内
+        クラスで状態をクロージャに持つ）はコピーが別インスタンスになり同じ sink・ポリシーを共有
+        していたが、いまはコピーが同一インスタンスそのものになる（`_evaluated` の印も共有する）。
+        ADR-0045 の invoker の統治済みの印（deepcopy で外れる）とは対象が別で、本メソッドは
+        その挙動に影響しない。
+
+        Args:
+            memo: `copy.deepcopy` のメモ（使わない）。
+
+        Returns:
+            self。
+        """
+        return self
+
+    def _govern_call(self, tool_name: str, args: Any) -> None:
+        """MCP 由来ツールの呼び出し 1 件をポリシーで評価し、判定を `tool:` として記録する。
+
+        `on_tool_start` と統治ガードレールが共有する評価手順。引数が str でなければ名前照合へ
+        縮退せず deny する（fail-closed）。
+
+        Args:
+            tool_name: 評価・記録に使うツールの公開名。
+            args: ツール引数（生 JSON 文字列であるべき値）。
+
+        Raises:
+            denied_exc: ポリシー違反、または引数が取得できず評価不能な場合。
+        """
+        if not isinstance(args, str):
+            # 引数が取れないときは名前照合へ縮退せず deny する（fail-closed）。
+            _deny_tool_call(
+                sink=self._sink,
+                agent_name=self._agent_name,
+                tool_name=tool_name,
+                reason=_ARGUMENTS_UNAVAILABLE_REASON,
+                arguments=None,
+                denied_exc=self._denied_exc,
+            )
+        reason = _evaluate_tool(self._policy, tool_name, args)
+        if reason is not None:
+            _deny_tool_call(
+                sink=self._sink,
+                agent_name=self._agent_name,
+                tool_name=tool_name,
+                reason=reason,
+                arguments=args,
+                denied_exc=self._denied_exc,
+            )
+        self._sink.record(
+            agent_id=self._agent_name,
+            action=f"tool:{tool_name}",
+            decision="allow",
+            details={"arguments": args},
+        )
+
+    async def on_start(self, context: Any, agent: Any) -> None:
+        self._sink.record(agent_id=agent.name, action="agent_start", decision="allow")
+
+    async def on_end(self, context: Any, agent: Any, output: Any) -> None:
+        self._sink.record(agent_id=agent.name, action="agent_end", decision="allow")
+
+    async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
+        name = getattr(tool, "name", "")
+        self._sink.record(agent_id=agent.name, action=f"tool_start:{name}", decision="allow")
+        if self._policy is None or not isinstance(tool, FunctionTool):
+            return
+        origin = get_function_tool_origin(tool)
+        # MCP 由来のみ評価する（positive 判定）。FUNCTION は build 時の govern ラップ、
+        # AGENT_AS_TOOL は対象外のため、ここで評価すると二重評価・意味変更になる
+        # （オプトイン時の AGENT_AS_TOOL は第 3 段 post-process の実行本体ラップで評価済み）。
+        # 比較は `is` でなく `!=` を使う: `ToolOriginType` は `str` 派生 Enum で
+        # `ToolOrigin` は型検証を持たない frozen dataclass のため、生 str の
+        # `ToolOrigin(type="mcp")` が渡り得る（公開型なので第三者ラッパ・シリアライズ経路で
+        # 成立する）。`is` だと同値でも不一致になり、統治が無警告でスキップされる。
+        if origin is None or origin.type != ToolOriginType.MCP:
+            return
+        # 統治ガードレールが本フックで同じ名前を評価済みの呼び出しは再評価しない（`tool:` を
+        # 1 件に保つ）。印はガードレールが評価したときにだけ付き、評価した名前と本フックが評価に
+        # 使う名前が一致するときだけ省く。ガードレールが辿れなかった呼び出し・名前が食い違う
+        # 呼び出しはここで必ず評価される（安全網。倒れる先は二重評価の側）。
+        # `in` を先に使う: 弱参照を作れない context では `get` が TypeError を送出するが、
+        # `in` は False を返し評価へ進む（WeakSet だった頃と同じ挙動）。
+        if context in self._evaluated and self._evaluated[context] == name:
+            return
+        self._govern_call(name, getattr(context, "tool_arguments", None))
+
+    async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
+        self._sink.record(
+            agent_id=agent.name,
+            action=f"tool_end:{getattr(tool, 'name', '')}",
+            decision="allow",
+        )
+
+    async def on_handoff(self, context: Any, agent: Any, source: Any) -> None:
+        self._sink.record(
+            agent_id=getattr(source, "name", ""),
+            action=f"handoff:{getattr(agent, 'name', '')}",
+            decision="allow",
+        )
+
+
 def _make_audit_hooks(
     sink: Any,
     inner: Any,
@@ -875,8 +1032,9 @@ def _make_audit_hooks(
     `policy` を渡した場合、`on_tool_start` は MCP 由来ツール（`ToolOriginType.MCP`）のみを
     `_evaluate_tool` で評価する（build 時にラップ対象が存在しない run 時注入ツールの統治）。
     許可なら "allow" を、違反なら "deny" を記録して `denied_exc` を送出する（送出により合成
-    チェーンの後段＝利用者フックへは到達しない）。`policy` が None のときは評価せず従来どおり
-    監査記録のみを行う。
+    チェーンの後段＝利用者フックへは到達しない）。統治ガードレール（`mcp_governance_guardrail`）
+    が本フックで同じツール名を評価済みの呼び出しは再評価しない。`policy` が None のときは評価
+    せず従来どおり監査記録のみを行う。
 
     Args:
         sink: 監査 sink（`record(agent_id, action, decision, details)` を持つ）。
@@ -905,77 +1063,78 @@ def _make_audit_hooks(
     # 載らない」probe（PEP 562 遅延窓口の契約）が赤になる。
     from .hooks import chain_agent_hooks
 
-    class _AuditAgentHooks(AgentHooks[Any]):
-        """監査記録と MCP 由来ツール評価（`policy` 指定時）を行う `AgentHooks`。
+    audit = _AuditAgentHooks(sink=sink, policy=policy, denied_exc=denied_exc, agent_name=agent_name)
+    return chain_agent_hooks(audit, inner)
 
-        既存フックへの委譲は `chain_agent_hooks` が担う。`policy` が None のときは監査記録
-        のみを行う。
-        """
 
-        async def on_start(self, context: Any, agent: Any) -> None:
-            sink.record(agent_id=agent.name, action="agent_start", decision="allow")
+def _collect_audit_hooks(hooks: Any) -> list[_AuditAgentHooks]:
+    """`hooks` を根に、ポリシーを持つ lib の監査フックを宣言順に集める。
 
-        async def on_end(self, context: Any, agent: Any, output: Any) -> None:
-            sink.record(agent_id=agent.name, action="agent_end", decision="allow")
+    辿る規則は 3 つ（ADR-0048）: (1) ポリシーを持つ `_AuditAgentHooks` は評価対象に加える
+    （中は辿らない）、(2) `_ChainedAgentHooks` は `_hooks` を宣言順に同じ規則で辿る、
+    (3) それ以外（None・利用者フック・duck-typed のラッパ・ポリシーを持たない監査フック）は
+    そこで止まる。辿るのは同じパッケージの lib 型だけで、SDK の型には依存しない。
 
-        async def on_tool_start(self, context: Any, agent: Any, tool: Any) -> None:
-            name = getattr(tool, "name", "")
-            sink.record(agent_id=agent.name, action=f"tool_start:{name}", decision="allow")
-            if policy is None or not isinstance(tool, FunctionTool):
-                return
-            origin = get_function_tool_origin(tool)
-            # MCP 由来のみ評価する（positive 判定）。FUNCTION は build 時の govern ラップ、
-            # AGENT_AS_TOOL は対象外のため、ここで評価すると二重評価・意味変更になる
-            # （オプトイン時の AGENT_AS_TOOL は第 3 段 post-process の実行本体ラップで評価済み）。
-            # 比較は `is` でなく `!=` を使う: `ToolOriginType` は `str` 派生 Enum で
-            # `ToolOrigin` は型検証を持たない frozen dataclass のため、生 str の
-            # `ToolOrigin(type="mcp")` が渡り得る（公開型なので第三者ラッパ・シリアライズ経路で
-            # 成立する）。`is` だと同値でも不一致になり、統治が無警告でスキップされる。
-            if origin is None or origin.type != ToolOriginType.MCP:
-                return
-            args = getattr(context, "tool_arguments", None)
-            if not isinstance(args, str):
-                # 引数が取れないときは名前照合へ縮退せず deny する（fail-closed）。
-                _deny_tool_call(
-                    sink=sink,
-                    agent_name=agent_name,
-                    tool_name=name,
-                    reason="tool arguments unavailable for policy evaluation",
-                    arguments=None,
-                    denied_exc=denied_exc,
-                )
-            reason = _evaluate_tool(policy, name, args)
-            if reason is not None:
-                _deny_tool_call(
-                    sink=sink,
-                    agent_name=agent_name,
-                    tool_name=name,
-                    reason=reason,
-                    arguments=args,
-                    denied_exc=denied_exc,
-                )
-            sink.record(
-                agent_id=agent_name,
-                action=f"tool:{name}",
-                decision="allow",
-                details={"arguments": args},
-            )
+    Args:
+        hooks: 辿る根（通常は `data.agent.hooks`）。
 
-        async def on_tool_end(self, context: Any, agent: Any, tool: Any, result: Any) -> None:
-            sink.record(
-                agent_id=agent.name,
-                action=f"tool_end:{getattr(tool, 'name', '')}",
-                decision="allow",
-            )
+    Returns:
+        評価対象の監査フック（宣言順）。対象が無ければ空リスト。
+    """
+    # `_adapters.hooks` は関数内遅延 import に留める（`_make_audit_hooks` の注記と同じ理由）。
+    from .hooks import _ChainedAgentHooks
 
-        async def on_handoff(self, context: Any, agent: Any, source: Any) -> None:
-            sink.record(
-                agent_id=getattr(source, "name", ""),
-                action=f"handoff:{getattr(agent, 'name', '')}",
-                decision="allow",
-            )
+    if isinstance(hooks, _AuditAgentHooks):
+        return [hooks] if hooks._policy is not None else []
+    if isinstance(hooks, _ChainedAgentHooks):
+        return [target for child in hooks._hooks for target in _collect_audit_hooks(child)]
+    return []
 
-    return chain_agent_hooks(_AuditAgentHooks(), inner)
+
+async def _mcp_governance_guardrail_function(data: Any) -> ToolGuardrailFunctionOutput:
+    """統治ガードレールの本体。`data.agent.hooks` から辿った各監査フックで呼び出しを評価する。
+
+    評価は宣言順に行い、最初の deny で `tool:` deny を記録して拒否例外を送出する（後続は評価
+    しない。SDK は `UserError` で包み `__cause__` に原例外を載せる）。allow は `tool:` allow
+    （`details.arguments`）を記録し、その監査フックの評価済みの印（`_evaluated`）に `data.context`
+    をキーとして評価に使ったツール名（`context.tool_name`）を記録する（`on_tool_start` は
+    自身が評価に使う名前と一致するときだけ再評価を省く）。対象が無ければ記録せずに allow する。
+    `reject_content` / `raise_exception` は使わない。
+
+    Args:
+        data: SDK の `ToolInputGuardrailData`（`context.tool_name` / `context.tool_arguments` /
+            `agent.hooks` を参照する）。
+
+    Returns:
+        常に `ToolGuardrailFunctionOutput.allow()`（deny は送出で表す）。
+
+    Raises:
+        PolicyViolationError: いずれかの監査フックのポリシーが deny した場合、または引数が
+            str として取得できず評価不能な場合（fail-closed）。
+    """
+    context = data.context
+    tool_name = context.tool_name
+    args = getattr(context, "tool_arguments", None)
+    for target in _collect_audit_hooks(getattr(data.agent, "hooks", None)):
+        target._govern_call(tool_name, args)
+        target._evaluated[context] = tool_name
+    return ToolGuardrailFunctionOutput.allow()
+
+
+def mcp_governance_guardrail() -> ToolInputGuardrail[Any]:
+    """MCPServer の `tool_input_guardrails` の先頭に置く統治ガードレールを生成して返す。
+
+    評価は呼び出したエージェント自身に装着された lib の監査フック（ポリシー・sink・
+    `spec.name`）で行うため、builder に結び付かず、共有サーバでも per-agent で評価される。
+    詳細は `govern_spec` の docstring（MCP 節）を参照する。
+
+    Returns:
+        name が `"mcp_governance_guardrail"` の SDK `ToolInputGuardrail`。
+    """
+    return ToolInputGuardrail(
+        guardrail_function=_mcp_governance_guardrail_function,
+        name=_MCP_GOVERNANCE_GUARDRAIL_NAME,
+    )
 
 
 def govern_spec(
@@ -1013,13 +1172,27 @@ def govern_spec(
     承認対象のツールを設計で分ける）。
 
     MCP 由来ツール（`ToolOriginType.MCP`）は run 時に SDK が解決するため build 時のラップ対象が
-    存在せず、監査フックの `AgentHooks.on_tool_start` で評価する。この経路の境界: (1) tool 入力
-    ガードレールが `reject_content` した呼び出しは `on_tool_start` へ到達しないため評価も監査も
-    発生しない、(2) HITL 承認（`needs_approval`）は `on_tool_start` より前に走るため MCP 経路でも
-    「承認後に deny」になり得る、(3) deny は raise で合成チェーンを中断するため利用者の
-    `spec.hooks.on_tool_start` へ**到達しない**（`spec.tools` の deny では実行本体のラップで弾く
-    ため到達する非対称。`RunHooks.on_tool_start` は SDK が並行実行するため deny 時も開始済みに
-    なり得る（開始後は最初の await で取り消されうる））、(4) `AGENT_AS_TOOL` origin（`sub_agents`
+    存在せず、監査フックの `AgentHooks.on_tool_start` で評価する。MCPServer の
+    `tool_input_guardrails` の先頭に統治ガードレール（`mcp_governance_guardrail()`）を付けた
+    場合は、入力ガードレールの位置で評価し（`tool:` 行が `tool_start:` より先に記録される）、
+    評価済みの呼び出しは `on_tool_start` で再評価しない。付けていない・付けたが監査フックへ辿れ
+    ない呼び出しは従来どおり `on_tool_start` で評価する（安全網。ADR-0048）。この経路の境界:
+    (1) 統治ガードレールを付けない場合、tool 入力ガードレール（内容検査）が `reject_content` した
+    呼び出しは `on_tool_start` へ到達しないため評価も監査も発生しない。統治ガードレールを先頭に
+    置けば統治が内容検査より前に評価・記録し、deny した呼び出しでは内容検査の検知器を呼ばない。
+    統治 allow の後に内容検査が reject した呼び出しは `tool:` allow だけが残り `tool_start:` /
+    `tool_end:` は残らない（`tool:` は判定の記録であり実行の記録ではない）、(2) HITL 承認
+    （`needs_approval`）は `on_tool_start` と入力ガードレールより前に走るため MCP 経路でも
+    「承認後に deny」になり得る。統治ガードレールを付け、`RunConfig.tool_execution` の
+    `pre_approval_tool_input_guardrails` を真にすると承認要求の前に deny できる（着地は同じ
+    `UserError`・`__cause__` が `PolicyViolationError`）。この場合 allow は承認の前後で 2 回評価
+    され `tool:` allow が 2 行残り、承認が却下されると実行されない呼び出しの allow 行だけが残る、
+    (3) deny は raise で合成チェーンを中断するため利用者の `spec.hooks.on_tool_start` へ
+    **到達しない**（`spec.tools` の deny では実行本体のラップで弾くため到達する非対称）。統治
+    ガードレールを付けた経路では deny が `on_tool_start` より前に送出されるため、
+    `RunHooks.on_tool_start` も開始されない。付けない経路では `RunHooks.on_tool_start` は SDK が
+    並行実行するため deny 時も開始済みになり得る（開始後は最初の await で取り消されうる）、
+    (4) `AGENT_AS_TOOL` origin（`sub_agents`
     の as_tool）は対象外
     （機構上は同じフックで評価しうるが、既存 `allowed_tools` 宣言の意味を変えるため評価しない。
     オプトイン時の as_tool はフックでなく実行本体のラップで評価する）、
@@ -1060,7 +1233,11 @@ def govern_spec(
     記録（`agent_start` / `tool_start:` / `tool_end:` / `handoff:` / `agent_end`）で、これは本
     フックの導入時から存在する性質だが、強制と per-call レコードまで失われるのは MCP 経路のみ。
     差し替えでなく合成したい場合は `spec.hooks` へ自前フックを宣言して builder に合成させる
-    （本モジュールが `chain_agent_hooks` で合成するため利用者フックは失われない）、
+    （本モジュールが `chain_agent_hooks` で合成するため利用者フックは失われない）。統治
+    ガードレールは lib の合成型（`_ChainedAgentHooks`）と監査フックしか辿らないため、差し替え先が
+    元の監査フックへ委譲する利用者のラッパであっても辿れず評価しない。その場合は委譲された
+    `on_tool_start` が安全網として評価する（強制は残り、`tool:` は `tool_start:` の後に
+    記録される）、
     (13) `get_function_tool_origin` が `None` を返すツールは MCP 由来であっても評価されない
     （fail-open・例外も警告も出ない）。SDK が非公開の `FunctionTool._emit_tool_origin` を False に
     したラッパ（現行 SDK では `build_litellm_json_tool_call` の合成ツール）や、第三者ラッパが同
@@ -1071,8 +1248,10 @@ def govern_spec(
     モデル文脈へ入る（`on_tool_end` は `tool_end:` を記録するだけ）。MCP は第三者プロセス / リモート
     のサーバであり、`allowed_tools` で許可したツールの戻り値が間接プロンプトインジェクションの主
     経路になる。`spec.tools` でも同じだが、サーバが自前でない MCP では影響が大きい。サーバを信頼
-    境界の外に置く場合は SDK の出力ガードレール（`tool_output_guardrails` / `output_guardrails`）を
-    併用する。
+    境界の外に置く場合は SDK の出力ガードレールを併用する。MCP ツールの戻り値へ掛けるには
+    MCPServer のコンストラクタへ `tool_output_guardrails=[...]` を渡す（SDK がサーバの全ツールへ
+    付ける。`guard_tool` は run 時に解決される MCP ツールへ届かない）。出力の `reject_content` は
+    置き換え後の値だけを Session に残すため redact として使える（置き換え文言に機密を入れない）。
 
     Args:
         spec: govern 対象の `AgentSpec`（plain・コア型）。

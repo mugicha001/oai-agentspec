@@ -1,6 +1,6 @@
 # 0025: MCP 由来ツールの統治を AgentHooks.on_tool_start で行う
 
-- Status: accepted
+- Status: accepted (partially superseded by 0048: Decision の評価点（統治ガードレールを付けた MCP サーバのツール）と、Context の tool 入力ガードレールの行の前半)
 - Date: 2026-08-07
 
 ## Context

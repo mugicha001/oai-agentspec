@@ -4,6 +4,8 @@
 へ記録する装飾 builder（`GovernedAgentBuilder`）を再エクスポートする。`AgentRegistry(agent_builder=
 ...)` へ注入すると、registry の遅延構築経路を通る全 spec の tools が govern ラップされ、監査
 `AgentHooks` が装着される。`AgentSpec` / `tools` / `AgentBuilder` Protocol の宣言面は不変。
+MCPServer の `tool_input_guardrails` の先頭に置く統治ガードレール（`mcp_governance_guardrail`）も
+再エクスポートする（ADR-0048）。
 
 SDK 型（`agents`）と AGT（`agent-governance-toolkit`）の import は `_adapters/governance.py` に閉
 じ、本窓口は不透明値（policy / audit_sink）のみ扱う（SDK / 外部クライアント隔離・NFR-1）。コア
@@ -28,10 +30,12 @@ from __future__ import annotations
 from typing import Any
 
 from .builder import GovernedAgentBuilder
+from .guardrail import mcp_governance_guardrail
 
 __all__ = [
     "GovernedAgentBuilder",
     "PolicyViolationError",
+    "mcp_governance_guardrail",
 ]
 
 
