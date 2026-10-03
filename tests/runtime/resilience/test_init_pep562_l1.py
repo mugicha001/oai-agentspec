@@ -3,9 +3,9 @@
 intent 窓口（`tests/runtime/intent/test_init_pep562_l1.py`）を直接の踏襲元とする。
 resilience 固有の差分として、宣言型（`ModelRetryPolicy` / `RunBudgetPolicy` /
 `FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`）・sentinel `RUNNING_AGENT` と
-関数 `failsafe_call` は外部依存ゼロのため module import 時点で直 import 済みであり、
-`build_*` ヘルパと SDK 生型 10 種のみ `__getattr__` で `_adapters.resilience` 経由の
-遅延取得になる。
+関数 `failsafe_call` / `failsafe_stream` は外部依存ゼロのため module import 時点で
+直 import 済みであり、`build_*` ヘルパと SDK 生型 10 種のみ `__getattr__` で
+`_adapters.resilience` 経由の遅延取得になる。
 lib 独自例外 `RunBudgetExceeded` の正規経路は `oai_agentspec.exceptions`
 （本窓口からは撤去済み）。
 
@@ -45,7 +45,7 @@ def _run_in_clean_subprocess(probe: str) -> str:
     return result.stdout.strip()
 
 
-# lib 独自 9 種。うち直 import は宣言型 5 + 関数 1 + sentinel 1、遅延は build_* 2。
+# lib 独自 10 種。うち直 import は宣言型 5 + 関数 2 + sentinel 1、遅延は build_* 2。
 _DIRECT_SYMBOLS = {
     "ModelRetryPolicy",
     "RunBudgetPolicy",
@@ -53,6 +53,7 @@ _DIRECT_SYMBOLS = {
     "FailsafePolicy",
     "FailsafeResult",
     "failsafe_call",
+    "failsafe_stream",
     "RUNNING_AGENT",
 }
 _LAZY_BUILD_SYMBOLS = {
@@ -77,11 +78,11 @@ _EXPECTED_ALL = _DIRECT_SYMBOLS | _LAZY_SYMBOLS
 
 
 def test_all_membership_pinned() -> None:
-    """`__all__` は 19 件で設計仕様通りのメンバ集合と一致する。"""
+    """`__all__` は 20 件で設計仕様通りのメンバ集合と一致する。"""
     from oai_agentspec.runtime import resilience as mod
 
     assert set(mod.__all__) == _EXPECTED_ALL
-    assert len(mod.__all__) == 19
+    assert len(mod.__all__) == 20
 
 
 def test_declaration_symbols_are_directly_imported() -> None:
@@ -129,7 +130,7 @@ def test_lazy_sdk_raw_types_resolve_and_cache() -> None:
 
 
 def test_all_symbols_are_resolvable_via_getattr() -> None:
-    """`__all__` の全 19 シンボルが `getattr` で解決可能（漏れがない）。"""
+    """`__all__` の全 20 シンボルが `getattr` で解決可能（漏れがない）。"""
     from oai_agentspec.runtime import resilience as mod
 
     for name in mod.__all__:
@@ -147,7 +148,7 @@ def test_getattr_unknown_attribute_raises() -> None:
 
 
 def test_dir_includes_all_symbols_even_before_access() -> None:
-    """`dir()` は未 import 状態でも `__all__` の全 19 シンボルを含む。"""
+    """`dir()` は未 import 状態でも `__all__` の全 20 シンボルを含む。"""
     from oai_agentspec.runtime import resilience as mod
 
     listing = set(mod.__dir__())

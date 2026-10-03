@@ -59,6 +59,7 @@ import pickle
 import re
 import warnings
 from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -485,6 +486,22 @@ async def test_failsafe_call_handlers空は例外をそのまま伝播する() -
     assert excinfo.value is exc
 
 
+async def test_failsafe_call_宣言検証を迂回したCancelledErrorキーでも着地せず伝播する() -> None:
+    """宣言側の検証を迂回した場合でも捕捉側が BaseException 系を素通しする。
+
+    捕捉側（`except Exception` 限定）が BaseException 系を素通しする（ADR の二重防御の
+    2 段目）。
+    """
+    policy = FailsafePolicy(handlers={MyError: "landed"})
+    object.__setattr__(policy, "handlers", MappingProxyType({asyncio.CancelledError: "landed"}))
+    cancelled = asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError) as excinfo:
+        await failsafe_call(policy, _thunk_raising(cancelled))
+
+    assert excinfo.value is cancelled
+
+
 async def test_failsafe_call_coroutine直渡しはTypeErrorでfail_fastする() -> None:
     """thunk ではなく coroutine を直接渡す受理契約違反は TypeError で fail-fast する。"""
     policy = FailsafePolicy(handlers={MyError: "landed"})
@@ -611,13 +628,15 @@ async def test_failsafe_call_既定でwarningログが出る(caplog: pytest.LogC
     """log_on_apply 既定 True では resilience logger に WARNING がトレースバック付きで出る。"""
     policy = FailsafePolicy(handlers={MyError: "landed"})
 
+    exc = MyError("boom")
+
     with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
-        result = await failsafe_call(policy, _thunk_raising(MyError("boom")))
+        result = await failsafe_call(policy, _thunk_raising(exc))
 
     assert isinstance(result, FailsafeResult)
     records = _records_of(caplog, logging.WARNING)
     assert len(records) == 1
-    assert records[0].exc_info is not None
+    assert records[0].exc_info[1] is exc
     msg = records[0].getMessage()
     assert MyError.__name__ in msg
     assert "boom" in msg
@@ -690,8 +709,10 @@ async def test_failsafe_call_on_apply例外はerrorログで握り潰され着�
 ) -> None:
     """on_apply が失敗しても FailsafeResult の返却は継続し、error ログに記録される。"""
 
+    callback_exc = RuntimeError("callback failed")
+
     def _on_apply(result: FailsafeResult) -> None:
-        raise RuntimeError("callback failed")
+        raise callback_exc
 
     policy = FailsafePolicy(handlers={MyError: "landed"}, on_apply=_on_apply)
 
@@ -702,7 +723,7 @@ async def test_failsafe_call_on_apply例外はerrorログで握り潰され着�
     assert result.final_output == "landed"
     errors = _records_of(caplog, logging.ERROR)
     assert len(errors) == 1
-    assert errors[0].exc_info is not None
+    assert errors[0].exc_info[1] is callback_exc
 
 
 async def test_failsafe_call_on_apply未指定なら呼ばれない(
@@ -2830,8 +2851,10 @@ async def test_failsafe_call_log_on_apply_Falseでもon_apply例外はerrorロ�
 ) -> None:
     """warning の抑止は監査経路の失敗記録（error ログ）までは抑止しない。"""
 
+    callback_exc = RuntimeError("callback failed")
+
     def _on_apply(result: FailsafeResult) -> None:
-        raise RuntimeError("callback failed")
+        raise callback_exc
 
     policy = FailsafePolicy(handlers={MyError: "landed"}, log_on_apply=False, on_apply=_on_apply)
 
@@ -2842,7 +2865,7 @@ async def test_failsafe_call_log_on_apply_Falseでもon_apply例外はerrorロ�
     assert _records_of(caplog, logging.WARNING) == []
     errors = _records_of(caplog, logging.ERROR)
     assert len(errors) == 1
-    assert errors[0].exc_info is not None
+    assert errors[0].exc_info[1] is callback_exc
 
 
 # ---------------------------------------------------------------------------
@@ -2855,9 +2878,11 @@ async def test_failsafe_call_async_on_applyの例外はerrorログで握り潰�
 ) -> None:
     """await 中に送出する `on_apply` でも例外は漏れず、着地結果の返却は継続する。"""
 
+    callback_exc = RuntimeError("async callback failed")
+
     async def _on_apply(result: FailsafeResult) -> None:
         await asyncio.sleep(0)
-        raise RuntimeError("async callback failed")
+        raise callback_exc
 
     policy = FailsafePolicy(handlers={MyError: "landed"}, on_apply=_on_apply)
 
@@ -2868,7 +2893,7 @@ async def test_failsafe_call_async_on_applyの例外はerrorログで握り潰�
     assert result.final_output == "landed"
     errors = _records_of(caplog, logging.ERROR)
     assert len(errors) == 1
-    assert errors[0].exc_info is not None
+    assert errors[0].exc_info[1] is callback_exc
     assert f"matched_type={MyError.__name__}" in errors[0].getMessage()
 
 
