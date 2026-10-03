@@ -6,6 +6,8 @@ Runner 外へ伝播した例外を、呼び出し側に分散した try/except �
 広すぎる宣言やプロセス制御例外の握り潰しを fail-fast したうえで、handlers を
 不変化して構築後の書き換えを防ぐ。適用結果は `FailsafeResult` として
 返り、SDK `RunResult` とは共通基底を持たず `.final_output` のみ structural に一致する。
+ストリーミング実行（`stream_events()` 等の `AsyncIterable`）を包む場合は `failsafe_stream` が
+同じ宣言・同じ着地規則で中継中の例外を捕捉し、着地を末尾 1 要素として yield する。
 
 着地時には「もともと実行中だったエージェント」を `FailsafeResult.last_agent` として
 参照できる。決定は 2 段で、(1) 例外ごとの指定（`FailsafeHandler.last_agent`）、
@@ -22,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, ClassVar, Final
@@ -121,7 +123,7 @@ RUNNING_AGENT: Final = _RunningAgentSentinel()
 （全体規定）のどちらにも置ける。この値を置いた段でのみ例外からの解決
 （`exc.run_data.last_agent` -> `exc.last_agent`）を試みる opt-in の合図であり、
 指定しなければ解決は一切走らない（`last_agent` は None のまま）。解決できなかった
-場合は次の段へ落ちる（最後まで解決できなければ None）。`failsafe_call` /
+場合は次の段へ落ちる（最後まで解決できなければ None）。`failsafe_call` / `failsafe_stream` /
 `FailsafeResult.from_exception` が生成する結果には sentinel そのものが載ることはない
 （`FailsafeResult` を直接構築する場合は `_resolve_last_agent` を経由しないため、
 渡した値がそのまま載る）。
@@ -420,14 +422,14 @@ class FailsafeResult:
     Attributes:
         final_output: 着地値（handlers の値、または fallback callable の戻り値）。
         exception: 捕捉した例外インスタンス。
-        matched_type: 結果に載せる例外型。`failsafe_call` の着地では first-match した
-            handlers のキー、`from_exception` では明示指定した値（未指定なら送出型
-            `type(exception)`）。
+        matched_type: 結果に載せる例外型。`failsafe_call` / `failsafe_stream` の着地では
+            first-match した handlers のキー、`from_exception` では明示指定した値
+            （未指定なら送出型 `type(exception)`）。
         last_agent: 決定モデル（例外ごとの指定 -> 全体規定）で確定した、実行中だった
             エージェント（不透明値）。どの段でも決まらない場合は None。`failsafe_call` /
-            `from_exception` が生成する結果には指定用の sentinel `RUNNING_AGENT` が
-            そのまま載ることはない（本型を直接構築する場合は `_resolve_last_agent` を
-            経由しないため、
+            `failsafe_stream` / `from_exception` が生成する結果には指定用の sentinel
+            `RUNNING_AGENT` がそのまま載ることはない（本型を直接構築する場合は
+            `_resolve_last_agent` を経由しないため、
             渡した値がそのまま載る）。値は機微（システム
             プロンプト・資格情報）を含みうるため `repr` には出さない（属性としては
             従来どおり参照でき、`==` にも従来どおり含まれる）。
@@ -538,6 +540,88 @@ class FailsafeResult:
         )
 
 
+def _match_handler(policy: FailsafePolicy, exc: Exception) -> type[Exception] | None:
+    """`policy.handlers` を走査し、`exc` にマッチする最初のキーを返す。
+
+    挿入順 first-match で判定する（より specific な型を先に宣言する責務は
+    利用者側にある）。
+
+    Args:
+        policy: 着地の宣言（handlers を含む）。
+        exc: 捕捉した例外。
+
+    Returns:
+        最初に `isinstance` マッチしたキー（例外型）。挿入順 first-match・
+        一致なしは None。
+    """
+    for key in policy.handlers:
+        if isinstance(exc, key):
+            return key
+    return None
+
+
+async def _land(policy: FailsafePolicy, exc: Exception, key: type[Exception]) -> FailsafeResult:
+    """`key` にマッチした宣言に従って `exc` を `FailsafeResult` へ着地させる。
+
+    呼び出し元の except 節の中から呼ぶこと（`log_on_apply` の warning が `exc_info=True`
+    で処理中の例外の traceback を記録するため）。
+
+    Args:
+        policy: 着地の宣言（handlers / log_on_apply / on_apply / fallback_last_agent）。
+        exc: 捕捉した例外。
+        key: `_match_handler` がマッチと判定したキー（例外型）。
+
+    Returns:
+        着地結果の `FailsafeResult`。
+
+    Raises:
+        Exception: fallback callable 自身が送出した例外は送出したまま伝播する
+            （監査は発火しない）。
+    """
+    declared = policy.handlers[key]
+    # `FailsafeHandler` 判定を callable 判定より先に行う（実装契約）。dataclass は
+    # callable() が False のため現状は順序に依存しないが、契約として固定する。
+    if isinstance(declared, FailsafeHandler):
+        fallback = declared.fallback
+        per_exception_last_agent = declared.last_agent
+    else:
+        fallback = declared
+        per_exception_last_agent = None
+
+    if callable(fallback):
+        value = fallback(exc)
+        if inspect.isawaitable(value):
+            value = await value
+    else:
+        value = fallback
+
+    last_agent = _resolve_last_agent(exc, per_exception_last_agent, policy.fallback_last_agent)
+
+    failsafe_result = FailsafeResult(
+        final_output=value, exception=exc, matched_type=key, last_agent=last_agent
+    )
+    if policy.log_on_apply:
+        logger.warning(
+            "failsafe applied: matched_type=%s exception_type=%s exception=%s",
+            key.__name__,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+    if policy.on_apply is not None:
+        try:
+            outcome = policy.on_apply(failsafe_result)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception:
+            logger.error(
+                "failsafe on_apply callback failed: matched_type=%s",
+                key.__name__,
+                exc_info=True,
+            )
+    return failsafe_result
+
+
 async def failsafe_call[T](
     policy: FailsafePolicy, thunk: Callable[[], Awaitable[T]]
 ) -> T | FailsafeResult:
@@ -576,8 +660,9 @@ async def failsafe_call[T](
     握り潰し、`FailsafeResult` の返却は継続する（監査経路の失敗は呼び出し側へ
     伝播しない）。
 
-    streaming（`run_streamed`）・sync（`run_sync`）専用のヘルパーは提供しない
-    （sync 文脈は `asyncio.run(failsafe_call(...))` で代替する）。Realtime は非対応。
+    streaming（`run_streamed`）は `failsafe_stream` で `stream_events()` を包む。
+    sync（`run_sync`）専用のヘルパーは提供しない（sync 文脈は
+    `asyncio.run(failsafe_call(...))` で代替する）。Realtime は非対応。
 
     Args:
         policy: 着地の宣言（handlers / log_on_apply / on_apply / fallback_last_agent）。
@@ -603,53 +688,119 @@ async def failsafe_call[T](
     try:
         result = await awaitable
     except Exception as exc:
-        for key in policy.handlers:
-            if isinstance(exc, key):
-                break
-        else:
+        key = _match_handler(policy, exc)
+        if key is None:
             raise
-
-        declared = policy.handlers[key]
-        # `FailsafeHandler` 判定を callable 判定より先に行う（実装契約）。dataclass は
-        # callable() が False のため現状は順序に依存しないが、契約として固定する。
-        if isinstance(declared, FailsafeHandler):
-            fallback = declared.fallback
-            per_exception_last_agent = declared.last_agent
-        else:
-            fallback = declared
-            per_exception_last_agent = None
-
-        if callable(fallback):
-            value = fallback(exc)
-            if inspect.isawaitable(value):
-                value = await value
-        else:
-            value = fallback
-
-        last_agent = _resolve_last_agent(exc, per_exception_last_agent, policy.fallback_last_agent)
-
-        failsafe_result = FailsafeResult(
-            final_output=value, exception=exc, matched_type=key, last_agent=last_agent
-        )
-        if policy.log_on_apply:
-            logger.warning(
-                "failsafe applied: matched_type=%s exception_type=%s exception=%s",
-                key.__name__,
-                type(exc).__name__,
-                exc,
-                exc_info=True,
-            )
-        if policy.on_apply is not None:
-            try:
-                outcome = policy.on_apply(failsafe_result)
-                if inspect.isawaitable(outcome):
-                    await outcome
-            except Exception:
-                logger.error(
-                    "failsafe on_apply callback failed: matched_type=%s",
-                    key.__name__,
-                    exc_info=True,
-                )
-        return failsafe_result
+        return await _land(policy, exc, key)
     else:
         return result
+
+
+def failsafe_stream[T](
+    policy: FailsafePolicy, source: AsyncIterable[T]
+) -> AsyncIterator[T | FailsafeResult]:
+    """`source` の要素を中継し、`policy` の宣言に従って途中の例外を末尾 1 要素へ着地させる。
+
+    `source` の要素は同一オブジェクトのまま（ラップせず）順に中継する。正常完了時は
+    `FailsafeResult` を yield しない。宣言済み例外を受けた場合は、0 件後でも N 件後でも
+    `FailsafeResult` を末尾 1 要素として yield して終了する（既配信の要素は上書きしない）。
+    handlers の走査（挿入順 first-match）・fallback の解決（値 / sync / async callable /
+    `FailsafeHandler`）・`last_agent` の 2 段決定・監査（`log_on_apply` の warning と
+    `on_apply`）は `failsafe_call` と共通の経路（`_land`）で行う。
+
+    着地対象は `source` の `__anext__` の await 中に起きた `Exception` だけである。
+    次のものは着地させずに素通しする。
+
+    - `BaseException` 系（`asyncio.CancelledError` / `GeneratorExit` /
+      `KeyboardInterrupt` / `SystemExit`）
+    - handlers のどのキーにもマッチしない未宣言の例外（例外チェーンも付けない）
+    - fallback callable 自身が送出した例外（監査は発火しない）
+    - 利用者の `async for` 本体で起きた例外
+    - `athrow()` で投げ込まれた例外
+    - `aclose()` 自身が送出した例外
+
+    `StopAsyncIteration` は正常終了として扱うため、handlers に `StopAsyncIteration` を
+    宣言しても正常終了は着地しない。`policy.handlers` が空なら一切捕捉せず完全透過する。
+    fallback callable が送出した例外（`StopAsyncIteration` を含む）は素通しするが、
+    `_relay` は async generator のため `StopAsyncIteration` は `RuntimeError` へ変換される
+    （PEP 525）。`failsafe_call` ではそのまま伝播するため、同じ fallback 契約でも
+    ストリーミングでは観測される例外型が異なる。
+
+    受理契約は `AsyncIterable[T]` のみで、`aiter(source)` を呼び出し時点で 1 回だけ
+    行う。非 async iterable（`int` / `list` / coroutine / 未呼び出しの async generator
+    関数等）は呼び出し時点で Python ランタイム由来の `TypeError` になり、handlers の
+    内容（`TypeError` の宣言有無・空）に関係なく着地しない。
+
+    1 要素以上を要求した後の明示 `aclose()`（`contextlib.aclosing` 経由を含む）は
+    `source` の `aclose`（存在する場合）へ転送する。反復を始める前の `aclose()` と、
+    反復を始める前に GC で回収された場合は転送しない（`source` の `__aiter__` で確保した
+    資源は利用者側で解放する）。反復を始めた後に GC で回収された場合は、イベントループの
+    async generator finalizer 経由で転送される（転送のタイミングは決まらない）。
+    例外が伝播中に `aclose()` 自身が例外を送出した場合、利用者に届くのはその例外に
+    なり、元の例外は `__context__` に残るだけになる。`aclose` は awaitable を返す
+    必要があり（async generator のプロトコル）、同期で None を返す callable だと
+    `await` が `TypeError` になる。lib は `RunResultStreaming.cancel()` を代行しない
+    ため、SDK のストリーミング実行を早期終了する場合は利用者が `cancel()` を先に呼ぶ。
+
+    Args:
+        policy: 着地の宣言（handlers / log_on_apply / on_apply / fallback_last_agent）。
+        source: 中継する async iterable（例: `streamed.stream_events()`）。
+
+    Returns:
+        `source` の要素を同一オブジェクトのまま中継し、着地時は末尾に
+        `FailsafeResult` を 1 要素だけ yield して終わる async iterator。
+
+    Raises:
+        TypeError: `source` が async iterable でない場合（呼び出し時点で送出）。
+        Exception: 反復中に handlers のどのキーにもマッチしない例外、fallback
+            callable 自身が送出した例外、および `aclose()` 自身が送出した例外
+            （いずれも素通しする）。
+    """
+    iterator = aiter(source)
+    return _relay(policy, iterator)
+
+
+async def _relay[T](
+    policy: FailsafePolicy, iterator: AsyncIterator[T]
+) -> AsyncIterator[T | FailsafeResult]:
+    """`failsafe_stream` の本体（`iterator` を中継し宣言済み例外を末尾 1 要素へ着地させる）。
+
+    `yield` は try / except の外に置き、`GeneratorExit` や `athrow()` の例外を着地の
+    判定に入れない。反復を開始した後の終了時（正常終了・着地・例外・`aclose()`）に限り、
+    `iterator` の `aclose` があれば await して転送する（反復前の `aclose()` と反復前の GC
+    では本体が実行されないため転送しない。反復開始後の GC では finalizer 経由で転送
+    される）。例外が伝播中に `aclose()` 自身が例外を送出した場合、利用者に届くのは
+    その例外になり、元の例外は `__context__` に残るだけになる。`aclose` は awaitable を
+    返す必要があり（async generator のプロトコル）、同期で None を返す callable だと
+    `await` が `TypeError` になる。
+
+    Args:
+        policy: 着地の宣言。
+        iterator: `aiter(source)` 済みの async iterator。
+
+    Returns:
+        要素を中継し、着地時は末尾に `FailsafeResult` を yield する async generator。
+
+    Raises:
+        Exception: 未宣言の例外・fallback 自身の例外・`aclose()` 自身の例外（素通し）。
+    """
+    try:
+        while True:
+            try:
+                item = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            except Exception as exc:
+                key = _match_handler(policy, exc)
+                if key is None:
+                    raise
+                landed = await _land(policy, exc, key)
+            else:
+                yield item
+                continue
+            yield landed
+            return
+    finally:
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()

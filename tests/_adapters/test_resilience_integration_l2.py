@@ -5,7 +5,8 @@ SDK `Runner.run` / `run_streamed` / `run_sync` を実際に走らせ、resilienc
 正しく機能することを実測で pin する:
 
 - A: `Runner.run` 経由の `RunBudgetExceeded`（トークン上限・非 streaming）と正常完了。
-- B: `Runner.run_streamed` 経由の予算超過（elapsed 上限・stream_events 消費で観測）。
+- B: `Runner.run_streamed` 経由の予算超過（elapsed 上限・stream_events 消費で観測）と、
+  `failsafe_stream` による既配信イベントの末尾への着地。
 - C: `Runner.run_sync` 経由の予算超過（run と等価な hooks 挙動）。
 - D: SDK `error_handlers` との共存（正常時は素通し・`RunBudgetExceeded` は非捕捉で伝播）。
 - E: `ModelSettings.resolve` による retry マージ（Runner 側が優先・SDK 委譲の検証）。
@@ -30,6 +31,7 @@ from agents import (
     ModelSettings,
     RunErrorHandlerResult,
     Runner,
+    StreamEvent,
     Usage,
 )
 from agents.items import ModelResponse
@@ -41,10 +43,15 @@ from oai_agentspec._adapters import build_agent
 from oai_agentspec.constants import RESILIENCE_LOGGER_NAME
 from oai_agentspec.exceptions import RunBudgetExceeded
 from oai_agentspec.runtime.resilience import (
+    RUNNING_AGENT,
+    FailsafeHandler,
+    FailsafePolicy,
+    FailsafeResult,
     ModelRetryPolicy,
     RunBudgetPolicy,
     build_model_retry,
     build_run_budget_hooks,
+    failsafe_stream,
 )
 from oai_agentspec.workflow import END, START, WorkflowGraph
 
@@ -128,6 +135,38 @@ async def test_B1_run_streamedはstream_events消費中に予算超過をraise�
             pass
 
     assert exc_info.value.context["exceeded"] == "max_elapsed_seconds"
+
+
+_STREAM_FAILSAFE_SENTINEL = "stream-failsafe-landed"
+"""B2 の着地値（既定値と取り違えないための固有の sentinel 文字列）。"""
+
+
+async def test_B2_failsafe_streamはstream_events中の予算超過を既配信の末尾へ着地させる() -> None:
+    """`stream_events()` 中の予算超過は既配信イベントを保ったまま末尾 1 要素へ着地する。"""
+    agent = _slow_workflow_agent("stream_failsafe", sleep_seconds=0.02)
+    hooks = build_run_budget_hooks(RunBudgetPolicy(max_elapsed_seconds=0.001))
+    policy = FailsafePolicy(
+        handlers={
+            RunBudgetExceeded: FailsafeHandler(
+                fallback=_STREAM_FAILSAFE_SENTINEL, last_agent=RUNNING_AGENT
+            )
+        }
+    )
+
+    streamed = Runner.run_streamed(agent, input="hi", hooks=hooks)
+    received: list[Any] = []
+    async for item in failsafe_stream(policy, streamed.stream_events()):
+        received.append(item)
+
+    result = received[-1]
+    assert isinstance(result, FailsafeResult)
+    assert result.final_output == _STREAM_FAILSAFE_SENTINEL
+    assert result.matched_type is RunBudgetExceeded
+    assert isinstance(result.exception, RunBudgetExceeded)
+    assert len(received) >= 2
+    assert not any(isinstance(item, FailsafeResult) for item in received[:-1])
+    assert all(isinstance(item, StreamEvent) for item in received[:-1])
+    assert result.last_agent is agent
 
 
 # ===========================================================================
