@@ -22,9 +22,11 @@ skip する。
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import gc
+import threading
 import warnings
 import weakref
 from dataclasses import MISSING, dataclass, field, fields
@@ -853,6 +855,159 @@ async def test_mcp_tool_unavailable_arguments_fail_closed(context: Any) -> None:
     ]
     # 引数が取れない時点で deny するため、ポリシー評価そのものには入らない。
     assert policy.tool_calls == []
+
+
+class _GuardrailCtx:
+    """統治ガードレールへ渡す `data.context` 相当（`tool_arguments` の有無・型を変えられる）。"""
+
+    def __init__(self, tool_name: str, **attrs: Any) -> None:
+        """ツール名と、指定された場合のみ `tool_arguments` を保持する。"""
+        self.tool_name = tool_name
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        _GuardrailCtx("mcp_read"),
+        _GuardrailCtx("mcp_read", tool_arguments=None),
+        _GuardrailCtx("mcp_read", tool_arguments=123),
+        _GuardrailCtx("mcp_read", tool_arguments={"q": "x"}),
+    ],
+    ids=["missing_attr", "none", "int", "dict"],
+)
+async def test_governance_guardrail_unavailable_arguments_fail_closed(context: Any) -> None:
+    """T8: 統治ガードレールでも `tool_arguments` が欠落 / 非 str なら名前照合へ縮退せず deny する。
+
+    `on_tool_start` の fail-closed（A6）と同じ規則がガードレールの位置でも成り立つことを固定する。
+    ツール名は常に許可する fake policy で試験するため、deny の原因は引数の取得不能に限られる。
+    記録は `tool:` deny の 1 行だけ（ガードレールは `tool_start:` を記録しない）で、reason は既存の
+    固定文言、ポリシー評価には入らない。str 判定を外して名前照合へ縮退させる変異では allow に
+    なって RED になる。
+    """
+    from agents.tool_guardrails import ToolInputGuardrailData
+
+    from oai_agentspec.runtime.governance import mcp_governance_guardrail
+
+    sink = _Sink()
+    policy = _FakePolicy()
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+    agent = SimpleNamespace(name="support", hooks=hooks)
+    guardrail = mcp_governance_guardrail()
+
+    with pytest.raises(_DenyExc, match="mcp_read") as excinfo:
+        await guardrail.run(ToolInputGuardrailData(context=context, agent=agent))
+
+    assert excinfo.value.details == {
+        "tool_name": "mcp_read",
+        "reason": "tool arguments unavailable for policy evaluation",
+    }
+    assert sink.records == [
+        (
+            "support",
+            "tool:mcp_read",
+            "deny",
+            {
+                "reason": "tool arguments unavailable for policy evaluation",
+                "arguments": None,
+            },
+        ),
+    ]
+    assert policy.tool_calls == []
+
+
+@pytest.mark.parametrize(
+    ("marked_name", "evaluated"),
+    [("other_tool", True), ("mcp_read", False)],
+    ids=["name_mismatch", "name_match"],
+)
+async def test_on_tool_start_skips_only_when_marked_name_matches(
+    marked_name: str, evaluated: bool
+) -> None:
+    """評価済みの印は名前が一致するときだけ `on_tool_start` の評価を省く。
+
+    ガードレールが評価した名前と on_tool_start のツール名がずれたら、印があっても安全網が
+    評価する（多層防御。現行 SDK ではずれない）。ポリシーは常に deny を返すため、評価が
+    行われれば `tool:` deny の記録と拒否例外の送出で観測できる。名前が一致する対照ケースでは
+    評価を省き、`tool:` 記録が増えずポリシーも呼ばれない（二重評価しない）ことを固定する。
+    """
+    sink = _Sink()
+    tool = _origin_tool("mcp_read")
+    policy = _FakePolicy(tool_reason="tool not allowed")
+    hooks = _make_audit_hooks(sink, None, policy=policy, denied_exc=_DenyExc, agent_name="support")
+    ctx = _tool_ctx("mcp_read", '{"q": "x"}')
+    # ガードレール経路で評価済みの印（評価したツール名）を付けた状態を作る。
+    hooks._evaluated[ctx] = marked_name
+
+    if evaluated:
+        with pytest.raises(_DenyExc, match="mcp_read"):
+            await hooks.on_tool_start(ctx, _Named("support"), tool)
+    else:
+        await hooks.on_tool_start(ctx, _Named("support"), tool)  # 例外は出ない
+
+    tool_records = [r for r in sink.records if r[1] == "tool:mcp_read"]
+    if evaluated:
+        assert tool_records == [
+            (
+                "support",
+                "tool:mcp_read",
+                "deny",
+                {"reason": "tool not allowed", "arguments": '{"q": "x"}'},
+            )
+        ]
+        assert policy.tool_calls == ["mcp_read"]
+    else:
+        assert tool_records == []
+        assert policy.tool_calls == []
+
+
+class _LockedSink(_Sink):
+    """ロックを持つ fake 監査 sink（AGT `AuditLog` と同じく深いコピーができない）。"""
+
+    def __init__(self) -> None:
+        """記録リストとロックを初期化する。"""
+        super().__init__()
+        self._lock = threading.Lock()
+
+
+async def test_audit_hooks_deepcopy_returns_same_instance_sharing_sink() -> None:
+    """監査フックの `copy.deepcopy` は TypeError にならず同一インスタンスを返す。
+
+    SDK のエージェント同一性シグネチャは、model 等が dataclass でそこから Agent へ参照が
+    届く場合に `dataclasses.asdict` で深くコピーする。利用者の `copy.deepcopy(agent)` も同じ。
+    AuditLog のロックを複製できないので self を返す。ロックを持つ sink で深いコピーが成立する
+    こと、複製側から記録した行が元と同じ sink に入ることを固定する。
+    """
+    sink = _LockedSink()
+    with pytest.raises(TypeError):
+        copy.deepcopy(sink)  # 前提: sink 自体は深いコピーできない
+    hooks = _make_audit_hooks(
+        sink, None, policy=_FakePolicy(), denied_exc=_DenyExc, agent_name="support"
+    )
+
+    copied = copy.deepcopy(hooks)
+
+    assert copied is hooks
+    await copied.on_start(None, _Named("support"))
+    assert sink.records == [("support", "agent_start", "allow", None)]
+
+
+@pytest.mark.usefixtures("fake_agt")
+def test_governed_agent_deepcopy_keeps_same_audit_hooks() -> None:
+    """統治済み Agent を `copy.deepcopy` しても監査フックは同一インスタンスのまま共有される。
+
+    利用者の `copy.deepcopy(agent)` が AuditLog 相当（ロックを持つ sink）の複製で TypeError に
+    ならず、複製後の Agent も同じ監査フック（同じ sink・ポリシー）を指すことを固定する。
+    """
+    sink = _LockedSink()
+    agent = Agent(name="bot", instructions="i", tools=[_origin_tool("mcp_read")])
+    governed = govern_agent(agent, policy=_FakePolicy(), audit_sink=sink, agent_name="bot")
+
+    copied = copy.deepcopy(governed)
+
+    assert copied is not governed
+    assert copied.hooks is governed.hooks
 
 
 async def test_non_function_tool_passes_through_without_evaluation() -> None:

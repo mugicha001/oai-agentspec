@@ -11,7 +11,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import warnings
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -20,6 +24,8 @@ import oai_agentspec.runtime.governance as governance_window
 from oai_agentspec._adapters.governance import _GOVERNANCE_INSTALL_HINT
 
 pytestmark = pytest.mark.unit
+
+_SRC_DIR = Path(__file__).resolve().parents[3] / "src"
 
 
 def test_reexported_symbol_is_agt_exception_class(agt_symbols: tuple[Any, Any, Any]) -> None:
@@ -38,8 +44,49 @@ def test_reexported_symbol_is_agt_exception_class(agt_symbols: tuple[Any, Any, A
 
 
 def test_reexport_listed_in_all() -> None:
-    """公開対象は `GovernedAgentBuilder` と `PolicyViolationError` のみ（`__all__` 契約）。"""
-    assert governance_window.__all__ == ["GovernedAgentBuilder", "PolicyViolationError"]
+    """公開対象は `GovernedAgentBuilder` / `PolicyViolationError` / `mcp_governance_guardrail`。"""
+    assert governance_window.__all__ == [
+        "GovernedAgentBuilder",
+        "PolicyViolationError",
+        "mcp_governance_guardrail",
+    ]
+
+
+def test_mcp_governance_guardrail_window_import_without_governance_extra() -> None:
+    """T9: governance extra 未導入でも窓口 import と `mcp_governance_guardrail` の取得が壊れない。
+
+    AGT（`openai_agents_trust` / `agent_os`）の import を塞いだクリーンな子プロセスで窓口を import
+    し、`__all__` のメンバ集合が `GovernedAgentBuilder` / `PolicyViolationError` /
+    `mcp_governance_guardrail` の 3 つであること、`mcp_governance_guardrail` が呼び出し可能な
+    属性として取得できること（AGT を窓口 import 時に読み込まない）を固定する。`__all__` から外す
+    変異と、窓口の import 時に AGT を読み込む変異の両方で RED になる。
+    """
+    probe = (
+        "import sys\n"
+        "sys.modules['openai_agents_trust'] = None\n"
+        "sys.modules['agent_os'] = None\n"
+        "import oai_agentspec.runtime.governance as w\n"
+        "print(sorted(w.__all__))\n"
+        "print(callable(w.mcp_governance_guardrail))\n"
+    )
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(_SRC_DIR) + (os.pathsep + existing if existing else "")
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == [
+        "['GovernedAgentBuilder', 'PolicyViolationError', 'mcp_governance_guardrail']",
+        "True",
+    ]
 
 
 def test_unknown_attribute_raises_attribute_error() -> None:
