@@ -1,8 +1,9 @@
 """Resilience 系宣言型の公開窓口（`oai-agentspec[resilience]` extra・agents 非依存の窓口）。
 
 宣言型 `ModelRetryPolicy` / `RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` /
-`FailsafeResult`、sentinel `RUNNING_AGENT`、関数 `failsafe_call`（いずれも `agents` に
-依存しない）、build 関数 2 種（`build_model_retry` / `build_run_budget_hooks`）、および
+`FailsafeResult`、sentinel `RUNNING_AGENT`、関数 `failsafe_call` / `failsafe_stream`
+（いずれも `agents` に依存しない）、build 関数 2 種（`build_model_retry` /
+`build_run_budget_hooks`）、および
 SDK 生型 10 種（`ModelRetrySettings` 系 / `RunErrorHandlers` 系）を再エクスポートする。
 
 例外 `RunBudgetExceeded` は本窓口からは撤去済み（Breaking Change）。正規の取得経路は
@@ -31,7 +32,14 @@ from __future__ import annotations
 import importlib
 from typing import Any
 
-from ._failsafe import RUNNING_AGENT, FailsafeHandler, FailsafePolicy, FailsafeResult, failsafe_call
+from ._failsafe import (
+    RUNNING_AGENT,
+    FailsafeHandler,
+    FailsafePolicy,
+    FailsafeResult,
+    failsafe_call,
+    failsafe_stream,
+)
 from ._types import ModelRetryPolicy, RunBudgetPolicy
 
 __all__ = [
@@ -53,6 +61,7 @@ __all__ = [
     "build_model_retry",
     "build_run_budget_hooks",
     "failsafe_call",
+    "failsafe_stream",
     "retry_policies",
 ]
 
@@ -85,6 +94,7 @@ _DIRECT_SYMBOLS: dict[str, str] = {
     "FailsafePolicy": "_failsafe",
     "FailsafeResult": "_failsafe",
     "failsafe_call": "_failsafe",
+    "failsafe_stream": "_failsafe",
     "RUNNING_AGENT": "_failsafe",
 }
 
