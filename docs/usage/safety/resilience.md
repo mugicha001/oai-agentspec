@@ -2,7 +2,7 @@
 
 ## 何を解決するか
 
-長い会話・エージェント運用では、Model 呼び出しの一過性エラー（rate limit / timeout / 5xx）・run 全体の暴走（累積時間・トークン消費）・Runner の外へ漏れた例外の着地、という 3 種の失敗を制御する必要があります。`ModelRetryPolicy` は個別 Model 呼び出しの retry を宣言、`RunBudgetPolicy` は run 全体の累積予算を宣言し超過時に `RunBudgetExceeded` を送出、`FailsafePolicy` + `failsafe_call` は Guardrail Tripwire・`RunBudgetExceeded`・`ToolTimeoutError` 等 Runner の外側まで伝播した例外を、呼び出し箇所ごとの try/except でなく宣言 1 回で着地値へ丸めます。
+長い会話・エージェント運用では、Model 呼び出しの一過性エラー（rate limit / timeout / 5xx）・run 全体の暴走（累積時間・トークン消費）・Runner の外へ漏れた例外の着地、という 3 種の失敗を制御する必要があります。`ModelRetryPolicy` は個別 Model 呼び出しの retry を宣言、`RunBudgetPolicy` は run 全体の累積予算を宣言し超過時に `RunBudgetExceeded` を送出、`FailsafePolicy` + `failsafe_call` は Guardrail Tripwire・`RunBudgetExceeded`・`ToolTimeoutError` 等 Runner の外側まで伝播した例外を、呼び出し箇所ごとの try/except でなく宣言 1 回で着地値へ丸めます。ストリーミング実行では同じ `FailsafePolicy` を `failsafe_stream` に渡し、`stream_events()` の途中で起きた例外を、既に届いたイベントを保ったまま末尾の `FailsafeResult` へ着地させます。
 
 セマンティックフラグ（`retry_on_*`）は既定 True で、SDK `ModelRetrySettings` の silent no-op（`policy` 未指定時 `max_retries` だけ指定しても retry しない）を排除します。
 
@@ -14,6 +14,7 @@
 | `RunBudgetPolicy` 単独 | run 全体の累積時間 / トークン制御（上限） | 暴走防止のみ必要 |
 | 併用（retry + budget） | retry で吸収しつつ全体は budget で頭打ち | 本番想定・両方の安全網が要る |
 | `FailsafePolicy` + `failsafe_call` | Runner の外へ漏れた例外の着地 | try/except を分散させず宣言的に着地値へ丸めたい |
+| `FailsafePolicy` + `failsafe_stream` | ストリーム途中の例外を末尾 1 要素として着地 | `run_streamed()` の `stream_events()` を同じ宣言で着地させたい |
 | セマンティックフラグ off | SDK 素の retry 挙動へ戻す | 既存挙動と揃えたい |
 
 ## 使い方
@@ -67,9 +68,9 @@ except RunBudgetExceeded as e:
     audit_log(usage=e.usage, elapsed=e.elapsed_seconds)
 ```
 
-### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `FailsafeResult` / `RUNNING_AGENT`）
+### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `failsafe_stream` / `FailsafeResult` / `RUNNING_AGENT`）
 
-- import: `from oai_agentspec.runtime.resilience import FailsafeHandler, FailsafePolicy, FailsafeResult, RUNNING_AGENT, failsafe_call`
+- import: `from oai_agentspec.runtime.resilience import FailsafeHandler, FailsafePolicy, FailsafeResult, RUNNING_AGENT, failsafe_call, failsafe_stream`
 - `FailsafePolicy` はアプリ全体で 1 回だけ宣言し、`Runner.run(...)` を呼ぶ各箇所を `failsafe_call(policy, lambda: Runner.run(...))` で包みます。
 
 ```python
@@ -95,6 +96,47 @@ else:
 ```
 
 正常完了時は `thunk` の戻り値（`RunResult`）がそのまま返り、着地時のみ `FailsafeResult` が返ります。いずれも `.final_output` で一様にアクセスできますが（structural 互換）、共通基底クラスは持たないため判別は `isinstance(result, FailsafeResult)` で行います。
+
+#### ストリーミング（`failsafe_stream`）
+
+`Runner.run_streamed(...).stream_events()` などの async iterable を `failsafe_stream(policy, source)` で包みます。policy は `failsafe_call` と同じものを使えます。宣言済みの例外がストリームの途中で起きると、それまでに届いたイベントはそのまま残り、`FailsafeResult` が**末尾の 1 要素**として届いてストリームが終わります。監査（`log_on_apply` の warning・`on_apply`）と `last_agent` の決定は `failsafe_call` と同じです。
+
+```python
+from oai_agentspec.exceptions import RunBudgetExceeded
+from oai_agentspec.runtime.resilience import (
+    RUNNING_AGENT, FailsafeHandler, FailsafePolicy, FailsafeResult, failsafe_stream,
+)
+
+policy = FailsafePolicy(
+    handlers={
+        RunBudgetExceeded: FailsafeHandler(
+            fallback="混雑のため中断しました。", last_agent=RUNNING_AGENT,
+        ),
+    },
+)
+
+streamed = Runner.run_streamed(agent, msg, hooks=budget_hooks)
+received = 0
+async for ev in failsafe_stream(policy, streamed.stream_events()):
+    if isinstance(ev, FailsafeResult):
+        # 着地: 末尾の 1 要素（この後ループは自然に終わる）。received が 0 なら何も届く前に着地した
+        show(ev.final_output)
+        continue
+    received += 1
+    forward(ev)  # 通常のイベント（SDK の StreamEvent がそのまま届く）
+```
+
+`source` が `str` を流す場合に届く列は次のとおりです（`handlers` は上の例と同じ `RunBudgetExceeded` のみ）。
+
+| ケース | source の挙動 | `failsafe_stream` が届ける列 | 終わり方 |
+|---|---|---|---|
+| 正常完了 | `"こん"`, `"にちは"` を流して終了 | `"こん"`, `"にちは"` | そのまま終了（`FailsafeResult` は届かない） |
+| 何も届く前に宣言済み例外 | 最初の要素の前に `RunBudgetExceeded` | `FailsafeResult(final_output="混雑のため中断しました。", ...)` のみ | 1 要素で終了 |
+| 途中で宣言済み例外 | `"こん"` の後に `RunBudgetExceeded` | `"こん"`, `FailsafeResult(...)` | 届いた `"こん"` は残り、末尾に 1 要素が加わって終了 |
+| 宣言していない例外 | `"こん"` の後に `ValueError` | `"こん"` | `ValueError` がそのまま伝播（監査なし） |
+| キャンセル | `"こん"` の後に `asyncio.CancelledError` | `"こん"` | `CancelledError` がそのまま伝播（着地しない） |
+
+`source` に async iterable でないもの（`list`・coroutine・呼び出し忘れの async generator 関数など）を渡すと、`failsafe_stream(...)` を呼んだ時点で `TypeError` になります。`handlers` に `TypeError` を宣言していても着地しません。
 
 #### `last_agent`（着地時に実行中だったエージェントを参照する）
 
@@ -175,6 +217,8 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 - 継続する設計にするなら、アプリ側で試行回数の上限を持つ（lib は再試行機構を提供しません）
 - 着地を `matched_type` で分岐し、通常応答と区別して監査する（`log_on_apply` の warning か `on_apply` で必ず痕跡を残す）
 
+`failsafe_stream` で Tripwire を着地させると、ガードレールが拒否した run の途中までのイベント（テキストのデルタなど）は、`FailsafeResult` より前に既に届いています。Tripwire 系の `matched_type` を受け取ったら、表示・転送済みの部分出力を破棄（取り消し）する処理を利用者側で行ってください。
+
 ## パラメータ一覧
 （下表は現時点のシグネチャ抜粋。乖離時は `docs/architecture.md` を正とする）
 
@@ -246,6 +290,10 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 
 `failsafe_call(policy: FailsafePolicy, thunk: Callable[[], Awaitable[T]]) -> T | FailsafeResult`。正常完了時は `thunk` の戻り値そのもの、着地時は `FailsafeResult` を返す。
 
+### `failsafe_stream(policy, source)`
+
+`failsafe_stream(policy: FailsafePolicy, source: AsyncIterable[T]) -> AsyncIterator[T | FailsafeResult]`。`source` の要素を同じオブジェクトのまま順に届け、宣言済み例外で着地したときだけ `FailsafeResult` を末尾の 1 要素として届けて終わる。`source` が async iterable でなければ呼び出し時点で `TypeError`。1 要素以上を受け取った後に返したイテレータを明示的に `aclose()`（`contextlib.aclosing` 経由を含む）すると、`source` の `aclose()` も呼ばれる。反復を始める前の `aclose()` と GC では呼ばれない。
+
 ### `FailsafeResult.from_exception(exception, *, final_output, matched_type=None, last_agent=None)`
 
 `failsafe_call` の外側で捕捉した例外から手動で `FailsafeResult` を構築する classmethod。`matched_type` 既定は `type(exception)`。`last_agent` は決定モデルの段 1 相当のみ（policy を受け取らないため段 2 は無い）。監査（warning / `on_apply`）は発火しない。
@@ -255,7 +303,7 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 - 一過性エラー吸収だけなら **`ModelRetryPolicy`** 単独。暴走防止だけなら **`RunBudgetPolicy`** 単独
 - 本番運用では **併用**を既定に、streaming 経路のハード timeout は `asyncio.wait_for` で上位に別途噛ませる（budget は turn 境界判定のため）
 - SDK 挙動を尊重したい場合のみ **セマンティックフラグ off**。既定 True 前提の設計を崩さないこと
-- Runner の外へ漏れた例外を宣言的に着地させたいなら **`FailsafePolicy` + `failsafe_call`**。streaming / sync / Realtime 専用のヘルパーは提供しない
+- Runner の外へ漏れた例外を宣言的に着地させたいなら **`FailsafePolicy` + `failsafe_call`**。streaming は **`failsafe_stream`** で `stream_events()` を包む。sync / Realtime 専用のヘルパーは提供しない
 
 ## 落とし穴
 
@@ -268,7 +316,12 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 - `Exception` / `BaseException` / `ExceptionGroup` / `KeyboardInterrupt` / `SystemExit` / `asyncio.CancelledError` / `GeneratorExit` は `handlers` のキーにできない（build-time `ValueError`）。`ExceptionGroup` は `isinstance` マッチのため `TaskGroup` が束ねた無関係な例外まで丸ごと着地させる広すぎる捕捉になるため禁止する（利用者定義のサブクラスは捕捉範囲が限定されるので許容）
 - `log_on_apply`（既定 True）の warning ログには例外メッセージとトレースバックがそのまま出る。機密を含みうる例外を扱う場合は `log_on_apply=False` にし `on_apply` でマスキングしたうえで記録する（`on_apply` 側でも result を丸ごと文字列化・シリアライズしない）
 - `FailsafePolicy.handlers` は不変化されるため、policy 自体の `copy.deepcopy` / `dataclasses.asdict` は `TypeError` になる。複製が必要な場合は `FailsafePolicy(dict(policy.handlers), ...)` で再構築する
-- `failsafe_call` は streaming（`run_streamed`）・sync（`run_sync`）・Realtime 用の専用ヘルパーを提供しない
+- streaming（`run_streamed`）は `failsafe_stream` を使う（`failsafe_call` で包んでも逐次配信にはならない）。sync（`run_sync`）・Realtime 用の専用ヘルパーは提供しない
+- `failsafe_stream` を途中でやめたいときは、`RunResultStreaming.cancel()` を先に呼んでから返したイテレータを `aclose()` する（`contextlib.aclosing` でも可）。`cancel()` を呼ばずに `aclose()` すると、SDK の `stream_events()` は後始末で run の完了を待つため、すぐには戻らない。`async for` を `break` で抜けるだけでは `aclose()` が呼ばれず、解放のタイミングが決まらない
+- `failsafe_stream` の着地が「何も届く前」か「途中」かは `FailsafeResult` からは分からない。受け取った要素の数を利用者側で数えて判別する
+- `failsafe_stream` が着地させるのは `source` から次の要素を取り出す間に起きた例外だけ。`async for` の本体（受け取ったイベントの処理）で起きた例外は着地せず、そのまま伝播する
+- `failsafe_stream` で例外が伝播している最中に `source` の `aclose()` 自身が例外を送出すると、利用者に届くのはその例外になり、元の例外は `__context__` に残るだけになる。`source` の `aclose` は awaitable を返す必要がある（同期で `None` を返すと `TypeError`）
+- fallback callable が `StopAsyncIteration` を送出すると、`failsafe_stream` では `RuntimeError` に変換される（async generator の仕様）。`failsafe_call` ではそのまま伝播するため、同じ fallback でも観測される例外型が異なる。fallback から `StopAsyncIteration` を送出しない
 - `repr` マスク（`FailsafeResult.last_agent` 等）は repr 限定。`dataclasses.asdict(result)` / `vars(result)` / 属性直参照は Agent 実体を返す。監査・メトリクスへ送るときは丸ごとシリアライズせず `getattr(agent, "name", None)` 等のメタデータへ落とす
 - `handlers` の値位置には着地値 / callable / `FailsafeHandler` のみを置く。Agent 実体を置くと (a) それが `final_output` として利用者へ返り、(b) `handlers` は policy repr に出るため機微が露出する。`last_agent` を指定したいなら `FailsafeHandler` を使う
 - `FailsafeResult` / `RunBudgetExceeded` を監査バッファ等で長期保持すると `last_agent` 経由で Agent と参照グラフが解放されない（`exc.__traceback__ = None` でも解放されない）。長期保持するならメタデータへ落としてから
@@ -280,7 +333,7 @@ Tripwire を着地させるときは次の 3 点を守ってください。
 ## 参照
 
 - 詳細設計: `docs/architecture.md`（Resilience 節）
-- 設計判断: `docs/adr/0002-resilience-declarative-compilation.md` / `docs/adr/0003-hooks-chain-helper.md`（`chain_hooks`）/ `docs/adr/0012-failsafe-declarative-landing.md`（Failsafe）/ `docs/adr/0013-failsafe-last-agent-resolution.md`（`last_agent` の決定モデル）
+- 設計判断: `docs/adr/0002-resilience-declarative-compilation.md` / `docs/adr/0003-hooks-chain-helper.md`（`chain_hooks`）/ `docs/adr/0012-failsafe-declarative-landing.md`（Failsafe）/ `docs/adr/0013-failsafe-last-agent-resolution.md`（`last_agent` の決定モデル）/ `docs/adr/0049-failsafe-stream-landing.md`（`failsafe_stream`）
 - 具体例: `examples/resilience/01_retry_and_budget.py` / `examples/resilience/02_failsafe.py`
 
 ## 次

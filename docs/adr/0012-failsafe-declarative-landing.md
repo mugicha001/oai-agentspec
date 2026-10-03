@@ -1,6 +1,6 @@
 # 0012: 任意例外の宣言的着地（Failsafe）を独立機能として追加する
 
-- Status: accepted
+- Status: accepted (partially superseded by 0049: Context の却下案 3（sync 版・streaming 版同梱案）のうち streaming 版と、Consequences の streaming 専用ヘルパー非提供の項)
 - Date: 2026-07-29
 
 ## Context

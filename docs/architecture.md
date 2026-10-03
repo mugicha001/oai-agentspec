@@ -853,7 +853,7 @@ sentinel（`_ACTION_DIRECT_SOURCE`・NUL 制御文字で挟んだ非公開定数
 記録の追記とゲートの参照は SDK が呼ぶ公式 callback の内側で行う読み書きのみであり、`await` も `Runner` 参照も
 独自の実行ループも持たない（hooks 合成と同種の薄い結線）。このため build-don't-run の逸脱には当たらず、
 逸脱として列挙する 5 例（`runtime/intent` の `fit_ml_estimator`・`tune_ml_estimator` / `runtime/resilience` の
-`failsafe_call` / `runtime/observability` の `enable_agent365_tracing`・`enable_otel_logging` /
+`failsafe_call`・`failsafe_stream` / `runtime/observability` の `enable_agent365_tracing`・`enable_otel_logging` /
 `runtime/intent` の `ActionPlanner.plan()` 内のパラメータ予測 / `runtime/finetune` の `wait_job`）の一覧には追加しない。
 この一覧は `./CLAUDE.md`「設計の核」の build-don't-run 項目と対で維持する。
 
@@ -3246,14 +3246,15 @@ Model 呼び出しの一時失敗リトライ・run 全体の予算超過制御�
 `runtime/resilience` に置く。宣言型 3 種（frozen dataclass）を SDK ネイティブ機構
 （`ModelSettings.retry` / `Runner.run(hooks=...)`）へコンパイルする、または SDK に依存しない純粋な
 着地関数（Failsafe）を提供するのみで、lib 独自の実行ループ・再試行・`Runner` 参照を持たない
-（build-don't-run）。`failsafe_call` は利用者が渡す thunk を 1 回 await する薄い結線であり、
-build-don't-run の逸脱の 1 つとして `./CLAUDE.md`「設計の核」の build-don't-run 項目と本ドキュメントの
-逸脱一覧に登録する（件数は当該一覧を正とし、本節では繰り返さない）。例外は SDK の
+（build-don't-run）。`failsafe_call` は利用者が渡す thunk を 1 回 await する、`failsafe_stream` は
+利用者が渡すストリームを 1 回だけ消費して中継する薄い結線であり、両者で build-don't-run の逸脱の
+1 つとして `./CLAUDE.md`「設計の核」の build-don't-run 項目と本ドキュメントの逸脱一覧に登録する（件数は当該一覧を正とし、本節では繰り返さない）。例外は SDK の
 伝播経路をそのまま使い呼び出し元まで届く。`oai-agentspec[resilience]`
 extra で opt-in 導入し、extra は追加の外部依存を持たない（`resilience = []`）。純粋追加であり、コア
 `__all__`・`AgentSpec` のフィールド集合は不変。設計判断の検討経緯は
 `docs/adr/0002-resilience-declarative-compilation.md`（Model Retry / Run Budget）・
-`docs/adr/0012-failsafe-declarative-landing.md`（Failsafe）を参照。
+`docs/adr/0012-failsafe-declarative-landing.md`（Failsafe）・
+`docs/adr/0049-failsafe-stream-landing.md`（Failsafe のストリーミング着地）を参照。
 
 ### 配置と依存方向
 
@@ -3373,13 +3374,15 @@ agent 単位の合成仕様:
 詳細な判断経緯は `docs/adr/0003-hooks-chain-helper.md`（run 単位）・
 `docs/adr/0016-agent-hooks-chain-helper.md`（agent 単位）を参照。
 
-### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `FailsafeResult` / `RUNNING_AGENT`）
+### Failsafe（`FailsafePolicy` / `FailsafeHandler` / `failsafe_call` / `failsafe_stream` / `FailsafeResult` / `RUNNING_AGENT`）
 
 Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudgetExceeded`・`ToolTimeoutError` 等）を、
-呼び出し箇所ごとの try/except でなく、宣言 1 回 + 単一 async 関数で着地値へ丸める機構。
+呼び出し箇所ごとの try/except でなく、宣言 1 回 + 実行モードに応じた関数（非 streaming は `failsafe_call`・
+streaming は `failsafe_stream`）で着地値へ丸める機構。
 `_failsafe.py` は `agents` を import しない（例外型は利用者が `handlers` のキーとして持ち込む）。
 設計判断の検討経緯は `docs/adr/0012-failsafe-declarative-landing.md`（宣言的着地の採用）・
-`docs/adr/0013-failsafe-last-agent-resolution.md`（`last_agent` の決定モデル）を参照。
+`docs/adr/0013-failsafe-last-agent-resolution.md`（`last_agent` の決定モデル）・
+`docs/adr/0049-failsafe-stream-landing.md`（ストリーミング着地）を参照。
 
 - `FailsafePolicy`（frozen dataclass）は `handlers: Mapping[type[Exception], Any]`（例外型 ->
   固定着地値・`Callable[[Exception], Any]`・または `FailsafeHandler`）・`log_on_apply: bool = True`・
@@ -3413,7 +3416,7 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   宣言がそのまま着地値になる誤りを防ぐ）または `RUNNING_AGENT`（指定用 sentinel が着地値として
   `final_output` に載る誤りを防ぐ）を渡した場合を build-time `ValueError` で拒否する。
 - `failsafe_call(policy: FailsafePolicy, thunk: Callable[[], Awaitable[T]]) -> T | FailsafeResult` が
-  唯一の実行関数。フロー:
+  非 streaming の実行関数。フロー:
   1. `awaitable = thunk()` を **try の外**で 1 回だけ呼び出す。thunk が呼び出し不可（coroutine
      オブジェクトの直渡し等）の場合、この呼び出し自体が Python ランタイム由来の `TypeError` になる
   2. `awaitable` が `inspect.isawaitable` を満たさない場合、実装が明示的に
@@ -3436,6 +3439,29 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   8. `policy.on_apply` が設定されていれば `FailsafeResult`（`last_agent` 込み）を渡して呼ぶ
      （sync/async 両対応）。`on_apply` 自体が送出した例外は `logger.error(..., exc_info=True)`
      で握り潰し着地は継続する
+
+  5 の照合（`_match_handler`）と 6〜8 の着地（`_land`）は private 関数として `failsafe_stream` と共有する。
+- `failsafe_stream(policy: FailsafePolicy, source: AsyncIterable[T]) -> AsyncIterator[T | FailsafeResult]` が
+  streaming の実行関数。`Runner.run_streamed(...).stream_events()` 等の任意の async iterable を包む。フロー:
+  1. 公開関数は plain `def` で、`aiter(source)` を呼び出し時点・**try の外**で 1 回だけ実行し、private な
+     async generator を返す。`source` が async iterable でない（`int` / `list` / coroutine / 呼び出し忘れの
+     async generator 関数等）場合は Python ランタイム由来の `TypeError` になり、`handlers` に `TypeError` を
+     宣言していても、`handlers` が空でも着地せず fail-fast する
+  2. `await anext(iterator)` のみを try 内に置く。正常な要素は同一オブジェクトをそのまま yield する
+     （`yield` は try の外）。`StopAsyncIteration` は `except Exception` より前で受けて正常終了とし、
+     `FailsafeResult` は出さない（`handlers` に `StopAsyncIteration` を宣言しても着地しない）
+  3. `except Exception` で捕捉した例外を `_match_handler` で照合する。未一致は `raise`（`from` なし）で
+     素通しする（`handlers` が空の場合もこの経路で透過する）
+  4. 一致したら `_land` で `FailsafeResult` を構築・監査し（`failsafe_call` の 6〜8 と同一）、**末尾 1 要素**として
+     yield して終了する。0 件転送後でも N 件転送後でも同じ形で、既配信要素は上書きしない。着地後は source を
+     読まない
+  5. 反復開始後の終了時（正常終了・着地・例外・明示 `aclose()`）に、`finally` で source が `aclose` を持てば
+     await する（反復を始める前の `aclose()` と GC では本体が実行されないため転送されない）。
+     `aclose()` 自身の例外は着地させずに伝播する
+  6. 着地対象は `__anext__` の await 中に起きた `Exception` のみ。`KeyboardInterrupt` / `SystemExit` /
+     `asyncio.CancelledError` / `GeneratorExit` は素通しし、利用者の `async for` 本体の例外・`athrow()` で
+     投げ込まれた例外・`Runner.run_streamed(...)` の呼び出し自体が同期送出する例外は着地しない。lib は
+     `RunResultStreaming.cancel()` を代行しない
 
 #### `last_agent` の決定モデル
 
@@ -3469,7 +3495,7 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
 - **段の遷移**: 段 1 が無指定、または `RUNNING_AGENT` だが解決不能なら段 2 へ。段 2 でも決まら
   なければ `None`。
 - `RUNNING_AGENT` そのものが `FailsafeResult.last_agent` に載ることはない（`failsafe_call` /
-  `FailsafeResult.from_exception` の経路では解決済みの値か `None` のみが載る。`FailsafeResult` を
+  `failsafe_stream` / `FailsafeResult.from_exception` の経路では解決済みの値か `None` のみが載る。`FailsafeResult` を
   直接構築する場合は決定モデルを経由しないため渡した値がそのまま載る）。
 - **build-time 誤配置ガード**: `RUNNING_AGENT` を着地値位置（`final_output` になる位置）に置くと
   `ValueError` になる。対象は `FailsafeHandler.fallback` と `FailsafePolicy.handlers` の値位置
@@ -3504,17 +3530,16 @@ Runner の外側まで伝播する任意例外（Guardrail Tripwire・`RunBudget
   されない）。`ModelRetryPolicy` / `RunBudgetPolicy` とも streaming で透過的に効く
 - `Runner.run_sync`: 対応（内部で `run` を呼ぶため透過的に効く）
 - Realtime（`RealtimeRunner` / `RealtimeSession`）は非対応
-- `failsafe_call` は `Runner.run`（非 streaming の `Awaitable` を返す thunk）のみを対象とする。
-  streaming（`run_streamed`）・sync（`run_sync`）専用の着地ヘルパーは提供しない。streaming 例外は
-  従来どおり利用者が `stream_events()` 消費時に捕捉する必要がある。Realtime（`RealtimeRunner` /
-  `RealtimeSession`）は非対応
+- `failsafe_call` は `Runner.run`（非 streaming の `Awaitable` を返す thunk）を対象とする。
+  streaming（`run_streamed`）は `failsafe_stream` で `stream_events()` を包む。sync（`run_sync`）専用の
+  着地ヘルパーは提供しない。Realtime（`RealtimeRunner` / `RealtimeSession`）は非対応
 
 ### 公開窓口と配置
 
 公開窓口は `oai_agentspec.runtime.resilience`（他 runtime extra と同型・コア `__all__` には載せない）。
-`__all__` は 19 件で、外部依存ゼロのシンボル 7 件（宣言型 5 種 `ModelRetryPolicy` /
-`RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`、関数 1 種
-`failsafe_call`、sentinel 1 種 `RUNNING_AGENT`）は module import 時点で直 import 済み、残り 12 件
+`__all__` は 20 件で、外部依存ゼロのシンボル 8 件（宣言型 5 種 `ModelRetryPolicy` /
+`RunBudgetPolicy` / `FailsafeHandler` / `FailsafePolicy` / `FailsafeResult`、関数 2 種
+`failsafe_call` / `failsafe_stream`、sentinel 1 種 `RUNNING_AGENT`）は module import 時点で直 import 済み、残り 12 件
 （`build_model_retry` / `build_run_budget_hooks` の 2 種と SDK 生型 10 種）は `__getattr__` で
 `_adapters.resilience` 経由の PEP 562 遅延取得とし、窓口 import 時点では実装実体の
 `_adapters.resilience` をロードしない（`hooks` 窓口と同型。`agents` はコア依存で窓口 import より
