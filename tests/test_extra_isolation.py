@@ -31,6 +31,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 # serve / cli / llmops だけが import する extra（本体 import で現れてはならない。トップレベル名の
 # 完全一致による絶対禁止）。httpx / uvicorn は SDK 経由で transitive に載るため対象外（モジュール
 # docstring 参照）。deepeval / langfuse は llmops の重い依存で、評価エントリ / _adapters の関数内
@@ -58,6 +60,22 @@ _OBSERVABILITY_SDK_BODY = (
     "opentelemetry.sdk",
     "opentelemetry.exporter",
     "microsoft_agents_a365",
+)
+
+# mcp 2 系で SDK が `import agents` の時点に読み込む opentelemetry-api を再現する preamble。
+# 末尾の `preloaded` 出力は preamble が実行されたことの印。
+_OBSERVABILITY_API_PRELOAD = (
+    "import opentelemetry.context\n"
+    "import opentelemetry.propagate\n"
+    "import opentelemetry.trace\n"
+    "print('preloaded')\n"
+)
+
+# 判定 B の名前空間ごとに、その名前空間にだけ当たる SDK 本体のモジュール（ADR 0047 Decision 2。
+# `microsoft_agents_a365` は読み込むと他の名前空間も伴うため単独では作れない）。
+_OBSERVABILITY_SDK_PRELOADS = (
+    "opentelemetry.sdk.resources",
+    "opentelemetry.exporter.otlp.proto.http",
 )
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src"
@@ -97,17 +115,18 @@ def test_importing_package_does_not_load_serve_cli_llmops_entrypoints() -> None:
     assert loaded == [], f"本体 import で serve / cli / llmops 入口がロードされました: {loaded}"
 
 
-def test_importing_package_does_not_force_load_extra_deps() -> None:
-    """本体 import で extra 依存・観測系モジュール・観測系 SDK 本体を強制ロードしない。
+def _extra_deps_probe(preamble: str = "") -> str:
+    """本体 import の extra 依存・観測系の違反を最終行へ出力する probe を組み立てる。
 
-    extra 依存は `_FORBIDDEN_EXTRAS` の完全一致で検査する。観測系は判定 A（lib による追加の
-    禁止）と判定 B（SDK 本体の絶対禁止）の 2 つで検査する（ADR 0047 Decision 1）。
+    `preamble` は `import agents` より前に実行する文で、SDK が観測系モジュールを先に読み込んだ
+    状況（baseline に載っている状態）を再現するために使う。
     """
     forbidden = list(_FORBIDDEN_EXTRAS)
     roots = list(_OBSERVABILITY_ROOTS)
     sdk_body = list(_OBSERVABILITY_SDK_BODY)
-    probe = (
+    return (
         "import sys\n"
+        f"{preamble}"
         "import agents\n"
         "sdk_baseline = set(sys.modules)\n"
         "import oai_agentspec\n"
@@ -122,11 +141,51 @@ def test_importing_package_does_not_force_load_extra_deps() -> None:
         "violations = sorted(set(forbidden_loaded) | set(added_by_lib) | set(sdk_body_loaded))\n"
         "print(','.join(violations))\n"
     )
-    out = _import_in_clean_subprocess(probe)
+
+
+def test_importing_package_does_not_force_load_extra_deps() -> None:
+    """本体 import で extra 依存・観測系モジュール・観測系 SDK 本体を強制ロードしない。
+
+    extra 依存は `_FORBIDDEN_EXTRAS` の完全一致で検査する。観測系は判定 A（lib による追加の
+    禁止）と判定 B（SDK 本体の絶対禁止）の 2 つで検査する（ADR 0047 Decision 1）。
+    """
+    out = _import_in_clean_subprocess(_extra_deps_probe())
     loaded = [m for m in out.split(",") if m]
     assert loaded == [], (
-        f"本体 import で extra（{forbidden}）または観測系モジュールがロードされました: {loaded}"
+        f"本体 import で extra（{list(_FORBIDDEN_EXTRAS)}）または観測系モジュールが"
+        f"ロードされました: {loaded}"
     )
+
+
+def test_observability_api_loaded_before_agents_is_not_attributed_to_lib() -> None:
+    """`import agents` より前に載った opentelemetry-api は判定 A の違反にしない。
+
+    mcp 2 系では SDK が `import agents` の時点で opentelemetry-api を読み込む。この状況を
+    preamble で再現し、lib の本体 import が新たに読み込んだものだけを違反とする差分判定
+    （ADR 0047 Decision 1）を、mcp の版に依存せず固定する。preamble が実行されたことは
+    `preloaded` の出力で確かめる（無視されると baseline が空のまま素通りするため）。
+    """
+    pytest.importorskip("opentelemetry.trace")
+    out = _import_in_clean_subprocess(_extra_deps_probe(_OBSERVABILITY_API_PRELOAD)).splitlines()
+
+    assert out[0] == "preloaded"
+    loaded = [m for line in out[1:] for m in line.split(",") if m]
+    assert loaded == [], f"SDK 経由で先に載った観測系モジュールが違反になりました: {loaded}"
+
+
+@pytest.mark.parametrize("sdk_module", _OBSERVABILITY_SDK_PRELOADS)
+def test_sdk_body_loaded_before_agents_is_a_violation(sdk_module: str) -> None:
+    """観測系 SDK 本体は `import agents` より前に載っていても違反になる（判定 B）。
+
+    lib への import 注入は必ず baseline の後に増えるため判定 A が先に当たる。判定 B だけが
+    検出できる状況（SDK 本体が baseline に含まれる状態）を preamble で作り、判定 B が
+    効いていることを固定する（ADR 0047 Decision 1 / 2）。
+    """
+    pytest.importorskip(sdk_module)
+    out = _import_in_clean_subprocess(_extra_deps_probe(f"import {sdk_module}\n"))
+    loaded = [m for m in out.split(",") if m]
+
+    assert sdk_module in loaded
 
 
 def test_importing_package_does_not_chain_import_realtime() -> None:

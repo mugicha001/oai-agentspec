@@ -35,6 +35,20 @@ _EXPECTED_ALL = {
 _ENABLE_ENTRIES = {"enable_agent365_tracing", "enable_otel_logging"}
 _CONFIG_TYPES = {"Agent365TracingConfig", "OtelLoggingConfig"}
 
+# mcp 2 系で SDK が `import agents` の時点に読み込む opentelemetry-api を再現する preamble と、
+# 判定 B の名前空間ごとにその名前空間にだけ当たる SDK 本体のモジュール。
+# tests/test_extra_isolation.py の同名定数に同期する。
+_OBSERVABILITY_API_PRELOAD = (
+    "import opentelemetry.context\n"
+    "import opentelemetry.propagate\n"
+    "import opentelemetry.trace\n"
+    "print('preloaded')\n"
+)
+_OBSERVABILITY_SDK_PRELOADS = (
+    "opentelemetry.sdk.resources",
+    "opentelemetry.exporter.otlp.proto.http",
+)
+
 _SRC_DIR = Path(__file__).resolve().parents[3] / "src"
 _INIT_PATH = _SRC_DIR / "oai_agentspec" / "runtime" / "observability" / "__init__.py"
 
@@ -52,6 +66,32 @@ def _run_in_clean_subprocess(probe: str) -> str:
         env=env,
     )
     return result.stdout.strip()
+
+
+def _window_probe(preamble: str = "") -> str:
+    """窓口 import の観測系の違反を最終行へ出力する probe を組み立てる。
+
+    `preamble` は `import agents` より前に実行する文で、SDK が観測系モジュールを先に読み込んだ
+    状況（baseline に載っている状態）を再現するために使う。
+    """
+    return (
+        "import sys\n"
+        f"{preamble}"
+        "import agents\n"
+        "sdk_baseline = set(sys.modules)\n"
+        "import oai_agentspec.runtime.observability\n"
+        "def _match(m, names):\n"
+        "    return any(m == p or m.startswith(p + '.') for p in names)\n"
+        # roots は ADR 0047 Decision 1、sdk_body は Decision 2 を正とし、
+        # tests/test_extra_isolation.py の _OBSERVABILITY_ROOTS /
+        # _OBSERVABILITY_SDK_BODY に同期する。
+        "roots = ['opentelemetry', 'microsoft_agents_a365']\n"
+        "sdk_body = ['opentelemetry.sdk', 'opentelemetry.exporter', 'microsoft_agents_a365']\n"
+        "added_by_lib = [m for m in set(sys.modules) - sdk_baseline if _match(m, roots)]\n"
+        "sdk_body_loaded = [m for m in sys.modules if _match(m, sdk_body)]\n"
+        "violations = sorted(set(added_by_lib) | set(sdk_body_loaded))\n"
+        "print(','.join(violations))\n"
+    )
 
 
 def test_all_membership_pinned() -> None:
@@ -106,26 +146,39 @@ def test_importing_window_does_not_load_observability_sdks() -> None:
     検査する（ADR 0047 Decision 1）。他テストの副作用を排除するためクリーンな子プロセスで
     確認する。
     """
-    probe = (
-        "import sys\n"
-        "import agents\n"
-        "sdk_baseline = set(sys.modules)\n"
-        "import oai_agentspec.runtime.observability\n"
-        "def _match(m, names):\n"
-        "    return any(m == p or m.startswith(p + '.') for p in names)\n"
-        # roots / sdk_body は ADR 0047 Decision 2 と tests/test_extra_isolation.py の
-        # _OBSERVABILITY_ROOTS / _OBSERVABILITY_SDK_BODY に同期する。
-        "roots = ['opentelemetry', 'microsoft_agents_a365']\n"
-        "sdk_body = ['opentelemetry.sdk', 'opentelemetry.exporter', 'microsoft_agents_a365']\n"
-        "added_by_lib = [m for m in set(sys.modules) - sdk_baseline if _match(m, roots)]\n"
-        "sdk_body_loaded = [m for m in sys.modules if _match(m, sdk_body)]\n"
-        "violations = sorted(set(added_by_lib) | set(sdk_body_loaded))\n"
-        "print(','.join(violations))\n"
-    )
-    out = _run_in_clean_subprocess(probe)
+    out = _run_in_clean_subprocess(_window_probe())
     loaded = [m for m in out.split(",") if m]
 
     assert loaded == [], f"窓口 import で観測系モジュールがロードされました: {loaded}"
+
+
+def test_observability_api_loaded_before_agents_is_not_attributed_to_window() -> None:
+    """`import agents` より前に載った opentelemetry-api は窓口 import の違反にしない。
+
+    mcp 2 系で SDK が `import agents` の時点に opentelemetry-api を読み込む状況を preamble で
+    再現し、窓口 import が新たに読み込んだものだけを違反とする差分判定（ADR 0047 Decision 1）を
+    mcp の版に依存せず固定する。preamble が実行されたことは `preloaded` の出力で確かめる。
+    """
+    pytest.importorskip("opentelemetry.trace")
+    out = _run_in_clean_subprocess(_window_probe(_OBSERVABILITY_API_PRELOAD)).splitlines()
+
+    assert out[0] == "preloaded"
+    loaded = [m for line in out[1:] for m in line.split(",") if m]
+    assert loaded == [], f"SDK 経由で先に載った観測系モジュールが違反になりました: {loaded}"
+
+
+@pytest.mark.parametrize("sdk_module", _OBSERVABILITY_SDK_PRELOADS)
+def test_sdk_body_loaded_before_agents_is_a_window_violation(sdk_module: str) -> None:
+    """観測系 SDK 本体は `import agents` より前に載っていても窓口の違反になる（判定 B）。
+
+    判定 B だけが検出できる状況（SDK 本体が baseline に含まれる状態）を preamble で作り、
+    判定 B が効いていることを固定する（ADR 0047 Decision 1 / 2）。
+    """
+    pytest.importorskip(sdk_module)
+    out = _run_in_clean_subprocess(_window_probe(f"import {sdk_module}\n"))
+    loaded = [m for m in out.split(",") if m]
+
+    assert sdk_module in loaded
 
 
 def test_window_symbols_are_importable_in_clean_subprocess() -> None:
