@@ -170,7 +170,7 @@ async def test_B2_failsafe_streamはstream_events中の予算超過を既配信�
 
 
 # ===========================================================================
-# C.Runner.run_sync 経由の RunBudgetExceeded
+# C. Runner.run_sync 経由の RunBudgetExceeded
 # ===========================================================================
 def test_C1_run_sync経由でもトークン上限超過でRunBudgetExceededをraiseする() -> None:
     """`run_sync` は内部で `run` を呼ぶため hooks の予算判定は run と等価に働く。"""

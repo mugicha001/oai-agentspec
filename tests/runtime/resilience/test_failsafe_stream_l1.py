@@ -32,6 +32,7 @@ from oai_agentspec.runtime.resilience._failsafe import (
     FailsafeHandler,
     FailsafePolicy,
     FailsafeResult,
+    failsafe_call,
     failsafe_stream,
 )
 
@@ -780,6 +781,126 @@ async def test_failsafe_stream_aclose非保持のsourceでもacloseと完走が�
 
     completed = await _collect(failsafe_stream(policy, _NoAcloseSource(["a", "b"])))
     assert completed == ["a", "b"]
+
+
+class _RaisingAcloseSource(_CountingAcloseSource):
+    """`aclose` が `aclose_exc` を送出する自作 async iterator（呼び出し回数も数える）。"""
+
+    def __init__(
+        self, items: list[Any], aclose_exc: Exception, outcome: Exception | None = None
+    ) -> None:
+        super().__init__(items, outcome)
+        self.aclose_exc = aclose_exc
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        raise self.aclose_exc
+
+
+@pytest.mark.parametrize(
+    ("outcome", "explicit_close", "expect_landed"),
+    [
+        (None, False, False),
+        (MyError("boom"), False, True),
+        (None, True, False),
+    ],
+    ids=["正常完了後", "着地後", "明示aclose"],
+)
+async def test_failsafe_stream_aclose自身の例外は着地せず同一インスタンスで伝播する(
+    caplog: pytest.LogCaptureFixture,
+    outcome: Exception | None,
+    explicit_close: bool,
+    expect_landed: bool,
+) -> None:
+    """source の `aclose` が送出した例外は着地させず、そのインスタンスのまま利用者へ届く。"""
+    aclose_exc = OSError("aclose boom")
+    source = _RaisingAcloseSource(["a", "b"], aclose_exc, outcome)
+    policy = FailsafePolicy(handlers={MyError: "landed", OSError: "must-not-land"})
+    received: list[Any] = []
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        with pytest.raises(OSError) as exc_info:
+            if explicit_close:
+                stream = failsafe_stream(policy, source)
+                received.append(await anext(stream))
+                await stream.aclose()  # type: ignore[attr-defined]
+            else:
+                await _collect_until_raise(failsafe_stream(policy, source), received)
+
+    assert exc_info.value is aclose_exc
+    assert source.aclose_calls == 1
+    assert received[0] == "a"
+    landed = [item for item in received if isinstance(item, FailsafeResult)]
+    assert all(r.final_output != "must-not-land" for r in landed)
+    if expect_landed:
+        assert len(landed) == 1
+        assert landed[0].exception is outcome
+        assert len(_records_of(caplog, logging.WARNING)) == 1
+    else:
+        assert landed == []
+        assert _records_of(caplog, logging.WARNING) == []
+
+
+async def test_failsafe_stream_未宣言例外の伝播中のaclose例外は元の例外を__context__に残す() -> (
+    None
+):
+    """伝播中に `aclose` が送出すると、届くのは `aclose` 側の例外になる。
+
+    元の例外は `__context__` に残る。
+    """
+    original = ValueError("unhandled")
+    aclose_exc = OSError("aclose boom")
+    source = _RaisingAcloseSource(["a"], aclose_exc, original)
+    policy = FailsafePolicy(handlers={MyError: "landed"})
+    received: list[Any] = []
+
+    with pytest.raises(OSError) as exc_info:
+        await _collect_until_raise(failsafe_stream(policy, source), received)
+
+    assert exc_info.value is aclose_exc
+    assert exc_info.value.__context__ is original
+    assert source.aclose_calls == 1
+    assert received == ["a"]
+
+
+async def test_failsafe_stream_fallbackのStopAsyncIterationはRuntimeErrorへ変換され監査しない(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """fallback が `StopAsyncIteration` を送出すると `RuntimeError` へ変換される。
+
+    async generator の仕様（PEP 525）による変換で、`failsafe_call` ではそのまま伝播する
+    （同じ fallback でも観測される型が異なる）。着地は成立していないため warning も
+    `on_apply` も発火しない。
+    """
+    stop = StopAsyncIteration("from fallback")
+    called: list[str] = []
+
+    def _fb(received: Exception) -> str:
+        raise stop
+
+    def _on_apply(result: FailsafeResult) -> None:
+        called.append("on_apply")
+
+    policy = FailsafePolicy(handlers={MyError: _fb}, on_apply=_on_apply)
+    received: list[Any] = []
+
+    with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+        with pytest.raises(RuntimeError) as exc_info:
+            await _collect_until_raise(
+                failsafe_stream(policy, _source(["a"], MyError("boom"))), received
+            )
+
+    assert exc_info.value.__cause__ is stop
+    assert received == ["a"]
+    assert called == []
+    assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []
+
+    async def _thunk() -> str:
+        raise MyError("boom")
+
+    with pytest.raises(StopAsyncIteration) as call_exc_info:
+        await failsafe_call(policy, _thunk)
+    assert call_exc_info.value is stop
 
 
 async def test_failsafe_stream_athrowで投げ込まれた宣言例外は着地せず伝播する() -> None:
