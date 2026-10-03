@@ -134,20 +134,36 @@ Consequences は変えない。「`import oai_agentspec` は root logger・SDK �
 - - `import agents` で読まれない SDK サブモジュール（lib が直接 import するもの）が将来観測系モジュールを読む
   ようになると、lib のせいではない追加として判定 A が失敗する（偽陽性）。失敗側に倒れるため保証は黙って
   消えず、違反モジュール名から原因を辿れる。
-- - mcp 2 系の構成は CI では継続的に検証しない（ADR-0043 の Consequences と同じ状態）。本 ADR の判定が
-  mcp 2 系で成り立つことは、決定時点の実測と、判定式を変えるときの手元での実行で確認する。
+- - mcp 2 系の構成そのものは CI では継続的に検証しない（ADR-0043 の Consequences と同じ状態）。SDK が
+  `import agents` の時点で opentelemetry-api を読み込む状況は、テストの中で opentelemetry-api を
+  `import agents` より前に読み込むことで再現し、CI（mcp 1 系）でも検査する。
 
 ## Confirmation
 
-- 強制手段は次のテストである。いずれもクリーンな子プロセスで `sys.modules` を検査する。
-  - `tests/test_extra_isolation.py::test_importing_package_does_not_force_load_extra_deps`
-  - `tests/runtime/observability/test_config_l1.py::test_config_module_does_not_load_observability_sdks`
-  - `tests/runtime/observability/test_reexport_l1.py::test_importing_window_does_not_load_observability_sdks`
-- 上記テストはいずれも判定 A と判定 B の両方で検査する。検出力は次の変異で、上記テストがすべて失敗する
-  ことにより確認する。
+- 強制手段は次のテストである。いずれもクリーンな子プロセスで `sys.modules` を検査し、対象の窓口ごとに
+  1 組ずつある。子プロセスの probe は `import agents` より前に任意の文（preamble）を差し込めるように
+  組み立て、SDK が観測系モジュールを先に読み込んだ状況をこの preamble で再現する。
+  - 窓口の import で判定 A / 判定 B の違反が無いこと:
+    - `tests/test_extra_isolation.py::test_importing_package_does_not_force_load_extra_deps`
+    - `tests/runtime/observability/test_config_l1.py::test_config_module_does_not_load_observability_sdks`
+    - `tests/runtime/observability/test_reexport_l1.py::test_importing_window_does_not_load_observability_sdks`
+  - `import agents` より前に載った opentelemetry-api を違反にしないこと（判定 A が差分であること。
+    preamble で opentelemetry-api を先に読み込み、mcp 2 系の baseline を再現する）:
+    - `tests/test_extra_isolation.py::test_observability_api_loaded_before_agents_is_not_attributed_to_lib`
+    - `tests/runtime/observability/test_config_l1.py::test_observability_api_loaded_before_agents_is_not_attributed_to_config`
+    - `tests/runtime/observability/test_reexport_l1.py::test_observability_api_loaded_before_agents_is_not_attributed_to_window`
+  - baseline に含まれる観測系 SDK 本体も違反にすること（判定 B。preamble で SDK 本体を先に読み込む。
+    `opentelemetry.sdk` と `opentelemetry.exporter` の名前空間ごとに検査する。`microsoft_agents_a365` は
+    読み込むと他の名前空間も伴うため、単独の状況は作れない）:
+    - `tests/test_extra_isolation.py::test_sdk_body_loaded_before_agents_is_a_violation`
+    - `tests/runtime/observability/test_config_l1.py::test_sdk_body_loaded_before_agents_is_a_config_violation`
+    - `tests/runtime/observability/test_reexport_l1.py::test_sdk_body_loaded_before_agents_is_a_window_violation`
+- 検出力は次の変異で、対応するテストが失敗することにより確認する。
   - 判定 A: 観測系モジュールの import（`opentelemetry.trace` 等）を
-    `src/oai_agentspec/_adapters/observability.py` のモジュールトップへ注入する（CI の mcp 1 系で検出）。
-  - 判定 B: 観測系 SDK 本体（Decision 2 の各名前空間）を `import agents` より前に読み込ませ、baseline に
-    含まれる状態にする（mcp の版に関わらず検出）。
+    `src/oai_agentspec/_adapters/observability.py` のモジュールトップへ注入する。窓口の import のテストが
+    失敗する（CI の mcp 1 系で検出）。
+  - 判定 A の差分: probe の `set(sys.modules) - sdk_baseline` を `sys.modules` に置き換える。
+    opentelemetry-api を先に読み込むテストが失敗する。
+  - 判定 B: probe の違反の和集合から判定 B の項を外す。SDK 本体を先に読み込むテストが失敗する。
 - `docs/QUALITY-GUARANTEES.md` の observability 遅延 import 境界の行に、source = ADR 0047 として登録する
   （相互参照）。
