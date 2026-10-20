@@ -20,7 +20,7 @@ classifiers = [
 ]
 dependencies = [
     # 宣言範囲は 1 つの minor に閉じ、下限は lock 構成で全件緑を実測した版にする（ADR-0043）。
-    "openai-agents>=0.22.3,<0.23",
+    "openai-agents>=0.22.3,<0.25",
     "pyyaml>=6.0.3",
 ]
 
